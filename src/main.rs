@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use parking_lot::RwLock;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{info, warn};
@@ -14,8 +15,21 @@ use rustblocker::forwarder::ParallelForwarder;
 use rustblocker::handler::DnsBlockerHandler;
 use rustblocker::lists::{DomainStore, RewriteMap, normalize_domain};
 
+#[derive(Parser)]
+#[command(name = "rustblocker", about = "A DNS blocker written in Rust")]
+struct Cli {
+    /// DNS listen port (overrides database setting)
+    #[arg(long)]
+    dns_port: Option<u16>,
+
+    /// Web UI listen port (overrides database setting, defaults to dns_port + 1)
+    #[arg(long)]
+    web_port: Option<u16>,
+}
+
 fn main() -> Result<()> {
-    // Initialize tracing with default level — overridable via RUST_LOG env var
+    let cli = Cli::parse();
+
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -26,10 +40,9 @@ fn main() -> Result<()> {
     info!("Starting RustBlocker");
 
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run_server())
+    runtime.block_on(run_server(cli))
 }
 
-/// Load a DomainStore from the database.
 fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
     let domains = db::get_domains(pool, table);
     let mut store = DomainStore::default();
@@ -43,7 +56,6 @@ fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
     store
 }
 
-/// Load a RewriteMap from the database.
 fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
     let rewrites = db::get_rewrites(pool);
     let mut map = RewriteMap::default();
@@ -58,7 +70,6 @@ fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
     map
 }
 
-/// Load settings from DB as key-value pairs.
 fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
     let settings = db::get_settings(pool);
     settings
@@ -68,30 +79,27 @@ fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
         .to_string()
 }
 
-async fn run_server() -> Result<()> {
-    // Initialize SQLite
+async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
 
-    // Seed with defaults if DB is empty
     db::seed_defaults(&pool);
 
-    // Read settings from DB
     let listen_address = get_setting_string(&pool, "listen_address");
-    let listen_port: u16 = get_setting_string(&pool, "listen_port")
+    let db_dns_port: u16 = get_setting_string(&pool, "listen_port")
         .parse()
-        .unwrap_or(5353);
-    let sinkhole_ipv4_str = get_setting_string(&pool, "sinkhole_ipv4");
-    let sinkhole_ipv6_str = get_setting_string(&pool, "sinkhole_ipv6");
-    let _log_level = get_setting_string(&pool, "log_level");
+        .unwrap_or(8053);
     let upstream_timeout: u64 = get_setting_string(&pool, "upstream_timeout_secs")
         .parse()
         .unwrap_or(5);
 
-    let listen_addr: SocketAddr = format!("{}:{}", listen_address, listen_port)
-        .parse()
-        .context("Invalid listen address from DB")?;
+    // CLI flags override DB settings
+    let dns_port = cli.dns_port.unwrap_or(db_dns_port);
+    let web_port = cli.web_port.unwrap_or(dns_port + 1);
 
-    // Load domain stores from DB into Arc<RwLock<>>
+    let listen_addr: SocketAddr = format!("{}:{}", listen_address, dns_port)
+        .parse()
+        .context("Invalid listen address")?;
+
     let blocklist = Arc::new(RwLock::new(load_store_from_db(&pool, "blocklist_domains")));
     let allowlist = Arc::new(RwLock::new(load_store_from_db(&pool, "allowlist_domains")));
     let rewrites = Arc::new(RwLock::new(load_rewrites_from_db(&pool)));
@@ -103,7 +111,6 @@ async fn run_server() -> Result<()> {
         rewrites.read().rules.len(),
     );
 
-    // Build upstreams from DB
     let db_upstreams = db::get_upstreams(&pool);
     let upstreams: Vec<UpstreamConfig> = db_upstreams
         .iter()
@@ -118,14 +125,15 @@ async fn run_server() -> Result<()> {
             .context("Failed to create upstream forwarder")?,
     );
 
+    let sinkhole_ipv4_str = get_setting_string(&pool, "sinkhole_ipv4");
+    let sinkhole_ipv6_str = get_setting_string(&pool, "sinkhole_ipv6");
     let sinkhole_ipv4: std::net::Ipv4Addr = sinkhole_ipv4_str
         .parse()
-        .context("Invalid sinkhole_ipv4 from DB")?;
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
     let sinkhole_ipv6: std::net::Ipv6Addr = sinkhole_ipv6_str
         .parse()
-        .context("Invalid sinkhole_ipv6 from DB")?;
+        .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
 
-    // Create DNS handler with shared stores
     let handler = DnsBlockerHandler::new(
         blocklist.clone(),
         allowlist.clone(),
@@ -137,7 +145,6 @@ async fn run_server() -> Result<()> {
 
     let mut server = hickory_server::server::Server::new(handler);
 
-    // Bind DNS sockets
     let udp_socket = UdpSocket::bind(listen_addr)
         .await
         .with_context(|| format!("Failed to bind UDP socket on {}", listen_addr))?;
@@ -150,8 +157,6 @@ async fn run_server() -> Result<()> {
     info!("DNS listening on TCP {}", listen_addr);
     server.register_listener(tcp_listener, Duration::from_secs(5), 1024);
 
-    // Configure web server on listen_port + 1
-    let web_port = listen_port + 1;
     let web_addr = format!("{}:{}", listen_address, web_port);
 
     let pool_data = actix_web::web::Data::new(pool.clone());
@@ -184,11 +189,10 @@ async fn run_server() -> Result<()> {
     info!(
         "RustBlocker ready — {} upstream(s), DNS port {}, web port {}",
         upstreams.len(),
-        listen_port,
+        dns_port,
         web_port,
     );
 
-    // Run both servers concurrently, shutdown on Ctrl+C
     tokio::select! {
         result = web_handle => {
             if let Err(e) = result {
