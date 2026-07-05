@@ -32,8 +32,8 @@ impl ParallelForwarder {
             let ns_config = NameServerConfig::udp_and_tcp(ip);
             let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
 
-            let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-                .build()?;
+            let resolver =
+                Resolver::builder_with_config(config, TokioRuntimeProvider::default()).build()?;
             resolvers.push(resolver);
             debug!("Added upstream resolver: {}", upstream.address);
         }
@@ -100,7 +100,10 @@ impl ParallelForwarder {
                     }
                 }
             }
-            Err(anyhow::anyhow!("All upstream resolvers failed: {:?}", last_err))
+            Err(anyhow::anyhow!(
+                "All upstream resolvers failed: {:?}",
+                last_err
+            ))
         })
         .await;
 
@@ -118,15 +121,26 @@ impl ParallelForwarder {
     }
 }
 
-fn extract_answers(query_type: RecordType, lookup: &hickory_resolver::lookup::Lookup) -> Vec<Record> {
+fn extract_answers(
+    query_type: RecordType,
+    lookup: &hickory_resolver::lookup::Lookup,
+) -> Vec<Record> {
     let mut answers = Vec::new();
     for record in lookup.answers() {
         match (query_type, &record.data) {
             (RecordType::A, RData::A(_)) | (RecordType::AAAA, RData::AAAA(_)) => {
-                answers.push(Record::from_rdata(record.name.clone(), record.ttl, record.data.clone()));
+                answers.push(Record::from_rdata(
+                    record.name.clone(),
+                    record.ttl,
+                    record.data.clone(),
+                ));
             }
             _ if query_type != RecordType::A && query_type != RecordType::AAAA => {
-                answers.push(Record::from_rdata(record.name.clone(), record.ttl, record.data.clone()));
+                answers.push(Record::from_rdata(
+                    record.name.clone(),
+                    record.ttl,
+                    record.data.clone(),
+                ));
             }
             _ => {}
         }
@@ -136,7 +150,7 @@ fn extract_answers(query_type: RecordType, lookup: &hickory_resolver::lookup::Lo
 
 async fn send_servfail(
     request: &hickory_server::server::Request,
-    response_handle: &mut (impl hickory_server::server::ResponseHandler + Send),
+    response_handle: &mut impl hickory_server::server::ResponseHandler,
 ) -> Result<ResponseInfo> {
     let builder = MessageResponseBuilder::from_message_request(request);
     let response = builder.error_msg(&request.metadata, ResponseCode::ServFail);

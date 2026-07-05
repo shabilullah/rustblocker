@@ -42,7 +42,8 @@ fn init_schema(conn: &rusqlite::Connection) {
             ipv4 TEXT,
             ipv6 TEXT
         );",
-    ).expect("failed to init schema");
+    )
+    .expect("failed to init schema");
 }
 
 /// Seed the database with sensible defaults (only if tables are empty).
@@ -71,13 +72,15 @@ pub fn seed_defaults(pool: &DbPool) {
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params![key, value],
-        ).ok();
+        )
+        .ok();
     }
 
     conn.execute(
         "INSERT OR IGNORE INTO upstreams (address, port) VALUES (?1, ?2)",
         params!["8.8.8.8", 53],
-    ).ok();
+    )
+    .ok();
 
     info!("Database seeded with defaults (1 upstream: 8.8.8.8:53)");
 }
@@ -158,7 +161,8 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) {
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
         params![key, value],
-    ).ok();
+    )
+    .ok();
 }
 
 // --- Upstreams ---
@@ -172,7 +176,9 @@ pub struct DbUpstream {
 
 pub fn get_upstreams(pool: &DbPool) -> Vec<DbUpstream> {
     let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn.prepare("SELECT id, address, port FROM upstreams ORDER BY id").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, address, port FROM upstreams ORDER BY id")
+        .unwrap();
     stmt.query_map([], |row| {
         Ok(DbUpstream {
             id: row.get(0)?,
@@ -190,13 +196,16 @@ pub fn add_upstream(pool: &DbPool, address: &str, port: i64) -> i64 {
     conn.execute(
         "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
         params![address, port],
-    ).ok();
+    )
+    .ok();
     conn.last_insert_rowid()
 }
 
 pub fn delete_upstream(pool: &DbPool, id: i64) -> bool {
     let conn = pool.get().expect("failed to get DB connection");
-    let rows = conn.execute("DELETE FROM upstreams WHERE id = ?1", params![id]).unwrap();
+    let rows = conn
+        .execute("DELETE FROM upstreams WHERE id = ?1", params![id])
+        .unwrap();
     rows > 0
 }
 
@@ -242,11 +251,15 @@ pub fn delete_domain(pool: &DbPool, table: &str, id: i64) -> bool {
 pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
     let conn = pool.get().expect("failed to get DB connection");
     let before: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     insert_domains_from_content(&conn, table, content);
     let after: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     (after - before) as usize
 }
@@ -263,7 +276,9 @@ pub struct DbRewrite {
 
 pub fn get_rewrites(pool: &DbPool) -> Vec<DbRewrite> {
     let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn.prepare("SELECT id, domain, ipv4, ipv6 FROM rewrites ORDER BY domain").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, domain, ipv4, ipv6 FROM rewrites ORDER BY domain")
+        .unwrap();
     stmt.query_map([], |row| {
         Ok(DbRewrite {
             id: row.get(0)?,
@@ -284,12 +299,15 @@ pub fn add_rewrite(pool: &DbPool, domain: &str, ipv4: Option<&str>, ipv6: Option
     conn.execute(
         "INSERT OR IGNORE INTO rewrites (domain, ipv4, ipv6) VALUES (?1, ?2, ?3)",
         params![normalized, ipv4, ipv6],
-    ).ok();
+    )
+    .ok();
     conn.last_insert_rowid()
 }
 
 pub fn delete_rewrite(pool: &DbPool, id: i64) -> bool {
     let conn = pool.get().expect("failed to get DB connection");
-    let rows = conn.execute("DELETE FROM rewrites WHERE id = ?1", params![id]).unwrap();
+    let rows = conn
+        .execute("DELETE FROM rewrites WHERE id = ?1", params![id])
+        .unwrap();
     rows > 0
 }

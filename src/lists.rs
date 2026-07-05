@@ -1,6 +1,6 @@
+use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use anyhow::{Context, Result};
 use tracing::info;
 
 /// Store for domain block/allow lists with exact and wildcard matching.

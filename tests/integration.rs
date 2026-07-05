@@ -83,28 +83,60 @@ async fn test_db_seed_defaults() {
         ("upstream_timeout_secs", "5"),
     ];
     for (key, value) in &settings {
-        conn.execute("INSERT INTO settings (key, value) VALUES (?1, ?2)", params![key, value]).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )
+        .unwrap();
     }
-    conn.execute("INSERT INTO upstreams (address, port) VALUES (?1, ?2)", params!["8.8.8.8", 53]).unwrap();
+    conn.execute(
+        "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
+        params!["8.8.8.8", 53],
+    )
+    .unwrap();
 
     // Verify settings
-    let listen_port: String = conn.query_row("SELECT value FROM settings WHERE key='listen_port'", [], |r| r.get(0)).unwrap();
+    let listen_port: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='listen_port'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(listen_port, "5353");
 
-    let listen_addr: String = conn.query_row("SELECT value FROM settings WHERE key='listen_address'", [], |r| r.get(0)).unwrap();
+    let listen_addr: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='listen_address'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(listen_addr, "127.0.0.1");
 
-    let timeout: String = conn.query_row("SELECT value FROM settings WHERE key='upstream_timeout_secs'", [], |r| r.get(0)).unwrap();
+    let timeout: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='upstream_timeout_secs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(timeout, "5");
 
     // Verify upstream
-    let upstream_count: i64 = conn.query_row("SELECT COUNT(*) FROM upstreams", [], |r| r.get(0)).unwrap();
+    let upstream_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM upstreams", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(upstream_count, 1);
 
-    let addr: String = conn.query_row("SELECT address FROM upstreams WHERE id=1", [], |r| r.get(0)).unwrap();
+    let addr: String = conn
+        .query_row("SELECT address FROM upstreams WHERE id=1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(addr, "8.8.8.8");
 
-    let port: i64 = conn.query_row("SELECT port FROM upstreams WHERE id=1", [], |r| r.get(0)).unwrap();
+    let port: i64 = conn
+        .query_row("SELECT port FROM upstreams WHERE id=1", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(port, 53);
 }
 

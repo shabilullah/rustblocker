@@ -12,7 +12,7 @@ use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
 use rustblocker::forwarder::ParallelForwarder;
 use rustblocker::handler::DnsBlockerHandler;
-use rustblocker::lists::{normalize_domain, DomainStore, RewriteMap};
+use rustblocker::lists::{DomainStore, RewriteMap, normalize_domain};
 
 fn main() -> Result<()> {
     // Initialize tracing with default level — overridable via RUST_LOG env var
@@ -70,8 +70,7 @@ fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
 
 async fn run_server() -> Result<()> {
     // Initialize SQLite
-    let pool = db::create_pool("rustblocker.db")
-        .context("Failed to create SQLite database")?;
+    let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
 
     // Seed with defaults if DB is empty
     db::seed_defaults(&pool);
@@ -119,9 +118,11 @@ async fn run_server() -> Result<()> {
             .context("Failed to create upstream forwarder")?,
     );
 
-    let sinkhole_ipv4: std::net::Ipv4Addr = sinkhole_ipv4_str.parse()
+    let sinkhole_ipv4: std::net::Ipv4Addr = sinkhole_ipv4_str
+        .parse()
         .context("Invalid sinkhole_ipv4 from DB")?;
-    let sinkhole_ipv6: std::net::Ipv6Addr = sinkhole_ipv6_str.parse()
+    let sinkhole_ipv6: std::net::Ipv6Addr = sinkhole_ipv6_str
+        .parse()
         .context("Invalid sinkhole_ipv6 from DB")?;
 
     // Create DNS handler with shared stores
@@ -165,11 +166,14 @@ async fn run_server() -> Result<()> {
             .app_data(allowlist_data.clone())
             .app_data(rewrites_data.clone())
             .configure(api::configure)
-            .route("/", actix_web::web::get().to(|| async {
-                actix_web::HttpResponse::Ok()
-                    .content_type("text/html; charset=utf-8")
-                    .body(include_str!("../static/index.html"))
-            }))
+            .route(
+                "/",
+                actix_web::web::get().to(|| async {
+                    actix_web::HttpResponse::Ok()
+                        .content_type("text/html; charset=utf-8")
+                        .body(include_str!("../static/index.html"))
+                }),
+            )
     })
     .bind(&web_addr)
     .with_context(|| format!("Failed to bind web server on {}", web_addr))?;

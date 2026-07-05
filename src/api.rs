@@ -1,7 +1,7 @@
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{HttpResponse, Responder, web};
+use parking_lot::RwLock;
 use serde::Deserialize;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use crate::db::{self, DbPool};
 use crate::lists::DomainStore;
@@ -61,10 +61,7 @@ async fn get_settings(pool: web::Data<DbPool>) -> impl Responder {
     HttpResponse::Ok().json(settings)
 }
 
-async fn update_setting(
-    pool: web::Data<DbPool>,
-    body: web::Json<SettingUpdate>,
-) -> impl Responder {
+async fn update_setting(pool: web::Data<DbPool>, body: web::Json<SettingUpdate>) -> impl Responder {
     db::set_setting(&pool, &body.key, &body.value);
     HttpResponse::Ok().json(serde_json::json!({"ok": true}))
 }
@@ -76,18 +73,12 @@ async fn get_upstreams(pool: web::Data<DbPool>) -> impl Responder {
     HttpResponse::Ok().json(upstreams)
 }
 
-async fn add_upstream(
-    pool: web::Data<DbPool>,
-    body: web::Json<UpstreamAdd>,
-) -> impl Responder {
+async fn add_upstream(pool: web::Data<DbPool>, body: web::Json<UpstreamAdd>) -> impl Responder {
     let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53));
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
-async fn delete_upstream(
-    pool: web::Data<DbPool>,
-    path: web::Path<i64>,
-) -> impl Responder {
+async fn delete_upstream(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl Responder {
     let id = path.into_inner();
     if db::delete_upstream(&pool, id) {
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -120,7 +111,10 @@ async fn delete_blocklist_domain(
 ) -> impl Responder {
     let id = path.into_inner();
     let domains = db::get_domains(&pool, "blocklist_domains");
-    let domain = domains.iter().find(|d| d.id == id).map(|d| d.domain.clone());
+    let domain = domains
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "blocklist_domains", id) {
         if let Some(ref d) = domain {
             remove_domain(&mut blocklist.write(), d);
@@ -165,7 +159,10 @@ async fn delete_allowlist_domain(
 ) -> impl Responder {
     let id = path.into_inner();
     let domains = db::get_domains(&pool, "allowlist_domains");
-    let domain = domains.iter().find(|d| d.id == id).map(|d| d.domain.clone());
+    let domain = domains
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "allowlist_domains", id) {
         if let Some(ref d) = domain {
             remove_domain(&mut allowlist.write(), d);
@@ -198,7 +195,12 @@ async fn add_rewrite(
     rewrites: web::Data<Arc<RwLock<crate::lists::RewriteMap>>>,
     body: web::Json<RewriteAdd>,
 ) -> impl Responder {
-    let id = db::add_rewrite(&pool, &body.domain, body.ipv4.as_deref(), body.ipv6.as_deref());
+    let id = db::add_rewrite(
+        &pool,
+        &body.domain,
+        body.ipv4.as_deref(),
+        body.ipv6.as_deref(),
+    );
     let domain = body.domain.to_lowercase();
     let rule = crate::config::RewriteRule {
         domain: domain.clone(),
