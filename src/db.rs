@@ -18,6 +18,9 @@ pub fn create_pool(db_path: &str) -> Result<DbPool, r2d2::Error> {
 }
 
 fn init_schema(conn: &rusqlite::Connection) {
+    // Let SQLite retry for up to 5s instead of immediately returning SQLITE_BUSY.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")
+        .expect("failed to set busy_timeout");
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,

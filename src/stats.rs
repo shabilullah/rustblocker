@@ -312,66 +312,70 @@ impl QueryLog {
             )
             .unwrap_or(0);
 
-        let mut stmt = conn
-            .prepare("SELECT client_ip, COUNT(*) as cnt FROM query_log GROUP BY client_ip ORDER BY cnt DESC LIMIT ?1")
-            .unwrap();
-        let top_clients: Vec<ClientCount> = stmt
-            .query_map(rusqlite::params![limit], |row| {
-                Ok(ClientCount {
-                    ip: row.get(0)?,
-                    count: row.get(1)?,
+        let top_clients: Vec<ClientCount> = match conn.prepare(
+            "SELECT client_ip, COUNT(*) as cnt FROM query_log GROUP BY client_ip ORDER BY cnt DESC LIMIT ?1",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![limit], |row| {
+                    Ok(ClientCount {
+                        ip: row.get(0)?,
+                        count: row.get(1)?,
+                    })
                 })
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
 
-        let mut stmt = conn
-            .prepare("SELECT domain, COUNT(*) as cnt FROM query_log GROUP BY domain ORDER BY cnt DESC LIMIT ?1")
-            .unwrap();
-        let top_domains: Vec<DomainCount> = stmt
-            .query_map(rusqlite::params![limit], |row| {
-                Ok(DomainCount {
-                    domain: row.get(0)?,
-                    count: row.get(1)?,
+        let top_domains: Vec<DomainCount> = match conn.prepare(
+            "SELECT domain, COUNT(*) as cnt FROM query_log GROUP BY domain ORDER BY cnt DESC LIMIT ?1",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![limit], |row| {
+                    Ok(DomainCount {
+                        domain: row.get(0)?,
+                        count: row.get(1)?,
+                    })
                 })
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
 
         // Top blocked domains
-        let mut stmt = conn
-            .prepare("SELECT domain, COUNT(*) as cnt FROM query_log WHERE action = 'blocked' GROUP BY domain ORDER BY cnt DESC LIMIT ?1")
-            .unwrap();
-        let top_blocked_domains: Vec<DomainCount> = stmt
-            .query_map(rusqlite::params![limit], |row| {
-                Ok(DomainCount {
-                    domain: row.get(0)?,
-                    count: row.get(1)?,
+        let top_blocked_domains: Vec<DomainCount> = match conn.prepare(
+            "SELECT domain, COUNT(*) as cnt FROM query_log WHERE action = 'blocked' GROUP BY domain ORDER BY cnt DESC LIMIT ?1",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![limit], |row| {
+                    Ok(DomainCount {
+                        domain: row.get(0)?,
+                        count: row.get(1)?,
+                    })
                 })
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
 
         // Upstream stats
-        let mut stmt = conn
-            .prepare("SELECT resolver, COUNT(*), CAST(AVG(latency_us) AS INTEGER), MIN(latency_us), MAX(latency_us) FROM query_log WHERE resolver IS NOT NULL AND resolver != '' GROUP BY resolver ORDER BY COUNT(*) DESC")
-            .unwrap();
-        let upstream_stats: Vec<UpstreamStats> = stmt
-            .query_map([], |row| {
-                Ok(UpstreamStats {
-                    resolver: row.get(0)?,
-                    count: row.get(1)?,
-                    avg_latency_us: row.get(2)?,
-                    min_latency_us: row.get(3)?,
-                    max_latency_us: row.get(4)?,
+        let upstream_stats: Vec<UpstreamStats> = match conn.prepare(
+            "SELECT resolver, COUNT(*), CAST(AVG(latency_us) AS INTEGER), MIN(latency_us), MAX(latency_us) FROM query_log WHERE resolver IS NOT NULL AND resolver != '' GROUP BY resolver ORDER BY COUNT(*) DESC",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| {
+                    Ok(UpstreamStats {
+                        resolver: row.get(0)?,
+                        count: row.get(1)?,
+                        avg_latency_us: row.get(2)?,
+                        min_latency_us: row.get(3)?,
+                        max_latency_us: row.get(4)?,
+                    })
                 })
-            })
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
 
         StatsSummary {
             total_queries: total,
@@ -393,27 +397,26 @@ impl QueryLog {
             Err(_) => return vec![],
         };
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, timestamp, client_ip, domain, query_type, action, resolver, latency_us FROM query_log ORDER BY id DESC LIMIT ?1 OFFSET ?2",
-            )
-            .unwrap();
-
-        stmt.query_map(rusqlite::params![limit, offset], |row| {
-            Ok(QueryLogEntry {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                client_ip: row.get(2)?,
-                domain: row.get(3)?,
-                query_type: row.get(4)?,
-                action: row.get(5)?,
-                resolver: row.get(6)?,
-                latency_us: row.get(7)?,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        match conn.prepare(
+            "SELECT id, timestamp, client_ip, domain, query_type, action, resolver, latency_us FROM query_log ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+        ) {
+            Ok(mut stmt) => stmt
+                .query_map(rusqlite::params![limit, offset], |row| {
+                    Ok(QueryLogEntry {
+                        id: row.get(0)?,
+                        timestamp: row.get(1)?,
+                        client_ip: row.get(2)?,
+                        domain: row.get(3)?,
+                        query_type: row.get(4)?,
+                        action: row.get(5)?,
+                        resolver: row.get(6)?,
+                        latency_us: row.get(7)?,
+                    })
+                })
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        }
     }
 
     /// Clear all query logs.
