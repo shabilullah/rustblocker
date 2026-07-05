@@ -6,7 +6,9 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::acl::SharedAcl;
+use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
+use crate::forwarder::ParallelForwarder;
 use crate::lists::DomainStore;
 use crate::stats::QueryLog;
 
@@ -137,17 +139,18 @@ async fn get_upstreams(
     let upstreams = db::get_upstreams(&pool);
     HttpResponse::Ok().json(upstreams)
 }
-
 async fn add_upstream(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    forwarder: web::Data<Arc<RwLock<ParallelForwarder>>>,
     body: web::Json<UpstreamAdd>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53));
+    reload_forwarder(&pool, &forwarder);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
@@ -155,16 +158,33 @@ async fn delete_upstream(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    forwarder: web::Data<Arc<RwLock<ParallelForwarder>>>,
     path: web::Path<i64>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    if db::delete_upstream(&pool, id) {
+    let ok = db::delete_upstream(&pool, id);
+    if ok {
+        reload_forwarder(&pool, &forwarder);
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
     } else {
         HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+    }
+}
+
+fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
+    let db_upstreams = db::get_upstreams(pool);
+    let upstreams: Vec<UpstreamConfig> = db_upstreams
+        .iter()
+        .map(|u| UpstreamConfig {
+            address: u.address.clone(),
+            port: Some(u.port as u16),
+        })
+        .collect();
+    if let Err(e) = forwarder.write().reload(&upstreams) {
+        warn!("Failed to reload forwarder: {}", e);
     }
 }
 

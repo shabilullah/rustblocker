@@ -126,10 +126,10 @@ async fn run_server(cli: Cli) -> Result<()> {
         })
         .collect();
 
-    let forwarder = Arc::new(
+    let forwarder = Arc::new(RwLock::new(
         ParallelForwarder::new(&upstreams, upstream_timeout)
             .context("Failed to create upstream forwarder")?,
-    );
+    ));
 
     let retention_days: u64 = get_setting_string(&pool, "stats_retention_days")
         .parse()
@@ -178,6 +178,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let rewrites_data = actix_web::web::Data::new(rewrites.clone());
     let acl_data = actix_web::web::Data::new(shared_acl.clone());
     let query_log_data = actix_web::web::Data::from(query_log.clone());
+    let forwarder_data = actix_web::web::Data::new(forwarder.clone());
 
     let web_server = actix_web::HttpServer::new(move || {
         actix_web::App::new()
@@ -194,6 +195,7 @@ async fn run_server(cli: Cli) -> Result<()> {
             .app_data(rewrites_data.clone())
             .app_data(acl_data.clone())
             .app_data(query_log_data.clone())
+            .app_data(forwarder_data.clone())
             .configure(api::configure)
             .route(
                 "/",

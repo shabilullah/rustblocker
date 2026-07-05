@@ -20,7 +20,7 @@ pub struct DnsBlockerHandler {
     pub blocklist: Arc<RwLock<DomainStore>>,
     pub allowlist: Arc<RwLock<DomainStore>>,
     pub rewrites: Arc<RwLock<RewriteMap>>,
-    forwarder: Arc<ParallelForwarder>,
+    forwarder: Arc<RwLock<ParallelForwarder>>,
     sinkhole_ipv4: Ipv4Addr,
     sinkhole_ipv6: Ipv6Addr,
     acl: SharedAcl,
@@ -33,7 +33,7 @@ impl DnsBlockerHandler {
         blocklist: Arc<RwLock<DomainStore>>,
         allowlist: Arc<RwLock<DomainStore>>,
         rewrites: Arc<RwLock<RewriteMap>>,
-        forwarder: Arc<ParallelForwarder>,
+        forwarder: Arc<RwLock<ParallelForwarder>>,
         sinkhole_ipv4: Ipv4Addr,
         sinkhole_ipv6: Ipv6Addr,
         acl: SharedAcl,
@@ -197,9 +197,9 @@ impl RequestHandler for DnsBlockerHandler {
             }
 
             // 3. Forward to upstream
-            debug!("Forwarding: {}", domain);
-            let result = self
-                .forwarder
+            let forwarder = self.forwarder.read().clone();
+            // Lock guard dropped here — safe to .await below.
+            let result = forwarder
                 .resolve(request, response_handle)
                 .await
                 .expect("forwarder failed to send response");

@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -23,9 +24,19 @@ pub struct ResolveResult {
 
 /// Parallel DNS forwarder that races queries across multiple upstream resolvers.
 pub struct ParallelForwarder {
-    resolvers: Vec<TokioResolver>,
-    addresses: Vec<String>,
+    resolvers: Arc<Vec<TokioResolver>>,
+    addresses: Arc<Vec<String>>,
     timeout: Duration,
+}
+
+impl Clone for ParallelForwarder {
+    fn clone(&self) -> Self {
+        Self {
+            resolvers: self.resolvers.clone(),
+            addresses: self.addresses.clone(),
+            timeout: self.timeout,
+        }
+    }
 }
 
 impl ParallelForwarder {
@@ -49,10 +60,19 @@ impl ParallelForwarder {
         }
 
         Ok(Self {
-            resolvers,
-            addresses,
+            resolvers: Arc::new(resolvers),
+            addresses: Arc::new(addresses),
             timeout: Duration::from_secs(timeout_secs),
         })
+    }
+
+    /// Reload upstream resolvers from a fresh config list.
+    /// Called after adding/removing upstreams via the web API.
+    pub fn reload(&mut self, upstreams: &[UpstreamConfig]) -> Result<()> {
+        let fresh = Self::new(upstreams, self.timeout.as_secs())?;
+        self.resolvers = fresh.resolvers;
+        self.addresses = fresh.addresses;
+        Ok(())
     }
 
     /// Race a DNS lookup across all upstream resolvers, return the first successful response.
