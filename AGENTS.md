@@ -31,6 +31,12 @@ If any check fails, fix it before proceeding. Never commit code that fails CI.
 ## Key Patterns
 
 - Use `parking_lot::Mutex` / `parking_lot::RwLock` instead of `std::sync` equivalents
+- `MessageResponseBuilder::build()` takes 5 args: `build(metadata, answers, authorities, soa, additionals)`
+- `Metadata::response_from_request()` then set `metadata.response_code` directly
+- `Record` fields (`name`, `ttl`, `data`) are accessed as fields, not methods
+- `Request` derefs to `MessageRequest` — access via `request.metadata`, `request.queries.queries()`
+- `NameServerConfig::udp_and_tcp(ip)` for upstream config (port 53 only)
+- `TokioResolver` = `Resolver<TokioRuntimeProvider>`, built via `Resolver::builder_with_config(config, TokioRuntimeProvider::default()).build()`
 
 ## File Structure
 
