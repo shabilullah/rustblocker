@@ -2,3 +2,5 @@
 rustblocker.db
 compiled-blocklist.txt
 compiled-allowlist.txt
+node_modules/
+package-lock.json

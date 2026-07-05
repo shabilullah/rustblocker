@@ -81,6 +81,8 @@ fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
         .to_string()
 }
 
+const CSP_POLICY: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'";
+
 async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
 
@@ -183,6 +185,13 @@ async fn run_server(cli: Cli) -> Result<()> {
 
     let web_server = actix_web::HttpServer::new(move || {
         actix_web::App::new()
+            .wrap(
+                actix_web::middleware::DefaultHeaders::new()
+                    .add(("Content-Security-Policy", CSP_POLICY))
+                    .add(("X-Content-Type-Options", "nosniff"))
+                    .add(("X-Frame-Options", "DENY"))
+                    .add(("Referrer-Policy", "no-referrer")),
+            )
             .app_data(pool_data.clone())
             .app_data(blocklist_data.clone())
             .app_data(allowlist_data.clone())
@@ -196,6 +205,15 @@ async fn run_server(cli: Cli) -> Result<()> {
                     actix_web::HttpResponse::Ok()
                         .content_type("text/html; charset=utf-8")
                         .body(include_str!("../static/index.html"))
+                }),
+            )
+            .route(
+                "/tailwind.min.css",
+                actix_web::web::get().to(|| async {
+                    actix_web::HttpResponse::Ok()
+                        .content_type("text/css; charset=utf-8")
+                        .insert_header(("Cache-Control", "public, max-age=86400"))
+                        .body(include_str!("../static/tailwind.min.css"))
                 }),
             )
     })
