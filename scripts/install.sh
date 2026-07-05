@@ -93,10 +93,10 @@ setup_data_dir() {
 }
 
 setup_service() {
-    if [ -d /etc/openrc ]; then
-        setup_openrc
-    elif [ -d /etc/systemd ]; then
+    if [ -d /run/systemd/system ]; then
         setup_systemd
+    elif command -v openrc-run >/dev/null 2>&1 || [ -f /sbin/openrc-run ]; then
+        setup_openrc
     else
         warn "No supported init system detected. Run '$INSTALL_DIR/$BINARY_NAME' manually."
     fi
@@ -154,20 +154,20 @@ SERVICEEOF
 }
 
 start_service() {
-    if [ -d /etc/openrc ]; then
-        rc-service "$SERVICE_NAME" start 2>/dev/null || true
-        info "Service started via OpenRC"
-    elif [ -d /etc/systemd ]; then
+    if [ -d /run/systemd/system ]; then
         systemctl start "$SERVICE_NAME" 2>/dev/null || true
         info "Service started via systemd"
+    elif command -v openrc-run >/dev/null 2>&1 || [ -f /sbin/openrc-run ]; then
+        rc-service "$SERVICE_NAME" start 2>/dev/null || true
+        info "Service started via OpenRC"
     fi
 }
 
 stop_service() {
-    if [ -d /etc/openrc ]; then
-        rc-service "$SERVICE_NAME" stop 2>/dev/null || true
-    elif [ -d /etc/systemd ]; then
+    if [ -d /run/systemd/system ]; then
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    elif command -v openrc-run >/dev/null 2>&1 || [ -f /sbin/openrc-run ]; then
+        rc-service "$SERVICE_NAME" stop 2>/dev/null || true
     fi
 }
 
@@ -180,18 +180,18 @@ uninstall() {
     stop_service || true
 
     # Remove service files
-    if [ -d /etc/openrc ]; then
-        if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
-            rc-update del "$SERVICE_NAME" 2>/dev/null || true
-            rm -f "/etc/init.d/$SERVICE_NAME"
-            info "Removed OpenRC service"
-        fi
-    elif [ -d /etc/systemd ]; then
+    if [ -d /run/systemd/system ]; then
         if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
             systemctl disable "$SERVICE_NAME" 2>/dev/null || true
             rm -f "/etc/systemd/system/$SERVICE_NAME.service"
             systemctl daemon-reload 2>/dev/null || true
             info "Removed systemd service"
+        fi
+    elif command -v openrc-run >/dev/null 2>&1 || [ -f /sbin/openrc-run ]; then
+        if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+            rc-update del "$SERVICE_NAME" 2>/dev/null || true
+            rm -f "/etc/init.d/$SERVICE_NAME"
+            info "Removed OpenRC service"
         fi
     fi
 
