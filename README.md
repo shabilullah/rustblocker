@@ -18,17 +18,24 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 
 ## Quick Start
 
-```bash
-# Build
-cargo build --release
+**One-line install (Alpine, Ubuntu, Debian, any Linux):**
 
-# Run — just start it, no config files needed
+```bash
+curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash
+```
+
+This installs the binary, sets up a system service (OpenRC or systemd), and starts it. Re-run to update.
+
+**Or build from source:**
+
+```bash
+cargo build --release
 ./target/release/rustblocker
 ```
 
 The server starts with sensible defaults:
-- DNS on `127.0.0.1:5353`
-- Web UI on `http://127.0.0.1:5354`
+- DNS on `127.0.0.1:8053`
+- Web UI on `http://127.0.0.1:8054`
 - Upstream: Google DNS (`8.8.8.8:53`)
 - Sinkhole: `0.0.0.0` (IPv4) / `::` (IPv6)
 
@@ -36,9 +43,16 @@ Open the web UI in your browser to configure everything. All settings are stored
 
 Port 53 requires elevated privileges — use `sudo` or run as root.
 
+**CLI options:**
+```bash
+rustblocker                          # Default: DNS 8053, web 8054
+rustblocker --dns-port 53            # DNS on port 53 (needs root)
+rustblocker --dns-port 5353 --web-port 8080  # Custom ports
+```
+
 ## Web Management UI
 
-Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:5354`).
+Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:8054`).
 
 - **Dashboard** — stats for blocked/allowed domains, rewrites, upstream servers
 - **Blocklist** — add, remove, bulk import blocked domains
@@ -86,21 +100,21 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 
 ```bash
 # Check health
-curl http://127.0.0.1:5354/api/health
+curl http://127.0.0.1:8054/api/health
 
 # Add a blocked domain
-curl -X POST http://127.0.0.1:5354/api/blocklist \
+curl -X POST http://127.0.0.1:8054/api/blocklist \
   -H "Content-Type: application/json" \
   -d '{"domain": "ads.example.com"}'
 
 # Remove a blocked domain
-curl -X DELETE http://127.0.0.1:5354/api/blocklist/1
+curl -X DELETE http://127.0.0.1:8054/api/blocklist/1
 
 # Get all settings
-curl http://127.0.0.1:5354/api/settings
+curl http://127.0.0.1:8054/api/settings
 
 # Bulk import a blocklist file
-curl -X POST http://127.0.0.1:5354/api/blocklist/import \
+curl -X POST http://127.0.0.1:8054/api/blocklist/import \
   -H "Content-Type: application/json" \
   -d '{"content": "0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com"}'
 ```
@@ -136,7 +150,7 @@ Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) r
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `listen_address` | `127.0.0.1` | Bind address |
-| `listen_port` | `5353` | DNS listen port (web UI on port+1) |
+| `listen_port` | `8053` | DNS listen port (web UI on port+1) |
 | `sinkhole_ipv4` | `0.0.0.0` | IPv4 returned for blocked domains |
 | `sinkhole_ipv6` | `::` | IPv6 returned for blocked domains |
 | `log_level` | `info` | Log level (overridable via `RUST_LOG` env var) |
@@ -144,16 +158,17 @@ Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) r
 
 ## Deploy on Alpine Linux
 
+### One-line install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash
+```
+
 ### Cross-compile from your machine
 
 ```bash
-# Install the musl target (Alpine uses musl libc)
 rustup target add x86_64-unknown-linux-musl
-
-# Build a fully static binary
 cargo build --release --target x86_64-unknown-linux-musl
-
-# Copy to Alpine — no runtime dependencies needed
 scp target/x86_64-unknown-linux-musl/release/rustblocker user@alpine:/usr/local/bin/
 ```
 
@@ -168,14 +183,14 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 
 FROM alpine:3.20
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/rustblocker /usr/local/bin/
-EXPOSE 53/udp 53/tcp 5354/tcp
+EXPOSE 53/udp 53/tcp 8054/tcp
 CMD ["rustblocker"]
 ```
 
 ```bash
 docker build -t rustblocker .
 docker run -d --name rustblocker \
-  -p 53:53/udp -p 53:53/tcp -p 5354:5354 \
+  -p 53:53/udp -p 53:53/tcp -p 8054:8054 \
   rustblocker
 ```
 
@@ -183,59 +198,9 @@ docker run -d --name rustblocker \
 
 ```bash
 apk add rust cargo musl-dev
-git clone <repo-url> && cd rustblocker
+git clone https://github.com/shabilullah/rustblocker.git && cd rustblocker
 cargo build --release
 cp target/release/rustblocker /usr/local/bin/
-```
-
-### Run as an OpenRC service
-
-Create `/etc/init.d/rustblocker`:
-
-```bash
-#!/sbin/openrc-run
-
-name="rustblocker"
-description="DNS Blocker"
-command="/usr/local/bin/rustblocker"
-command_background=true
-pidfile="/run/rustblocker.pid"
-output_log="/var/log/rustblocker.log"
-error_log="/var/log/rustblocker.log"
-
-depend() {
-    need net
-    after firewall
-}
-```
-
-```bash
-chmod +x /etc/init.d/rustblocker
-rc-update add rustblocker default
-rc-service rustblocker start
-```
-
-### Run as a systemd service
-
-Create `/etc/systemd/system/rustblocker.service`:
-
-```ini
-[Unit]
-Description=RustBlocker DNS Blocker
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/rustblocker
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl enable --now rustblocker
 ```
 
 ### Deployment directory layout
