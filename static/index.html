@@ -202,6 +202,7 @@
                             <th class="text-left py-2 px-2">Domain</th>
                             <th class="text-left py-2 px-2">Type</th>
                             <th class="text-left py-2 px-2">Action</th>
+                            <th class="text-left py-2 px-2">Upstream</th>
                         </tr></thead>
                         <tbody id="stats-query-log"></tbody>
                     </table>
@@ -667,7 +668,6 @@
     let reconnectTimer = null;
     let dashboardInterval = null;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
-
     function renderQueryRow(q) {
         const now = new Date();
         const ts = q.timestamp || now.toISOString().slice(0, 19).replace('T', ' ');
@@ -677,6 +677,7 @@
             <td class="py-1.5 px-2 font-mono truncate max-w-xs">${q.domain}</td>
             <td class="py-1.5 px-2 text-gray-400">${q.query_type}</td>
             <td class="py-1.5 px-2 font-medium ${actionColors[q.action] || 'text-gray-400'}">${q.action}</td>
+            <td class="py-1.5 px-2 font-mono text-gray-400">${q.resolver || '-'}</td>
         </tr>`;
     }
 
@@ -746,7 +747,7 @@
         const tbody = document.getElementById('stats-query-log');
         tbody.innerHTML = queries.length
             ? queries.map(q => renderQueryRow(q)).join('')
-            : '<tr><td colspan="5" class="py-4 text-center text-gray-500">No queries logged yet</td></tr>';
+            : '<tr><td colspan="6" class="py-4 text-center text-gray-500">No queries logged yet</td></tr>';
 
         document.getElementById('stats-prev').disabled = statsOffset === 0;
         document.getElementById('stats-next').disabled = queries.length < STATS_PAGE;
