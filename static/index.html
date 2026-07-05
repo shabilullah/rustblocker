@@ -71,7 +71,7 @@
 
         <!-- Sources -->
         <div id="tab-sources" class="tab-content hidden">
-            <p class="text-sm text-gray-400 mb-4">Manage blocklist/allowlist URLs. Sources are automatically refreshed on a schedule. Domains are imported into the database and hot-reloaded into the DNS handler.</p>
+            <p class="text-sm text-gray-400 mb-4">Manage blocklist/allowlist URLs. Sources are automatically refreshed on a schedule.</p>
             <div class="flex gap-3 mb-4">
                 <input id="source-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                 <select id="source-type" class="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
@@ -206,7 +206,7 @@
 
         const srcDiv = document.getElementById('dashboard-sources');
         if (!sources.length) {
-            srcDiv.innerHTML = '<div class="text-gray-500">No auto-update sources configured. Add them in the Sources tab.</div>';
+            srcDiv.innerHTML = '<div class="text-gray-500">No auto-update sources configured.</div>';
         } else {
             srcDiv.innerHTML = sources.map(s =>
                 `<div class="flex items-center justify-between py-1 border-b border-gray-700 last:border-0">
@@ -261,7 +261,7 @@
         document.getElementById('source-count').textContent = data.length + ' source(s)';
         const list = document.getElementById('source-list');
         if (!data.length) {
-            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No sources configured. Add a URL above to auto-fetch blocklists.</div>';
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No sources configured.</div>';
             return;
         }
         list.innerHTML = data.map(s =>
@@ -512,18 +512,26 @@
             {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
             {key: 'log_level', label: 'Log Level'},
             {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
+            {key: 'allowed_networks', label: 'Allowed Networks (CIDR, comma-separated)'},
         ];
-        form.innerHTML = fields.map(f =>
-            `<div>
+        form.innerHTML = fields.map(f => {
+            if (f.key === 'allowed_networks') {
+                return `<div class="md:col-span-2">
+                    <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
+                    <textarea id="setting-${f.key}" rows="2" placeholder="192.168.0.0/24, 10.0.0.0/22 (empty = allow all)"
+                        class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">${data[f.key] || ''}</textarea>
+                </div>`;
+            }
+            return `<div>
                 <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
                 <input id="setting-${f.key}" type="text" value="${data[f.key] || ''}"
                     class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-            </div>`
-        ).join('');
+            </div>`;
+        }).join('');
     }
 
     async function saveSettings() {
-        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs'];
+        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'allowed_networks'];
         for (const key of keys) {
             const el = document.getElementById('setting-' + key);
             if (el) {

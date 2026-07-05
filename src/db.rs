@@ -76,6 +76,7 @@ pub fn seed_defaults(pool: &DbPool) {
         ("sinkhole_ipv6", "::"),
         ("log_level", "info"),
         ("upstream_timeout_secs", "5"),
+        ("allowed_networks", ""),
     ];
     for (key, value) in &settings {
         conn.execute(

@@ -1,8 +1,11 @@
-use actix_web::{HttpResponse, Responder, web};
-use parking_lot::RwLock;
-use serde::Deserialize;
+use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+use serde::Deserialize;
+use tracing::warn;
+
+use crate::acl::SharedAcl;
 use crate::db::{self, DbPool};
 use crate::lists::DomainStore;
 
@@ -43,6 +46,18 @@ struct DomainQuery {
     offset: Option<i64>,
 }
 
+/// ACL check helper — logs rejection and returns false if not allowed.
+fn check_acl(req: &HttpRequest, acl: &SharedAcl) -> bool {
+    if let Some(addr) = req.peer_addr() {
+        let acl_guard = acl.read();
+        if !acl_guard.is_allowed(addr.ip()) {
+            warn!("Web ACL rejected: {}", addr.ip());
+            return false;
+        }
+    }
+    true
+}
+
 /// Resolve import content from either inline content or a URL.
 async fn resolve_import_content(body: &BulkImport) -> String {
     if let Some(url) = &body.url {
@@ -75,29 +90,73 @@ fn remove_domain(store: &mut DomainStore, domain: &str) {
 
 // --- Settings ---
 
-async fn get_settings(pool: web::Data<DbPool>) -> impl Responder {
+async fn get_settings(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let settings = db::get_settings(&pool);
     HttpResponse::Ok().json(settings)
 }
 
-async fn update_setting(pool: web::Data<DbPool>, body: web::Json<SettingUpdate>) -> impl Responder {
+async fn update_setting(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<SettingUpdate>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     db::set_setting(&pool, &body.key, &body.value);
+    // Hot-reload ACL when allowed_networks is changed
+    if body.key == "allowed_networks" {
+        let mut acl_guard = acl.write();
+        *acl_guard = crate::acl::Acl::parse(&body.value);
+        tracing::info!("ACL reloaded: {}", body.value);
+    }
     HttpResponse::Ok().json(serde_json::json!({"ok": true}))
 }
 
 // --- Upstreams ---
 
-async fn get_upstreams(pool: web::Data<DbPool>) -> impl Responder {
+async fn get_upstreams(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let upstreams = db::get_upstreams(&pool);
     HttpResponse::Ok().json(upstreams)
 }
 
-async fn add_upstream(pool: web::Data<DbPool>, body: web::Json<UpstreamAdd>) -> impl Responder {
+async fn add_upstream(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<UpstreamAdd>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53));
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
-async fn delete_upstream(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl Responder {
+async fn delete_upstream(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    path: web::Path<i64>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = path.into_inner();
     if db::delete_upstream(&pool, id) {
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -108,7 +167,15 @@ async fn delete_upstream(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl 
 
 // --- Blocklist domains ---
 
-async fn get_blocklist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) -> impl Responder {
+async fn get_blocklist(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query: web::Query<DomainQuery>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let search = query.search.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
@@ -122,9 +189,14 @@ async fn get_blocklist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) 
 
 async fn add_blocklist_domain(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<DomainAdd>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = db::add_domain(&pool, "blocklist_domains", &body.domain);
     insert_domain(&mut blocklist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
@@ -132,9 +204,14 @@ async fn add_blocklist_domain(
 
 async fn delete_blocklist_domain(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     path: web::Path<i64>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = path.into_inner();
     let domains = db::get_domains(&pool, "blocklist_domains");
     let domain = domains
@@ -142,7 +219,7 @@ async fn delete_blocklist_domain(
         .find(|d| d.id == id)
         .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "blocklist_domains", id) {
-        if let Some(d) = &domain {
+        if let Some(ref d) = domain {
             remove_domain(&mut blocklist.write(), d);
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -153,9 +230,14 @@ async fn delete_blocklist_domain(
 
 async fn bulk_import_blocklist(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let content = resolve_import_content(&body).await;
     if content.is_empty() {
         return HttpResponse::BadRequest()
@@ -168,7 +250,15 @@ async fn bulk_import_blocklist(
 
 // --- Allowlist domains ---
 
-async fn get_allowlist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) -> impl Responder {
+async fn get_allowlist(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query: web::Query<DomainQuery>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let search = query.search.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
@@ -182,9 +272,14 @@ async fn get_allowlist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) 
 
 async fn add_allowlist_domain(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<DomainAdd>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = db::add_domain(&pool, "allowlist_domains", &body.domain);
     insert_domain(&mut allowlist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
@@ -192,9 +287,14 @@ async fn add_allowlist_domain(
 
 async fn delete_allowlist_domain(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
     path: web::Path<i64>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = path.into_inner();
     let domains = db::get_domains(&pool, "allowlist_domains");
     let domain = domains
@@ -202,7 +302,7 @@ async fn delete_allowlist_domain(
         .find(|d| d.id == id)
         .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "allowlist_domains", id) {
-        if let Some(d) = &domain {
+        if let Some(ref d) = domain {
             remove_domain(&mut allowlist.write(), d);
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -213,9 +313,14 @@ async fn delete_allowlist_domain(
 
 async fn bulk_import_allowlist(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let content = resolve_import_content(&body).await;
     if content.is_empty() {
         return HttpResponse::BadRequest()
@@ -228,16 +333,28 @@ async fn bulk_import_allowlist(
 
 // --- Rewrites ---
 
-async fn get_rewrites(pool: web::Data<DbPool>) -> impl Responder {
+async fn get_rewrites(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let rewrites = db::get_rewrites(&pool);
     HttpResponse::Ok().json(rewrites)
 }
 
 async fn add_rewrite(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     rewrites: web::Data<Arc<RwLock<crate::lists::RewriteMap>>>,
     body: web::Json<RewriteAdd>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = db::add_rewrite(
         &pool,
         &body.domain,
@@ -256,14 +373,19 @@ async fn add_rewrite(
 
 async fn delete_rewrite(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     rewrites: web::Data<Arc<RwLock<crate::lists::RewriteMap>>>,
     path: web::Path<i64>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = path.into_inner();
     let all = db::get_rewrites(&pool);
     let domain = all.iter().find(|r| r.id == id).map(|r| r.domain.clone());
     if db::delete_rewrite(&pool, id) {
-        if let Some(d) = &domain {
+        if let Some(ref d) = domain {
             rewrites.write().rules.remove(&d.to_lowercase());
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -271,6 +393,7 @@ async fn delete_rewrite(
         HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
     }
 }
+
 // --- Sources ---
 
 #[derive(Debug, Deserialize)]
@@ -280,22 +403,33 @@ struct SourceAdd {
     update_interval_hours: Option<i64>,
 }
 
-async fn get_sources(pool: web::Data<DbPool>) -> impl Responder {
+async fn get_sources(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let sources = db::get_sources(&pool);
     HttpResponse::Ok().json(sources)
 }
 
 async fn add_source(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<SourceAdd>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let list_type = body.list_type.as_deref().unwrap_or("blocklist");
     let interval = body.update_interval_hours.unwrap_or(24);
     let id = db::add_source(&pool, &body.url, list_type, interval);
 
-    // Immediate first fetch
     let source = db::DbSource {
         id,
         url: body.url.clone(),
@@ -310,7 +444,15 @@ async fn add_source(
     HttpResponse::Created().json(serde_json::json!({"id": id, "status": status}))
 }
 
-async fn delete_source(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl Responder {
+async fn delete_source(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    path: web::Path<i64>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let id = path.into_inner();
     if db::delete_source(&pool, id) {
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -321,9 +463,14 @@ async fn delete_source(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl Re
 
 async fn refresh_all_sources(
     pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
 ) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
     let sources = db::get_sources(&pool);
     let mut results = Vec::new();
     for source in &sources {

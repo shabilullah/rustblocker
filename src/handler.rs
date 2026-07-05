@@ -11,6 +11,7 @@ use hickory_server::zone_handler::MessageResponseBuilder;
 use parking_lot::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::acl::SharedAcl;
 use crate::forwarder::ParallelForwarder;
 use crate::lists::{DomainStore, RewriteMap, normalize_domain};
 
@@ -21,6 +22,7 @@ pub struct DnsBlockerHandler {
     forwarder: Arc<ParallelForwarder>,
     sinkhole_ipv4: Ipv4Addr,
     sinkhole_ipv6: Ipv6Addr,
+    acl: SharedAcl,
 }
 
 impl DnsBlockerHandler {
@@ -31,6 +33,7 @@ impl DnsBlockerHandler {
         forwarder: Arc<ParallelForwarder>,
         sinkhole_ipv4: Ipv4Addr,
         sinkhole_ipv6: Ipv6Addr,
+        acl: SharedAcl,
     ) -> Self {
         Self {
             blocklist,
@@ -39,11 +42,11 @@ impl DnsBlockerHandler {
             forwarder,
             sinkhole_ipv4,
             sinkhole_ipv6,
+            acl,
         }
     }
 }
 
-/// Build a sinkhole or rewrite response record.
 fn build_rdata(query_type: RecordType, ipv4: Ipv4Addr, ipv6: Ipv6Addr) -> RData {
     match query_type {
         RecordType::AAAA => RData::AAAA(AAAA::from(ipv6)),
@@ -65,6 +68,22 @@ impl RequestHandler for DnsBlockerHandler {
         'life1: 'async_trait,
     {
         Box::pin(async move {
+            // ACL check — extract bool, drop guard, then async
+            let src_ip = request.src().ip();
+            let is_blocked = {
+                let acl = self.acl.read();
+                !acl.is_allowed(src_ip)
+            };
+            if is_blocked {
+                warn!("ACL rejected: {}", src_ip);
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let response = builder.error_msg(&request.metadata, ResponseCode::Refused);
+                let mut rh = response_handle;
+                return rh
+                    .send_response(response)
+                    .await
+                    .expect("failed to send REFUSED");
+            }
             let query = match request.queries.queries().first() {
                 Some(q) => q,
                 None => {
@@ -84,9 +103,9 @@ impl RequestHandler for DnsBlockerHandler {
             let query_type = query.query_type();
             let query_name = hickory_proto::rr::Name::from(query.name());
 
-            debug!("Query: {} ({})", domain, query_type);
+            debug!("Query from {}: {} ({})", src_ip, domain, query_type);
 
-            // 1. Check rewrite map — scope the read guard before any .await
+            // 1. Check rewrite map
             let rewrite_rdata: Option<RData> = {
                 let rewrites = self.rewrites.read();
                 rewrites.lookup(&domain).and_then(|rule| match query_type {
@@ -102,7 +121,7 @@ impl RequestHandler for DnsBlockerHandler {
                         .map(|ip| RData::AAAA(AAAA::from(ip))),
                     _ => None,
                 })
-            }; // rewrites guard dropped here
+            };
 
             if let Some(rdata) = rewrite_rdata {
                 info!("Rewrite: {} -> {}", domain, rdata);
@@ -120,7 +139,7 @@ impl RequestHandler for DnsBlockerHandler {
                     .expect("failed to send rewrite response");
             }
 
-            // 2. Check allowlist, then blocklist — scope guards before any .await
+            // 2. Check allowlist, then blocklist
             let action: Option<RData> = {
                 let allowlist = self.allowlist.read();
                 if allowlist.matches(&domain) {
@@ -139,7 +158,7 @@ impl RequestHandler for DnsBlockerHandler {
                         None
                     }
                 }
-            }; // both guards dropped here
+            };
 
             if let Some(rdata) = action {
                 let builder = MessageResponseBuilder::from_message_request(request);
@@ -156,7 +175,7 @@ impl RequestHandler for DnsBlockerHandler {
                     .expect("failed to send sinkhole response");
             }
 
-            // 3. Forward to upstream (no locks held)
+            // 3. Forward to upstream
             debug!("Forwarding: {}", domain);
             let rh = response_handle;
             self.forwarder

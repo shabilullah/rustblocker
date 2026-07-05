@@ -1831,6 +1831,7 @@ dependencies = [
  "hickory-proto",
  "hickory-resolver",
  "hickory-server",
+ "ipnet",
  "parking_lot",
  "r2d2",
  "r2d2_sqlite",

@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::{info, warn};
 
+use rustblocker::acl;
 use rustblocker::api;
 use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
@@ -92,13 +93,19 @@ async fn run_server(cli: Cli) -> Result<()> {
         .parse()
         .unwrap_or(5);
 
-    // CLI flags override DB settings
     let dns_port = cli.dns_port.unwrap_or(db_dns_port);
     let web_port = cli.web_port.unwrap_or(dns_port + 1);
 
     let listen_addr: SocketAddr = format!("{}:{}", listen_address, dns_port)
         .parse()
         .context("Invalid listen address")?;
+
+    // Load ACL from database
+    let allowed_networks = get_setting_string(&pool, "allowed_networks");
+    let shared_acl = acl::load_acl_from_db(&pool);
+    if !allowed_networks.is_empty() {
+        info!("ACL enabled: {}", allowed_networks);
+    }
 
     let blocklist = Arc::new(RwLock::new(load_store_from_db(&pool, "blocklist_domains")));
     let allowlist = Arc::new(RwLock::new(load_store_from_db(&pool, "allowlist_domains")));
@@ -141,6 +148,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         forwarder.clone(),
         sinkhole_ipv4,
         sinkhole_ipv6,
+        shared_acl.clone(),
     );
 
     let mut server = hickory_server::server::Server::new(handler);
@@ -163,6 +171,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let blocklist_data = actix_web::web::Data::new(blocklist.clone());
     let allowlist_data = actix_web::web::Data::new(allowlist.clone());
     let rewrites_data = actix_web::web::Data::new(rewrites.clone());
+    let acl_data = actix_web::web::Data::new(shared_acl.clone());
 
     let web_server = actix_web::HttpServer::new(move || {
         actix_web::App::new()
@@ -170,6 +179,7 @@ async fn run_server(cli: Cli) -> Result<()> {
             .app_data(blocklist_data.clone())
             .app_data(allowlist_data.clone())
             .app_data(rewrites_data.clone())
+            .app_data(acl_data.clone())
             .configure(api::configure)
             .route(
                 "/",
@@ -199,7 +209,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let refresh_al = allowlist.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(600));
-        interval.tick().await; // skip first tick
+        interval.tick().await;
         loop {
             interval.tick().await;
             let stale = db::get_stale_sources(&refresh_pool);
