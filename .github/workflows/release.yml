@@ -40,19 +40,17 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cross-compile tools (aarch64 musl)
+      - name: Install cross (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          wget -q https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar xzf aarch64-linux-musl-cross.tgz
-          echo "$PWD/aarch64-linux-musl-cross/bin" >> $GITHUB_PATH
-          echo "[target.aarch64-unknown-linux-musl]" >> ~/.cargo/config.toml
-          echo "linker = 'aarch64-linux-musl-gcc'" >> ~/.cargo/config.toml
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build
+      - name: Build (native)
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Package (Linux)
         if: matrix.archive == 'tar.gz'
