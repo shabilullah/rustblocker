@@ -13,7 +13,8 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 - **REST API** — full CRUD for blocklists, allowlists, rewrites, settings, and upstreams
 - **SQLite database** — portable single-file storage, zero-config startup
 - **Hot-reload** — blocklist/allowlist/rewrite changes via web UI take effect immediately
-- **URL blocklists** — fetch remote blocklists from URLs via the API
+- **Auto-update sources** — add blocklist URLs, set update interval, automatic refresh on schedule
+- **URL import** — import blocklists from URLs via web UI or API
 - **Hosts file format** — auto-strips `0.0.0.0` / `127.0.0.1` prefixes
 
 ## Quick Start
@@ -53,9 +54,11 @@ rustblocker --dns-port 5353 --web-port 8080   # Custom ports (useful for local d
 
 Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:54`).
 
-- **Dashboard** — stats for blocked/allowed domains, rewrites, upstream servers
-- **Blocklist** — add, remove, bulk import blocked domains
-- **Allowlist** — add, remove, bulk import allowed domains
+- **Dashboard** — stats for blocked/allowed domains, rewrites, upstream servers, auto-update sources
+- **Upstreams** — add/remove upstream DNS servers
+- **Sources** — manage auto-update blocklist/allowlist URLs with configurable refresh intervals
+- **Blocklist** — add, remove, bulk import, search/paginate blocked domains; import from URL
+- **Allowlist** — add, remove, bulk import, search/paginate allowed domains; import from URL
 - **Rewrites** — manage DNS rewrite rules (domain → custom IP)
 - **Settings** — configure listen address, port, sinkhole IPs, upstream timeout
 - **Theme** — dark mode with TailwindCSS
@@ -90,10 +93,11 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 | `GET` | `/api/allowlist` | List allowed domains |
 | `POST` | `/api/allowlist` | Add allowed domain |
 | `DELETE` | `/api/allowlist/{id}` | Remove allowed domain |
-| `POST` | `/api/allowlist/import` | Bulk import allowlist |
-| `GET` | `/api/rewrites` | List DNS rewrites |
-| `POST` | `/api/rewrites` | Add DNS rewrite |
 | `DELETE` | `/api/rewrites/{id}` | Remove DNS rewrite |
+| `GET` | `/api/sources` | List auto-update sources |
+| `POST` | `/api/sources` | Add source (immediately fetches) |
+| `DELETE` | `/api/sources/{id}` | Remove source |
+| `POST` | `/api/sources/refresh` | Refresh all sources now |
 
 ### Example API usage
 
@@ -117,6 +121,48 @@ curl -X POST http://127.0.0.1:54/api/blocklist/import \
   -H "Content-Type: application/json" \
   -d '{"content": "0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com"}'
 ```
+
+## Auto-Update Sources
+
+RustBlocker can automatically fetch and update blocklists from URLs on a schedule. Manage sources via the **Sources** tab in the web UI.
+
+**Adding a source:**
+1. Go to the Sources tab
+2. Paste a URL (e.g., `https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts`)
+3. Choose type: Blocklist or Allowlist
+4. Set update interval (default: 24 hours)
+5. Click "Add Source"
+
+The server immediately fetches the URL and imports all domains. On subsequent runs, it auto-refreshes stale sources every 10 minutes.
+
+**Manual refresh:** Click "Refresh All Now" on the Sources tab or Dashboard to immediately re-fetch all sources.
+
+**API:**
+```bash
+# List sources
+curl http://127.0.0.1:54/api/sources
+
+# Add a source (immediately fetches)
+curl -X POST http://127.0.0.1:54/api/sources \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts", "list_type": "blocklist", "update_interval_hours": 24}'
+
+# Refresh all sources now
+curl -X POST http://127.0.0.1:54/api/sources/refresh
+```
+
+## URL Import
+
+Import blocklists directly from a URL without saving it as a source. Use the **Import URL** button on the Blocklist or Allowlist tab, or call the API:
+
+```bash
+curl -X POST http://127.0.0.1:54/api/blocklist/import \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"}'
+```
+
+This fetches the URL, parses all domains (including hosts-file format), and imports them. Use this for one-time imports; use Sources for recurring updates.
+
 
 ## Blocklist Format
 
