@@ -271,6 +271,70 @@ async fn delete_rewrite(
         HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
     }
 }
+// --- Sources ---
+
+#[derive(Debug, Deserialize)]
+struct SourceAdd {
+    url: String,
+    list_type: Option<String>,
+    update_interval_hours: Option<i64>,
+}
+
+async fn get_sources(pool: web::Data<DbPool>) -> impl Responder {
+    let sources = db::get_sources(&pool);
+    HttpResponse::Ok().json(sources)
+}
+
+async fn add_source(
+    pool: web::Data<DbPool>,
+    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
+    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    body: web::Json<SourceAdd>,
+) -> impl Responder {
+    let list_type = body.list_type.as_deref().unwrap_or("blocklist");
+    let interval = body.update_interval_hours.unwrap_or(24);
+    let id = db::add_source(&pool, &body.url, list_type, interval);
+
+    // Immediate first fetch
+    let source = db::DbSource {
+        id,
+        url: body.url.clone(),
+        list_type: list_type.to_string(),
+        enabled: true,
+        update_interval_hours: interval,
+        last_updated: None,
+        last_status: None,
+    };
+    let status = db::refresh_source(&pool, &source, Some(&blocklist), Some(&allowlist)).await;
+
+    HttpResponse::Created().json(serde_json::json!({"id": id, "status": status}))
+}
+
+async fn delete_source(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl Responder {
+    let id = path.into_inner();
+    if db::delete_source(&pool, id) {
+        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
+    } else {
+        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+    }
+}
+
+async fn refresh_all_sources(
+    pool: web::Data<DbPool>,
+    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
+    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+) -> impl Responder {
+    let sources = db::get_sources(&pool);
+    let mut results = Vec::new();
+    for source in &sources {
+        if !source.enabled {
+            continue;
+        }
+        let status = db::refresh_source(&pool, source, Some(&blocklist), Some(&allowlist)).await;
+        results.push(serde_json::json!({"id": source.id, "url": source.url, "status": status}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"refreshed": results.len(), "results": results}))
+}
 
 // --- Health ---
 
@@ -310,6 +374,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/allowlist/import", web::post().to(bulk_import_allowlist))
             .route("/rewrites", web::get().to(get_rewrites))
             .route("/rewrites", web::post().to(add_rewrite))
-            .route("/rewrites/{id}", web::delete().to(delete_rewrite)),
+            .route("/rewrites/{id}", web::delete().to(delete_rewrite))
+            .route("/sources", web::get().to(get_sources))
+            .route("/sources", web::post().to(add_source))
+            .route("/sources/{id}", web::delete().to(delete_source))
+            .route("/sources/refresh", web::post().to(refresh_all_sources)),
     );
 }

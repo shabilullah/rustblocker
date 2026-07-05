@@ -41,6 +41,15 @@ fn init_schema(conn: &rusqlite::Connection) {
             domain TEXT NOT NULL UNIQUE,
             ipv4 TEXT,
             ipv6 TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL UNIQUE,
+            list_type TEXT NOT NULL DEFAULT 'blocklist',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            update_interval_hours INTEGER NOT NULL DEFAULT 24,
+            last_updated TEXT,
+            last_status TEXT
         );",
     )
     .expect("failed to init schema");
@@ -358,4 +367,141 @@ pub fn delete_rewrite(pool: &DbPool, id: i64) -> bool {
         .execute("DELETE FROM rewrites WHERE id = ?1", params![id])
         .unwrap();
     rows > 0
+}
+
+// --- Sources (blocklist/allowlist URLs with auto-update) ---
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DbSource {
+    pub id: i64,
+    pub url: String,
+    pub list_type: String,
+    pub enabled: bool,
+    pub update_interval_hours: i64,
+    pub last_updated: Option<String>,
+    pub last_status: Option<String>,
+}
+
+pub fn get_sources(pool: &DbPool) -> Vec<DbSource> {
+    let conn = pool.get().expect("failed to get DB connection");
+    let mut stmt = conn
+        .prepare("SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status FROM sources ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(DbSource {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            list_type: row.get(2)?,
+            enabled: row.get::<_, i64>(3)? != 0,
+            update_interval_hours: row.get(4)?,
+            last_updated: row.get(5)?,
+            last_status: row.get(6)?,
+        })
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+pub fn add_source(pool: &DbPool, url: &str, list_type: &str, interval_hours: i64) -> i64 {
+    let conn = pool.get().expect("failed to get DB connection");
+    conn.execute(
+        "INSERT OR IGNORE INTO sources (url, list_type, enabled, update_interval_hours) VALUES (?1, ?2, 1, ?3)",
+        params![url, list_type, interval_hours],
+    ).ok();
+    conn.last_insert_rowid()
+}
+
+pub fn delete_source(pool: &DbPool, id: i64) -> bool {
+    let conn = pool.get().expect("failed to get DB connection");
+    let rows = conn
+        .execute("DELETE FROM sources WHERE id = ?1", params![id])
+        .unwrap();
+    rows > 0
+}
+
+pub fn update_source_status(pool: &DbPool, id: i64, status: &str) {
+    let conn = pool.get().expect("failed to get DB connection");
+    conn.execute(
+        "UPDATE sources SET last_updated = datetime('now'), last_status = ?1 WHERE id = ?2",
+        params![status, id],
+    )
+    .ok();
+}
+
+pub fn get_stale_sources(pool: &DbPool) -> Vec<DbSource> {
+    let conn = pool.get().expect("failed to get DB connection");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status
+             FROM sources
+             WHERE enabled = 1 AND (
+                 last_updated IS NULL
+                 OR datetime(last_updated, '+' || update_interval_hours || ' hours') <= datetime('now')
+             )
+             ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map([], |row| {
+        Ok(DbSource {
+            id: row.get(0)?,
+            url: row.get(1)?,
+            list_type: row.get(2)?,
+            enabled: row.get::<_, i64>(3)? != 0,
+            update_interval_hours: row.get(4)?,
+            last_updated: row.get(5)?,
+            last_status: row.get(6)?,
+        })
+    })
+    .unwrap()
+    .filter_map(|r| r.ok())
+    .collect()
+}
+
+/// Refresh a single source: fetch URL, import domains, update status.
+/// Returns a status string like "ok: 12345 domains" or "failed: ...".
+pub async fn refresh_source(
+    pool: &DbPool,
+    source: &DbSource,
+    blocklist_store: Option<&parking_lot::RwLock<crate::lists::DomainStore>>,
+    allowlist_store: Option<&parking_lot::RwLock<crate::lists::DomainStore>>,
+) -> String {
+    let table = match source.list_type.as_str() {
+        "allowlist" => "allowlist_domains",
+        _ => "blocklist_domains",
+    };
+
+    info!("Refreshing source: {} ({})", source.url, source.list_type);
+    let content = fetch_source(&source.url).await;
+    if content.is_empty() {
+        let status = "failed: empty response".to_string();
+        update_source_status(pool, source.id, &status);
+        return status;
+    }
+
+    let count = bulk_import_domains(pool, table, &content);
+    let status = format!("ok: {} domains", count);
+    update_source_status(pool, source.id, &status);
+
+    // Reload in-memory store
+    let store = match source.list_type.as_str() {
+        "allowlist" => allowlist_store,
+        _ => blocklist_store,
+    };
+    if let Some(store) = store {
+        let domains = get_domains(pool, table);
+        let mut s = store.write();
+        s.exact.clear();
+        s.wildcards.clear();
+        for d in &domains {
+            if let Some(stripped) = d.domain.strip_prefix("*.") {
+                s.wildcards.insert(stripped.to_lowercase());
+            } else {
+                s.exact.insert(d.domain.to_lowercase());
+            }
+        }
+    }
+
+    info!("Source refreshed: {} -> {}", source.url, status);
+    status
 }

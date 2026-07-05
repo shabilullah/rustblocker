@@ -193,6 +193,29 @@ async fn run_server(cli: Cli) -> Result<()> {
         web_port,
     );
 
+    // Auto-refresh stale sources every 10 minutes
+    let refresh_pool = pool.clone();
+    let refresh_bl = blocklist.clone();
+    let refresh_al = allowlist.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(600));
+        interval.tick().await; // skip first tick
+        loop {
+            interval.tick().await;
+            let stale = db::get_stale_sources(&refresh_pool);
+            if stale.is_empty() {
+                continue;
+            }
+            info!("Auto-refreshing {} stale source(s)...", stale.len());
+            for source in &stale {
+                let status =
+                    db::refresh_source(&refresh_pool, source, Some(&refresh_bl), Some(&refresh_al))
+                        .await;
+                info!("Auto-refreshed {}: {}", source.url, status);
+            }
+        }
+    });
+
     tokio::select! {
         result = web_handle => {
             if let Err(e) = result {

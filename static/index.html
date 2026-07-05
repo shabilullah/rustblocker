@@ -19,13 +19,14 @@
 
     <div class="max-w-6xl mx-auto p-6">
         <!-- Tabs -->
-        <div class="flex gap-1 mb-6 border-b border-gray-700">
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-400 text-emerald-400" data-tab="dashboard">Dashboard</button>
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="upstreams">Upstreams</button>
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="blocklist">Blocklist</button>
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="allowlist">Allowlist</button>
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="rewrites">Rewrites</button>
-            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="settings">Settings</button>
+        <div class="flex gap-1 mb-6 border-b border-gray-700 overflow-x-auto">
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-400 text-emerald-400 whitespace-nowrap" data-tab="dashboard">Dashboard</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="upstreams">Upstreams</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="sources">Sources</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="blocklist">Blocklist</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="allowlist">Allowlist</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="rewrites">Rewrites</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200 whitespace-nowrap" data-tab="settings">Settings</button>
         </div>
 
         <!-- Dashboard -->
@@ -48,6 +49,13 @@
                     <div id="stat-upstreams" class="text-3xl font-bold text-purple-400">-</div>
                 </div>
             </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-semibold">Auto-Update Sources</h2>
+                    <button onclick="refreshAllSources()" id="refresh-all-btn" class="bg-yellow-600 hover:bg-yellow-700 px-3 py-1 rounded text-sm font-medium">Refresh All Now</button>
+                </div>
+                <div id="dashboard-sources" class="text-sm text-gray-300">Loading...</div>
+            </div>
         </div>
 
         <!-- Upstreams -->
@@ -59,6 +67,26 @@
             </div>
             <div id="upstream-count" class="text-sm text-gray-400 mb-2"></div>
             <div id="upstream-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
+        </div>
+
+        <!-- Sources -->
+        <div id="tab-sources" class="tab-content hidden">
+            <p class="text-sm text-gray-400 mb-4">Manage blocklist/allowlist URLs. Sources are automatically refreshed on a schedule. Domains are imported into the database and hot-reloaded into the DNS handler.</p>
+            <div class="flex gap-3 mb-4">
+                <input id="source-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <select id="source-type" class="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                    <option value="blocklist">Blocklist</option>
+                    <option value="allowlist">Allowlist</option>
+                </select>
+                <input id="source-interval" type="number" placeholder="24" value="24" title="Update interval (hours)" class="w-20 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addSource()" id="add-source-btn" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded text-sm font-medium">Add Source</button>
+            </div>
+            <div id="source-status" class="text-sm mb-2"></div>
+            <div class="flex justify-between items-center mb-2">
+                <span id="source-count" class="text-sm text-gray-400"></span>
+                <button onclick="refreshAllSources()" id="refresh-sources-btn" class="bg-yellow-600 hover:bg-yellow-700 px-3 py-1 rounded text-sm font-medium">Refresh All Now</button>
+            </div>
+            <div id="source-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
         </div>
 
         <!-- Blocklist -->
@@ -153,6 +181,7 @@
         switch(tab) {
             case 'dashboard': return loadDashboard();
             case 'upstreams': return loadUpstreams();
+            case 'sources': return loadSources();
             case 'blocklist': return loadDomainList('blocklist');
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
@@ -160,18 +189,35 @@
         }
     }
 
+    // --- Dashboard ---
+
     async function loadDashboard() {
-        const [blocklist, allowlist, rewrites, upstreams] = await Promise.all([
+        const [blocklist, allowlist, rewrites, upstreams, sources] = await Promise.all([
             fetch(API + '/blocklist?limit=0').then(r => r.json()),
             fetch(API + '/allowlist?limit=0').then(r => r.json()),
             fetch(API + '/rewrites').then(r => r.json()),
             fetch(API + '/upstreams').then(r => r.json()),
+            fetch(API + '/sources').then(r => r.json()),
         ]);
         document.getElementById('stat-blocked').textContent = blocklist.total;
         document.getElementById('stat-allowed').textContent = allowlist.total;
         document.getElementById('stat-rewrites').textContent = rewrites.length;
         document.getElementById('stat-upstreams').textContent = upstreams.length;
+
+        const srcDiv = document.getElementById('dashboard-sources');
+        if (!sources.length) {
+            srcDiv.innerHTML = '<div class="text-gray-500">No auto-update sources configured. Add them in the Sources tab.</div>';
+        } else {
+            srcDiv.innerHTML = sources.map(s =>
+                `<div class="flex items-center justify-between py-1 border-b border-gray-700 last:border-0">
+                    <span class="font-mono text-xs truncate max-w-md">${s.url}</span>
+                    <span class="text-xs px-2 py-0.5 rounded ${s.last_status && s.last_status.startsWith('ok') ? 'bg-green-900 text-green-300' : s.last_status ? 'bg-red-900 text-red-300' : 'bg-gray-700 text-gray-400'}">${s.last_status || 'pending'}</span>
+                </div>`
+            ).join('');
+        }
     }
+
+    // --- Upstreams ---
 
     async function loadUpstreams() {
         const data = await fetch(API + '/upstreams').then(r => r.json());
@@ -208,6 +254,86 @@
         loadUpstreams();
     }
 
+    // --- Sources ---
+
+    async function loadSources() {
+        const data = await fetch(API + '/sources').then(r => r.json());
+        document.getElementById('source-count').textContent = data.length + ' source(s)';
+        const list = document.getElementById('source-list');
+        if (!data.length) {
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No sources configured. Add a URL above to auto-fetch blocklists.</div>';
+            return;
+        }
+        list.innerHTML = data.map(s =>
+            `<div class="px-4 py-3 border-b border-gray-700 last:border-0">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="font-mono text-sm truncate max-w-lg">${s.url}</span>
+                    <button onclick="deleteSource(${s.id})" class="text-red-400 hover:text-red-300 text-xs ml-2">Remove</button>
+                </div>
+                <div class="flex gap-4 text-xs text-gray-400">
+                    <span>Type: <span class="text-gray-300">${s.list_type}</span></span>
+                    <span>Every: <span class="text-gray-300">${s.update_interval_hours}h</span></span>
+                    <span>Last: <span class="${s.last_status && s.last_status.startsWith('ok') ? 'text-green-400' : s.last_status ? 'text-red-400' : 'text-gray-500'}">${s.last_updated || 'never'}</span></span>
+                    <span>Status: <span class="${s.last_status && s.last_status.startsWith('ok') ? 'text-green-400' : s.last_status ? 'text-red-400' : 'text-gray-500'}">${s.last_status || 'pending'}</span></span>
+                </div>
+            </div>`
+        ).join('');
+    }
+
+    async function addSource() {
+        const url = document.getElementById('source-url').value.trim();
+        if (!url) return;
+        const list_type = document.getElementById('source-type').value;
+        const interval = parseInt(document.getElementById('source-interval').value) || 24;
+        const btn = document.getElementById('add-source-btn');
+        const status = document.getElementById('source-status');
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner"></span> Adding...';
+        status.innerHTML = '<span class="spinner spinner-lg"></span> Fetching and importing...';
+        status.className = 'text-sm text-emerald-400 mb-2';
+        const resp = await fetch(API + '/sources', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url, list_type, update_interval_hours: interval})
+        });
+        const result = await resp.json();
+        btn.disabled = false;
+        btn.innerHTML = 'Add Source';
+        status.innerHTML = '';
+        status.className = 'text-sm mb-2';
+        showSourceStatus(resp.ok ? `Added! ${result.status}` : `Error: ${result.error || 'failed'}`, resp.ok);
+        document.getElementById('source-url').value = '';
+        loadSources();
+    }
+
+    async function deleteSource(id) {
+        await fetch(API + '/sources/' + id, {method: 'DELETE'});
+        loadSources();
+    }
+
+    async function refreshAllSources() {
+        const btn = document.getElementById('refresh-all-btn') || document.getElementById('refresh-sources-btn');
+        if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Refreshing...'; }
+        const status = document.getElementById('source-status');
+        if (status) { status.innerHTML = '<span class="spinner spinner-lg"></span> Refreshing all sources...'; status.className = 'text-sm text-emerald-400 mb-2'; }
+        const resp = await fetch(API + '/sources/refresh', {method: 'POST'});
+        const result = await resp.json();
+        if (btn) { btn.disabled = false; btn.innerHTML = 'Refresh All Now'; }
+        if (status) { status.innerHTML = ''; status.className = 'text-sm mb-2'; }
+        showSourceStatus(`Refreshed ${result.refreshed} source(s)`, true);
+        loadSources();
+    }
+
+    function showSourceStatus(msg, ok) {
+        const status = document.getElementById('source-status');
+        if (!status) return;
+        status.textContent = msg;
+        status.className = 'text-sm mb-2 ' + (ok ? 'text-emerald-400' : 'text-red-400');
+        setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 5000);
+    }
+
+    // --- Domains (blocklist / allowlist) ---
+
     async function loadDomainList(type) {
         const s = state[type];
         const params = new URLSearchParams({limit: PAGE_SIZE, offset: s.offset});
@@ -232,7 +358,6 @@
             ).join('');
         }
 
-        // Pagination
         const pag = document.getElementById(type + '-pagination');
         const prevDisabled = s.offset <= 0 ? 'disabled opacity-50' : '';
         const nextDisabled = s.offset + PAGE_SIZE >= total ? 'disabled opacity-50' : '';
@@ -321,12 +446,12 @@
 
     function showStatus(type, msg, isError) {
         const status = document.getElementById(type + '-status');
+        if (!status) return;
         status.textContent = msg;
         status.className = 'text-sm mb-2 ' + (isError ? 'text-red-400' : 'text-emerald-400');
         setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 5000);
     }
 
-    // Debounced search
     let searchTimers = {};
     function onSearch(type) {
         clearTimeout(searchTimers[type]);
@@ -336,6 +461,8 @@
             loadDomainList(type);
         }, 300);
     }
+
+    // --- Rewrites ---
 
     async function loadRewrites() {
         const data = await fetch(API + '/rewrites').then(r => r.json());
@@ -372,6 +499,8 @@
         await fetch(API + '/rewrites/' + id, {method: 'DELETE'});
         loadRewrites();
     }
+
+    // --- Settings ---
 
     async function loadSettings() {
         const data = await fetch(API + '/settings').then(r => r.json());
@@ -410,6 +539,8 @@
         setTimeout(() => status.textContent = '', 3000);
     }
 
+    // --- Health ---
+
     async function checkHealth() {
         try {
             const r = await fetch(API + '/health');
@@ -422,12 +553,14 @@
         }
     }
 
-    // Enter key + search bindings
+    // --- Key bindings ---
+
     document.getElementById('blocklist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('blocklist'); });
     document.getElementById('allowlist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('allowlist'); });
     document.getElementById('upstream-address').addEventListener('keydown', e => { if (e.key === 'Enter') addUpstream(); });
     document.getElementById('blocklist-url').addEventListener('keydown', e => { if (e.key === 'Enter') importUrl('blocklist'); });
     document.getElementById('allowlist-url').addEventListener('keydown', e => { if (e.key === 'Enter') importUrl('allowlist'); });
+    document.getElementById('source-url').addEventListener('keydown', e => { if (e.key === 'Enter') addSource(); });
     document.getElementById('blocklist-search').addEventListener('input', () => onSearch('blocklist'));
     document.getElementById('allowlist-search').addEventListener('input', () => onSearch('allowlist'));
 
