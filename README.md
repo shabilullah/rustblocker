@@ -30,12 +30,12 @@ This installs the binary, sets up a system service (OpenRC or systemd), and star
 
 ```bash
 cargo build --release
-./target/release/rustblocker
+sudo ./target/release/rustblocker
 ```
 
 The server starts with sensible defaults:
-- DNS on `127.0.0.1:8053`
-- Web UI on `http://127.0.0.1:8054`
+- DNS on `127.0.0.1:53`
+- Web UI on `http://127.0.0.1:54`
 - Upstream: Google DNS (`8.8.8.8:53`)
 - Sinkhole: `0.0.0.0` (IPv4) / `::` (IPv6)
 
@@ -45,14 +45,13 @@ Port 53 requires elevated privileges — use `sudo` or run as root.
 
 **CLI options:**
 ```bash
-rustblocker                          # Default: DNS 8053, web 8054
-rustblocker --dns-port 53            # DNS on port 53 (needs root)
-rustblocker --dns-port 5353 --web-port 8080  # Custom ports
+rustblocker                               # Default: DNS 53, web 54
+rustblocker --dns-port 5353 --web-port 8080   # Custom ports (useful for local dev)
 ```
 
 ## Web Management UI
 
-Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:8054`).
+Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:54`).
 
 - **Dashboard** — stats for blocked/allowed domains, rewrites, upstream servers
 - **Blocklist** — add, remove, bulk import blocked domains
@@ -100,21 +99,21 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 
 ```bash
 # Check health
-curl http://127.0.0.1:8054/api/health
+curl http://127.0.0.1:54/api/health
 
 # Add a blocked domain
-curl -X POST http://127.0.0.1:8054/api/blocklist \
+curl -X POST http://127.0.0.1:54/api/blocklist \
   -H "Content-Type: application/json" \
   -d '{"domain": "ads.example.com"}'
 
 # Remove a blocked domain
-curl -X DELETE http://127.0.0.1:8054/api/blocklist/1
+curl -X DELETE http://127.0.0.1:54/api/blocklist/1
 
 # Get all settings
-curl http://127.0.0.1:8054/api/settings
+curl http://127.0.0.1:54/api/settings
 
 # Bulk import a blocklist file
-curl -X POST http://127.0.0.1:8054/api/blocklist/import \
+curl -X POST http://127.0.0.1:54/api/blocklist/import \
   -H "Content-Type: application/json" \
   -d '{"content": "0.0.0.0 ads.example.com\n0.0.0.0 tracker.example.com"}'
 ```
@@ -150,7 +149,7 @@ Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) r
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `listen_address` | `127.0.0.1` | Bind address |
-| `listen_port` | `8053` | DNS listen port (web UI on port+1) |
+| `listen_port` | `53` | DNS listen port (web UI on port+1) |
 | `sinkhole_ipv4` | `0.0.0.0` | IPv4 returned for blocked domains |
 | `sinkhole_ipv6` | `::` | IPv6 returned for blocked domains |
 | `log_level` | `info` | Log level (overridable via `RUST_LOG` env var) |
@@ -183,14 +182,14 @@ RUN cargo build --release --target x86_64-unknown-linux-musl
 
 FROM alpine:3.20
 COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/rustblocker /usr/local/bin/
-EXPOSE 53/udp 53/tcp 8054/tcp
+EXPOSE 53/udp 53/tcp 54/tcp
 CMD ["rustblocker"]
 ```
 
 ```bash
 docker build -t rustblocker .
 docker run -d --name rustblocker \
-  -p 53:53/udp -p 53:53/tcp -p 8054:8054 \
+  -p 53:53/udp -p 53:53/tcp -p 54:54 \
   rustblocker
 ```
 

@@ -87,7 +87,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let listen_address = get_setting_string(&pool, "listen_address");
     let db_dns_port: u16 = get_setting_string(&pool, "listen_port")
         .parse()
-        .unwrap_or(8053);
+        .unwrap_or(53);
     let upstream_timeout: u64 = get_setting_string(&pool, "upstream_timeout_secs")
         .parse()
         .unwrap_or(5);
