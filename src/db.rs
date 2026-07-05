@@ -232,6 +232,54 @@ pub fn get_domains(pool: &DbPool, table: &str) -> Vec<DbDomain> {
     .collect()
 }
 
+pub fn count_domains(pool: &DbPool, table: &str) -> i64 {
+    let conn = pool.get().expect("failed to get DB connection");
+    let sql = format!("SELECT COUNT(*) FROM {}", table);
+    conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0)
+}
+
+pub fn search_domains(
+    pool: &DbPool,
+    table: &str,
+    search: &str,
+    limit: i64,
+    offset: i64,
+) -> Vec<DbDomain> {
+    let conn = pool.get().expect("failed to get DB connection");
+    if search.is_empty() {
+        let sql = format!(
+            "SELECT id, domain FROM {} ORDER BY domain LIMIT ?1 OFFSET ?2",
+            table
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map(rusqlite::params![limit, offset], |row| {
+            Ok(DbDomain {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+            })
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        let sql = format!(
+            "SELECT id, domain FROM {} WHERE domain LIKE ?1 ORDER BY domain LIMIT ?2 OFFSET ?3",
+            table
+        );
+        let pattern = format!("%{}%", search);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map(rusqlite::params![pattern, limit, offset], |row| {
+            Ok(DbDomain {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+            })
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    }
+}
+
 pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
     let conn = pool.get().expect("failed to get DB connection");
     let normalized = domain.to_lowercase();

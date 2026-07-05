@@ -36,11 +36,18 @@ struct RewriteAdd {
     ipv6: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DomainQuery {
+    search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 /// Resolve import content from either inline content or a URL.
 async fn resolve_import_content(body: &BulkImport) -> String {
-    if let Some(ref url) = body.url {
+    if let Some(url) = &body.url {
         db::fetch_source(url).await
-    } else if let Some(ref content) = body.content {
+    } else if let Some(content) = &body.content {
         content.clone()
     } else {
         String::new()
@@ -101,9 +108,16 @@ async fn delete_upstream(pool: web::Data<DbPool>, path: web::Path<i64>) -> impl 
 
 // --- Blocklist domains ---
 
-async fn get_blocklist(pool: web::Data<DbPool>) -> impl Responder {
-    let domains = db::get_domains(&pool, "blocklist_domains");
-    HttpResponse::Ok().json(domains)
+async fn get_blocklist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) -> impl Responder {
+    let search = query.search.as_deref().unwrap_or("");
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let total = db::count_domains(&pool, "blocklist_domains");
+    let domains = db::search_domains(&pool, "blocklist_domains", search, limit, offset);
+    HttpResponse::Ok().json(serde_json::json!({
+        "domains": domains,
+        "total": total,
+    }))
 }
 
 async fn add_blocklist_domain(
@@ -128,7 +142,7 @@ async fn delete_blocklist_domain(
         .find(|d| d.id == id)
         .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "blocklist_domains", id) {
-        if let Some(ref d) = domain {
+        if let Some(d) = &domain {
             remove_domain(&mut blocklist.write(), d);
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -154,9 +168,16 @@ async fn bulk_import_blocklist(
 
 // --- Allowlist domains ---
 
-async fn get_allowlist(pool: web::Data<DbPool>) -> impl Responder {
-    let domains = db::get_domains(&pool, "allowlist_domains");
-    HttpResponse::Ok().json(domains)
+async fn get_allowlist(pool: web::Data<DbPool>, query: web::Query<DomainQuery>) -> impl Responder {
+    let search = query.search.as_deref().unwrap_or("");
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let total = db::count_domains(&pool, "allowlist_domains");
+    let domains = db::search_domains(&pool, "allowlist_domains", search, limit, offset);
+    HttpResponse::Ok().json(serde_json::json!({
+        "domains": domains,
+        "total": total,
+    }))
 }
 
 async fn add_allowlist_domain(
@@ -181,7 +202,7 @@ async fn delete_allowlist_domain(
         .find(|d| d.id == id)
         .map(|d| d.domain.clone());
     if db::delete_domain(&pool, "allowlist_domains", id) {
-        if let Some(ref d) = domain {
+        if let Some(d) = &domain {
             remove_domain(&mut allowlist.write(), d);
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -242,7 +263,7 @@ async fn delete_rewrite(
     let all = db::get_rewrites(&pool);
     let domain = all.iter().find(|r| r.id == id).map(|r| r.domain.clone());
     if db::delete_rewrite(&pool, id) {
-        if let Some(ref d) = domain {
+        if let Some(d) = &domain {
             rewrites.write().rules.remove(&d.to_lowercase());
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
