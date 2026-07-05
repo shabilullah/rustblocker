@@ -27,6 +27,15 @@ curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts
 
 This installs the binary, sets up a system service (OpenRC or systemd), and starts it. Re-run to update.
 
+**Uninstall:**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash -s -- --uninstall
+```
+
+This stops the service, removes the binary, database, service file, and logs.
+
+
 **Or build from source:**
 
 ```bash

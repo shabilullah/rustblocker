@@ -1,71 +1,43 @@
 #!/bin/sh
 set -e
 
-# RustBlocker installer and updater
-# Usage: curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | bash
+# RustBlocker installer, updater, and uninstaller
+# Install:  curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash
+# Uninstall: curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash -s -- --uninstall
 
 REPO="shabilullah/rustblocker"
 INSTALL_DIR="/usr/local/bin"
 DATA_DIR="/var/lib/rustblocker"
 SERVICE_NAME="rustblocker"
 BINARY_NAME="rustblocker"
+LOG_FILE="/var/log/rustblocker.log"
 
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info() { printf "${GREEN}[INFO]${NC} %s\n" "$1"; }
 warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$1"; }
 error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; exit 1; }
 
-# Check if running as root
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         error "This script must be run as root. Use: sudo sh install.sh"
     fi
 }
 
-# Detect system architecture
 detect_arch() {
     ARCH=$(uname -m)
     case "$ARCH" in
-        x86_64|amd64)
-            TARGET="x86_64-unknown-linux-musl"
-            ;;
-        aarch64|arm64)
-            TARGET="aarch64-unknown-linux-musl"
-            ;;
-        *)
-            error "Unsupported architecture: $ARCH. Supported: x86_64, aarch64"
-            ;;
+        x86_64|amd64) TARGET="x86_64-unknown-linux-musl" ;;
+        aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+        *) error "Unsupported architecture: $ARCH. Supported: x86_64, aarch64" ;;
     esac
     info "Detected architecture: $ARCH ($TARGET)"
 }
 
-# Detect OS
-detect_os() {
-    OS=$(uname -s)
-    case "$OS" in
-        Linux)
-            ;;
-        *)
-            error "Unsupported OS: $OS. This script supports Linux only (Alpine, Debian, Ubuntu, etc.)"
-            ;;
-    esac
-
-    # Check for musl
-    if ldd --version 2>&1 | grep -q musl 2>/dev/null; then
-        info "Detected musl libc"
-    elif [ -f /etc/alpine-release ]; then
-        info "Detected Alpine Linux"
-    else
-        warn "Non-musl system detected. The musl static binary will still work."
-    fi
-}
-
-# Check for required tools
 check_deps() {
     for cmd in curl tar; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -74,7 +46,6 @@ check_deps() {
     done
 }
 
-# Get the latest release version from GitHub
 get_latest_version() {
     VERSION=$(curl -sL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
     if [ -z "$VERSION" ]; then
@@ -83,26 +54,20 @@ get_latest_version() {
     info "Latest version: $VERSION"
 }
 
-# Get installed version
 get_installed_version() {
     if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
-        INSTALLED_VERSION=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
-        if [ "$INSTALLED_VERSION" = "unknown" ]; then
-            # Binary exists but --version not supported, check via service
-            INSTALLED_VERSION="installed"
-        fi
+        INSTALLED_VERSION=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | awk '{print $2}' || echo "installed")
     else
         INSTALLED_VERSION=""
     fi
 }
 
-# Download and install the binary
 install_binary() {
     DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/rustblocker-$VERSION-$TARGET.tar.gz"
     TEMP_DIR=$(mktemp -d)
 
     info "Downloading $DOWNLOAD_URL ..."
-    if ! curl -sSL -o "$TEMP_DIR/rustblocker.tar.gz" "$DOWNLOAD_URL"; then
+    if ! curl -fSL --retry 3 --retry-delay 5 -o "$TEMP_DIR/rustblocker.tar.gz" "$DOWNLOAD_URL"; then
         rm -rf "$TEMP_DIR"
         error "Download failed. Check if release $VERSION exists for $TARGET"
     fi
@@ -110,7 +75,6 @@ install_binary() {
     info "Extracting..."
     tar xzf "$TEMP_DIR/rustblocker.tar.gz" -C "$TEMP_DIR"
 
-    # Stop service if running
     stop_service 2>/dev/null || true
 
     info "Installing binary to $INSTALL_DIR/$BINARY_NAME"
@@ -121,7 +85,6 @@ install_binary() {
     info "Binary installed successfully"
 }
 
-# Create data directory
 setup_data_dir() {
     if [ ! -d "$DATA_DIR" ]; then
         mkdir -p "$DATA_DIR"
@@ -129,7 +92,6 @@ setup_data_dir() {
     fi
 }
 
-# Detect init system and create service
 setup_service() {
     if [ -d /etc/openrc ]; then
         setup_openrc
@@ -191,7 +153,6 @@ SERVICEEOF
     info "systemd service created and enabled"
 }
 
-# Start the service
 start_service() {
     if [ -d /etc/openrc ]; then
         rc-service "$SERVICE_NAME" start 2>/dev/null || true
@@ -202,7 +163,6 @@ start_service() {
     fi
 }
 
-# Stop the service
 stop_service() {
     if [ -d /etc/openrc ]; then
         rc-service "$SERVICE_NAME" stop 2>/dev/null || true
@@ -211,7 +171,75 @@ stop_service() {
     fi
 }
 
-# Print summary
+# --- Uninstall ---
+
+uninstall() {
+    check_root
+
+    info "Stopping RustBlocker service..."
+    stop_service || true
+
+    # Remove service files
+    if [ -d /etc/openrc ]; then
+        if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+            rc-update del "$SERVICE_NAME" 2>/dev/null || true
+            rm -f "/etc/init.d/$SERVICE_NAME"
+            info "Removed OpenRC service"
+        fi
+    elif [ -d /etc/systemd ]; then
+        if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
+            systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+            rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+            systemctl daemon-reload 2>/dev/null || true
+            info "Removed systemd service"
+        fi
+    fi
+
+    # Remove binary
+    if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
+        rm -f "$INSTALL_DIR/$BINARY_NAME"
+        info "Removed binary: $INSTALL_DIR/$BINARY_NAME"
+    else
+        warn "Binary not found at $INSTALL_DIR/$BINARY_NAME"
+    fi
+
+    # Remove data directory
+    if [ -d "$DATA_DIR" ]; then
+        rm -rf "$DATA_DIR"
+        info "Removed data directory: $DATA_DIR"
+    else
+        warn "Data directory not found at $DATA_DIR"
+    fi
+
+    # Remove compiled blocklist files (may be in working dir)
+    for f in compiled-blocklist.txt compiled-allowlist.txt; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            info "Removed $f"
+        fi
+    done
+
+    # Remove log file
+    if [ -f "$LOG_FILE" ]; then
+        rm -f "$LOG_FILE"
+        info "Removed log file: $LOG_FILE"
+    fi
+
+    echo ""
+    echo "============================================"
+    echo "  RustBlocker has been completely removed."
+    echo "============================================"
+    echo ""
+    echo "  Removed:"
+    echo "    - Binary:     $INSTALL_DIR/$BINARY_NAME"
+    echo "    - Database:   $DATA_DIR/rustblocker.db"
+    echo "    - Service:    $SERVICE_NAME"
+    echo "    - Logs:       $LOG_FILE"
+    echo ""
+    echo "  To reinstall, run the install script again."
+    echo "============================================"
+}
+
 print_summary() {
     echo ""
     echo "============================================"
@@ -229,12 +257,23 @@ print_summary() {
     echo "  CLI options:"
     echo "    rustblocker --dns-port 5353 --web-port 8080"
     echo ""
-    echo "  Re-run this script to update to the latest version."
+    echo "  Uninstall:"
+    echo "    curl -sSL https://raw.githubusercontent.com/$REPO/main/scripts/install.sh | sudo bash -s -- --uninstall"
     echo "============================================"
 }
 
 # Main
 main() {
+    # Check for --uninstall flag
+    for arg in "$@"; do
+        case "$arg" in
+            --uninstall)
+                uninstall
+                exit 0
+                ;;
+        esac
+    done
+
     echo ""
     echo "  RustBlocker Installer"
     echo "  https://github.com/$REPO"
@@ -242,7 +281,6 @@ main() {
 
     check_root
     detect_arch
-    detect_os
     check_deps
     get_latest_version
     get_installed_version
