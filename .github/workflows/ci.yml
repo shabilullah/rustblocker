@@ -53,6 +53,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - run: npm ci && npm run build:css
       - run: git diff --exit-code static/tailwind.min.css || (echo "CSS out of date. Run 'npm run build:css' and commit." && exit 1)
