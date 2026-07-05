@@ -237,8 +237,9 @@
 
     async function loadTab(tab) {
         if (tab !== 'stats') disconnectSSE();
+        stopDashboardPoll();
         switch(tab) {
-            case 'dashboard': return loadDashboard();
+            case 'dashboard': loadDashboard(); startDashboardPoll(); return;
             case 'upstreams': return loadUpstreams();
             case 'sources': return loadSources();
             case 'blocklist': return loadDomainList('blocklist');
@@ -673,7 +674,7 @@
     const STATS_PAGE = 50;
     let liveEnabled = true;
     let eventSource = null;
-    let reconnectTimer = null;
+    let dashboardInterval = null;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
 
     function renderQueryRow(q) {
@@ -736,6 +737,18 @@
             disconnectSSE();
         }
     }
+    function startDashboardPoll() {
+        if (dashboardInterval) clearInterval(dashboardInterval);
+        dashboardInterval = setInterval(() => { loadDashboard(); }, 2000);
+    }
+
+    function stopDashboardPoll() {
+        if (dashboardInterval) {
+            clearInterval(dashboardInterval);
+            dashboardInterval = null;
+        }
+    }
+
 
     async function loadStats() {
         // Load historical page from DB.
