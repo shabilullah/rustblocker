@@ -44,8 +44,8 @@ sudo ./target/release/rustblocker
 ```
 
 The server starts with sensible defaults:
-- DNS on `127.0.0.1:53`
-- Web UI on `http://127.0.0.1:54`
+- DNS on `0.0.0.0:53` (accessible from LAN)
+- Web UI on port 54 (accessible from LAN at `http://<your-ip>:54`)
 - Upstream: Google DNS (`8.8.8.8:53`)
 - Sinkhole: `0.0.0.0` (IPv4) / `::` (IPv6)
 
@@ -61,7 +61,7 @@ rustblocker --dns-port 5353 --web-port 8080   # Custom ports (useful for local d
 
 ## Web Management UI
 
-Available at `http://<listen_address>:<listen_port + 1>` (default: `http://127.0.0.1:54`).
+Available at `http://<your-server-ip>:54` (e.g., `http://192.168.1.10:54`).
 
 - **Dashboard** — stats for blocked/allowed domains, rewrites, upstream servers, auto-update sources
 - **Upstreams** — add/remove upstream DNS servers
@@ -206,7 +206,7 @@ Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) r
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `listen_address` | `127.0.0.1` | Bind address |
+| `listen_address` | `0.0.0.0` | Bind address (all interfaces) |
 | `listen_port` | `53` | DNS listen port (web UI on port+1) |
 | `sinkhole_ipv4` | `0.0.0.0` | IPv4 returned for blocked domains |
 | `sinkhole_ipv6` | `::` | IPv6 returned for blocked domains |

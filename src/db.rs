@@ -70,7 +70,7 @@ pub fn seed_defaults(pool: &DbPool) {
     info!("Seeding database with default settings...");
 
     let settings = [
-        ("listen_address", "127.0.0.1"),
+        ("listen_address", "0.0.0.0"),
         ("listen_port", "53"),
         ("sinkhole_ipv4", "0.0.0.0"),
         ("sinkhole_ipv6", "::"),
