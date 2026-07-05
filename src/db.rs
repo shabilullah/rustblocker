@@ -18,6 +18,9 @@ pub fn create_pool(db_path: &str) -> Result<DbPool, r2d2::Error> {
 }
 
 fn init_schema(conn: &rusqlite::Connection) {
+    // Use WAL mode so writes never block reads (critical for live stats during imports).
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .expect("failed to set WAL mode");
     // Let SQLite retry for up to 5s instead of immediately returning SQLITE_BUSY.
     conn.execute_batch("PRAGMA busy_timeout = 5000;")
         .expect("failed to set busy_timeout");
@@ -144,6 +147,9 @@ pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize
 /// Insert domains from content, preserving `*.` prefix for wildcards.
 fn insert_domains_from_content(conn: &rusqlite::Connection, table: &str, content: &str) {
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
+    // Wrap all inserts in a single transaction so a 100k-line source
+    // doesn't create 100k individual write transactions.
+    let _ = conn.execute("BEGIN", []);
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -167,6 +173,7 @@ fn insert_domains_from_content(conn: &rusqlite::Connection, table: &str, content
             conn.execute(&sql, params![normalized]).ok();
         }
     }
+    let _ = conn.execute("COMMIT", []);
 }
 
 // --- Settings ---
