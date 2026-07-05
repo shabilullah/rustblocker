@@ -241,18 +241,23 @@ uninstall() {
 }
 
 print_summary() {
+    # Detect LAN IP for remote access hint
+    LAN_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -z "$LAN_IP" ] && LAN_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{sub(/\/.*/, "", $2); print $2; exit}')
+    [ -z "$LAN_IP" ] && LAN_IP="<server-ip>"
+
     echo ""
     echo "============================================"
     echo "  RustBlocker $VERSION installed successfully!"
     echo "============================================"
     echo ""
     echo "  DNS port:  53"
-    echo "  Web UI:    http://127.0.0.1:54"
+    echo "  Web UI:    http://${LAN_IP}:54"
     echo "  Data:      $DATA_DIR/rustblocker.db"
     echo "  Binary:    $INSTALL_DIR/$BINARY_NAME"
     echo ""
     echo "  Manage via web UI or API:"
-    echo "    curl http://127.0.0.1:54/api/health"
+    echo "    curl http://${LAN_IP}:54/api/health"
     echo ""
     echo "  CLI options:"
     echo "    rustblocker --dns-port 5353 --web-port 8080"
