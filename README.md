@@ -86,13 +86,16 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 | `GET` | `/api/upstreams` | List upstream servers |
 | `POST` | `/api/upstreams` | Add upstream server |
 | `DELETE` | `/api/upstreams/{id}` | Remove upstream server |
-| `GET` | `/api/blocklist` | List blocked domains |
+| `GET` | `/api/blocklist` | List blocked domains (paginated, searchable) |
 | `POST` | `/api/blocklist` | Add blocked domain |
 | `DELETE` | `/api/blocklist/{id}` | Remove blocked domain |
-| `POST` | `/api/blocklist/import` | Bulk import blocklist |
-| `GET` | `/api/allowlist` | List allowed domains |
+| `POST` | `/api/blocklist/import` | Bulk import blocklist (from content or URL) |
+| `GET` | `/api/allowlist` | List allowed domains (paginated, searchable) |
 | `POST` | `/api/allowlist` | Add allowed domain |
 | `DELETE` | `/api/allowlist/{id}` | Remove allowed domain |
+| `POST` | `/api/allowlist/import` | Bulk import allowlist (from content or URL) |
+| `GET` | `/api/rewrites` | List DNS rewrites |
+| `POST` | `/api/rewrites` | Add DNS rewrite |
 | `DELETE` | `/api/rewrites/{id}` | Remove DNS rewrite |
 | `GET` | `/api/sources` | List auto-update sources |
 | `POST` | `/api/sources` | Add source (immediately fetches) |
