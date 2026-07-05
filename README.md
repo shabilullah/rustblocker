@@ -10,12 +10,16 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 - **Parallel Forwarding** — races queries across multiple upstream resolvers, uses the first response
 - **UDP + TCP** — listens on both protocols simultaneously
 - **Web Management UI** — manage all settings from a browser (TailwindCSS, dark theme)
-- **REST API** — full CRUD for blocklists, allowlists, rewrites, settings, and upstreams
+- **Query Statistics** — tracks total queries, blocked/allowed/rewritten/forwarded counts, top clients, top domains
+- **Live Query Log** — real-time streaming via Server-Sent Events (SSE)
+- **Configurable retention** — auto-prune old query logs (default 30 days)
+- **REST API** — full CRUD for blocklists, allowlists, rewrites, settings, upstreams, and stats
 - **SQLite database** — portable single-file storage, zero-config startup
 - **Hot-reload** — blocklist/allowlist/rewrite changes via web UI take effect immediately
 - **Auto-update sources** — add blocklist URLs, set update interval, automatic refresh on schedule
 - **URL import** — import blocklists from URLs via web UI or API
 - **Hosts file format** — auto-strips `0.0.0.0` / `127.0.0.1` prefixes
+- **Security headers** — CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 
 ## Quick Start
 
@@ -32,13 +36,12 @@ This installs the binary, sets up a system service (OpenRC or systemd), and star
 ```bash
 curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash -s -- --uninstall
 ```
-
-This stops the service, removes the binary, database, service file, and logs.
-
-
 **Or build from source:**
 
 ```bash
+# Prerequisites: Rust toolchain + Node.js (for CSS build)
+npm install
+npm run build:css
 cargo build --release
 sudo ./target/release/rustblocker
 ```
@@ -110,6 +113,10 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 | `POST` | `/api/sources` | Add source (immediately fetches) |
 | `DELETE` | `/api/sources/{id}` | Remove source |
 | `POST` | `/api/sources/refresh` | Refresh all sources now |
+| `GET` | `/api/stats` | Get query statistics (top clients, top domains, counts) |
+| `GET` | `/api/stats/queries` | Get recent query log (paginated) |
+| `GET` | `/api/stats/live` | Live query stream (SSE) |
+| `DELETE` | `/api/stats` | Clear all query statistics |
 
 ### Example API usage
 
