@@ -155,7 +155,7 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/rustblocker --dns-port 53
 WorkingDirectory=/var/lib/rustblocker
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]

@@ -635,8 +635,25 @@
             }
         }
         const status = document.getElementById('settings-status');
-        status.textContent = 'Saved! Restart to apply.';
-        setTimeout(() => status.textContent = '', 3000);
+        status.textContent = 'Saved. Restarting server...';
+        status.className = 'text-sm text-emerald-400';
+        try {
+            await fetch(API + '/restart', {method: 'POST'});
+        } catch {}
+        // Poll until server comes back, then refresh
+        const check = async () => {
+            try {
+                await fetch(API + '/health');
+                status.textContent = 'Server restarted!';
+                setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 3000);
+                checkHealth();
+                loadDashboard();
+            } catch {
+                status.textContent = 'Waiting for server...';
+                setTimeout(check, 1000);
+            }
+        };
+        setTimeout(check, 1500);
     }
 
     function formatLatency(us) {

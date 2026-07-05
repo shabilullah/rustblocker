@@ -585,6 +585,20 @@ async fn live_queries(
         .streaming(stream)
 }
 
+// --- Restart ---
+
+async fn restart_server(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    tracing::info!("Restart requested via API, exiting in 1s...");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        std::process::exit(0);
+    });
+    HttpResponse::Ok().json(serde_json::json!({"status": "restarting"}))
+}
+
 // --- Health ---
 
 async fn health() -> impl Responder {
@@ -631,6 +645,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/stats", web::get().to(get_stats))
             .route("/stats/queries", web::get().to(get_queries))
             .route("/stats", web::delete().to(clear_stats))
-            .route("/stats/live", web::get().to(live_queries)),
+            .route("/stats/live", web::get().to(live_queries))
+            .route("/restart", web::post().to(restart_server)),
     );
 }
