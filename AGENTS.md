@@ -39,7 +39,7 @@ If any check fails, fix it before proceeding. Never commit code that fails CI.
 | `src/handler.rs` | `DnsBlockerHandler` implementing `RequestHandler` |
 | `src/forwarder.rs` | `ParallelForwarder` racing upstream resolvers |
 | `src/api.rs` | REST API endpoints (actix-web handlers) |
-| `src/main.rs` | Server startup, DB init, DNS + web server via `tokio::select!` |
+| `src/main.rs` | Server startup, CLI args (`--dns-port`, `--web-port`), DB init, DNS + web server via `tokio::select!` |
 | `static/index.html` | Web UI (TailwindCSS, vanilla JS) — embedded in binary |
 
 ## Rules
