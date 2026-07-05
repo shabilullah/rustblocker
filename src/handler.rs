@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use crate::acl::SharedAcl;
 use crate::forwarder::ParallelForwarder;
 use crate::lists::{DomainStore, RewriteMap, normalize_domain};
+use crate::stats::{QueryAction, QueryEntry, QueryLog};
 
 pub struct DnsBlockerHandler {
     pub blocklist: Arc<RwLock<DomainStore>>,
@@ -23,9 +24,11 @@ pub struct DnsBlockerHandler {
     sinkhole_ipv4: Ipv4Addr,
     sinkhole_ipv6: Ipv6Addr,
     acl: SharedAcl,
+    query_log: Arc<QueryLog>,
 }
 
 impl DnsBlockerHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         blocklist: Arc<RwLock<DomainStore>>,
         allowlist: Arc<RwLock<DomainStore>>,
@@ -34,6 +37,7 @@ impl DnsBlockerHandler {
         sinkhole_ipv4: Ipv4Addr,
         sinkhole_ipv6: Ipv6Addr,
         acl: SharedAcl,
+        query_log: Arc<QueryLog>,
     ) -> Self {
         Self {
             blocklist,
@@ -43,6 +47,7 @@ impl DnsBlockerHandler {
             sinkhole_ipv4,
             sinkhole_ipv6,
             acl,
+            query_log,
         }
     }
 }
@@ -124,6 +129,12 @@ impl RequestHandler for DnsBlockerHandler {
             };
 
             if let Some(rdata) = rewrite_rdata {
+                self.query_log.record(QueryEntry {
+                    client_ip: src_ip,
+                    domain: domain.clone(),
+                    query_type,
+                    action: QueryAction::Rewritten,
+                });
                 info!("Rewrite: {} -> {}", domain, rdata);
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let mut metadata = Metadata::response_from_request(&request.metadata);
@@ -149,6 +160,12 @@ impl RequestHandler for DnsBlockerHandler {
                     let blocklist = self.blocklist.read();
                     if blocklist.matches(&domain) {
                         info!("Blocked: {}", domain);
+                        self.query_log.record(QueryEntry {
+                            client_ip: src_ip,
+                            domain: domain.clone(),
+                            query_type,
+                            action: QueryAction::Blocked,
+                        });
                         Some(build_rdata(
                             query_type,
                             self.sinkhole_ipv4,
@@ -177,6 +194,12 @@ impl RequestHandler for DnsBlockerHandler {
 
             // 3. Forward to upstream
             debug!("Forwarding: {}", domain);
+            self.query_log.record(QueryEntry {
+                client_ip: src_ip,
+                domain,
+                query_type,
+                action: QueryAction::Forwarded,
+            });
             let rh = response_handle;
             self.forwarder
                 .resolve(request, rh)

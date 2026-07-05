@@ -50,7 +50,18 @@ fn init_schema(conn: &rusqlite::Connection) {
             update_interval_hours INTEGER NOT NULL DEFAULT 24,
             last_updated TEXT,
             last_status TEXT
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS query_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            client_ip TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            query_type TEXT NOT NULL,
+            action TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_query_log_timestamp ON query_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_query_log_client_ip ON query_log(client_ip);
+        CREATE INDEX IF NOT EXISTS idx_query_log_action ON query_log(action);",
     )
     .expect("failed to init schema");
 }
@@ -77,6 +88,7 @@ pub fn seed_defaults(pool: &DbPool) {
         ("log_level", "info"),
         ("upstream_timeout_secs", "5"),
         ("allowed_networks", ""),
+        ("stats_retention_days", "30"),
     ];
     for (key, value) in &settings {
         conn.execute(

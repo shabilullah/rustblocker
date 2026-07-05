@@ -5,3 +5,4 @@ pub mod db;
 pub mod forwarder;
 pub mod handler;
 pub mod lists;
+pub mod stats;

@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::acl::SharedAcl;
 use crate::db::{self, DbPool};
 use crate::lists::DomainStore;
+use crate::stats::QueryLog;
 
 #[derive(Debug, Deserialize)]
 struct SettingUpdate {
@@ -42,6 +43,17 @@ struct RewriteAdd {
 #[derive(Debug, Deserialize)]
 struct DomainQuery {
     search: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryLogQuery {
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -483,6 +495,49 @@ async fn refresh_all_sources(
     HttpResponse::Ok().json(serde_json::json!({"refreshed": results.len(), "results": results}))
 }
 
+// --- Stats ---
+
+async fn get_stats(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query: web::Query<StatsQuery>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let limit = query.limit.unwrap_or(10);
+    let stats = QueryLog::get_stats(&pool, limit);
+    HttpResponse::Ok().json(stats)
+}
+
+async fn get_queries(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query: web::Query<QueryLogQuery>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let queries = QueryLog::get_queries(&pool, limit, offset);
+    HttpResponse::Ok().json(queries)
+}
+
+async fn clear_stats(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    QueryLog::clear(&pool);
+    HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
+}
+
 // --- Health ---
 
 async fn health() -> impl Responder {
@@ -525,6 +580,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sources", web::get().to(get_sources))
             .route("/sources", web::post().to(add_source))
             .route("/sources/{id}", web::delete().to(delete_source))
-            .route("/sources/refresh", web::post().to(refresh_all_sources)),
+            .route("/sources/refresh", web::post().to(refresh_all_sources))
+            .route("/stats", web::get().to(get_stats))
+            .route("/stats/queries", web::get().to(get_queries))
+            .route("/stats", web::delete().to(clear_stats)),
     );
 }

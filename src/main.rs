@@ -15,6 +15,7 @@ use rustblocker::db;
 use rustblocker::forwarder::ParallelForwarder;
 use rustblocker::handler::DnsBlockerHandler;
 use rustblocker::lists::{DomainStore, RewriteMap, normalize_domain};
+use rustblocker::stats::QueryLog;
 
 #[derive(Parser)]
 #[command(name = "rustblocker", about = "A DNS blocker written in Rust")]
@@ -132,6 +133,11 @@ async fn run_server(cli: Cli) -> Result<()> {
             .context("Failed to create upstream forwarder")?,
     );
 
+    let retention_days: u64 = get_setting_string(&pool, "stats_retention_days")
+        .parse()
+        .unwrap_or(30);
+    let (query_log, _log_handle) = QueryLog::new(pool.clone(), retention_days);
+
     let sinkhole_ipv4_str = get_setting_string(&pool, "sinkhole_ipv4");
     let sinkhole_ipv6_str = get_setting_string(&pool, "sinkhole_ipv6");
     let sinkhole_ipv4: std::net::Ipv4Addr = sinkhole_ipv4_str
@@ -149,6 +155,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         sinkhole_ipv4,
         sinkhole_ipv6,
         shared_acl.clone(),
+        query_log.clone(),
     );
 
     let mut server = hickory_server::server::Server::new(handler);
@@ -172,6 +179,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let allowlist_data = actix_web::web::Data::new(allowlist.clone());
     let rewrites_data = actix_web::web::Data::new(rewrites.clone());
     let acl_data = actix_web::web::Data::new(shared_acl.clone());
+    let query_log_data = actix_web::web::Data::from(query_log.clone());
 
     let web_server = actix_web::HttpServer::new(move || {
         actix_web::App::new()
@@ -180,6 +188,7 @@ async fn run_server(cli: Cli) -> Result<()> {
             .app_data(allowlist_data.clone())
             .app_data(rewrites_data.clone())
             .app_data(acl_data.clone())
+            .app_data(query_log_data.clone())
             .configure(api::configure)
             .route(
                 "/",
