@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hickory_proto::rr::RecordType;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, warn};
 
 use crate::db::DbPool;
@@ -73,6 +73,15 @@ pub struct QueryLogEntry {
     pub action: String,
 }
 
+/// Serializable entry for SSE live streaming.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveQuery {
+    pub client_ip: String,
+    pub domain: String,
+    pub query_type: String,
+    pub action: String,
+}
+
 /// Thread-safe query log with atomic counters and a background batch writer.
 pub struct QueryLog {
     total: AtomicU64,
@@ -81,6 +90,7 @@ pub struct QueryLog {
     rewritten: AtomicU64,
     forwarded: AtomicU64,
     tx: mpsc::Sender<QueryEntry>,
+    live_tx: broadcast::Sender<LiveQuery>,
 }
 
 const BATCH_SIZE: usize = 100;
@@ -90,6 +100,7 @@ impl QueryLog {
     /// Create a new QueryLog and spawn the background writer task.
     pub fn new(pool: DbPool, retention_days: u64) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel::<QueryEntry>(4096);
+        let (live_tx, _) = broadcast::channel::<LiveQuery>(256);
 
         let log = Arc::new(Self {
             total: AtomicU64::new(0),
@@ -98,11 +109,17 @@ impl QueryLog {
             rewritten: AtomicU64::new(0),
             forwarded: AtomicU64::new(0),
             tx,
+            live_tx,
         });
 
         let handle = tokio::spawn(Self::writer_task(pool, rx, retention_days));
 
         (log, handle)
+    }
+
+    /// Subscribe to the live query stream for SSE.
+    pub fn subscribe(&self) -> broadcast::Receiver<LiveQuery> {
+        self.live_tx.subscribe()
     }
 
     /// Record a single query. Non-blocking on the hot-path.
@@ -114,6 +131,15 @@ impl QueryLog {
             QueryAction::Rewritten => self.rewritten.fetch_add(1, Ordering::Relaxed),
             QueryAction::Forwarded => self.forwarded.fetch_add(1, Ordering::Relaxed),
         };
+
+        // Broadcast to live SSE subscribers before consuming entry.
+        let live = LiveQuery {
+            client_ip: entry.client_ip.to_string(),
+            domain: entry.domain.clone(),
+            query_type: entry.query_type.to_string(),
+            action: entry.action.to_string(),
+        };
+        let _ = self.live_tx.send(live);
 
         if self.tx.try_send(entry).is_err() {
             debug!("QueryLog channel full, dropping entry");

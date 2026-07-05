@@ -538,6 +538,42 @@ async fn clear_stats(
     HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
 }
 
+async fn live_queries(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query_log: web::Data<QueryLog>,
+) -> HttpResponse {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    let rx = query_log.subscribe();
+
+    let stream = futures::stream::unfold(rx, |mut rx| async {
+        match rx.recv().await {
+            Ok(entry) => {
+                let json = serde_json::to_string(&entry).unwrap_or_default();
+                Some((
+                    Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(format!(
+                        "data: {json}\n\n"
+                    ))),
+                    rx,
+                ))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                Some((Ok(actix_web::web::Bytes::from(": lagged\n\n")), rx))
+            }
+            Err(_) => None,
+        }
+    });
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
 // --- Health ---
 
 async fn health() -> impl Responder {
@@ -583,6 +619,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sources/refresh", web::post().to(refresh_all_sources))
             .route("/stats", web::get().to(get_stats))
             .route("/stats/queries", web::get().to(get_queries))
-            .route("/stats", web::delete().to(clear_stats)),
+            .route("/stats", web::delete().to(clear_stats))
+            .route("/stats/live", web::get().to(live_queries)),
     );
 }

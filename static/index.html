@@ -193,7 +193,13 @@
         <div id="tab-stats" class="tab-content hidden">
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <div class="flex items-center justify-between mb-3">
-                    <h3 class="text-sm font-semibold text-gray-300">Recent Queries</h3>
+                    <div class="flex items-center gap-3">
+                        <h3 class="text-sm font-semibold text-gray-300">Query Log</h3>
+                        <button onclick="toggleLive()" id="live-btn" class="flex items-center gap-1.5 px-3 py-1 rounded text-xs font-medium bg-emerald-600 hover:bg-emerald-700">
+                            <span id="live-dot" class="w-2 h-2 rounded-full bg-emerald-300 animate-pulse"></span>
+                            <span id="live-label">Live</span>
+                        </button>
+                    </div>
                     <button onclick="clearStats()" class="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-xs font-medium">Clear All Stats</button>
                 </div>
                 <div class="overflow-x-auto">
@@ -238,6 +244,7 @@
     });
 
     async function loadTab(tab) {
+        if (tab !== 'stats') disconnectSSE();
         switch(tab) {
             case 'dashboard': return loadDashboard();
             case 'upstreams': return loadUpstreams();
@@ -640,30 +647,96 @@
         }
     }
 
-    // --- Stats ---
+    // --- Stats (Live SSE) ---
 
     let statsOffset = 0;
     const STATS_PAGE = 50;
+    let liveEnabled = true;
+    let eventSource = null;
+    let reconnectTimer = null;
+    const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
+
+    function renderQueryRow(q) {
+        const now = new Date();
+        const ts = q.timestamp || now.toISOString().slice(0, 19).replace('T', ' ');
+        return `<tr class="border-b border-gray-700/50 hover:bg-gray-700/30 live-row">
+            <td class="py-1.5 px-2 text-gray-400 whitespace-nowrap">${ts}</td>
+            <td class="py-1.5 px-2 font-mono">${q.client_ip}</td>
+            <td class="py-1.5 px-2 font-mono truncate max-w-xs">${q.domain}</td>
+            <td class="py-1.5 px-2 text-gray-400">${q.query_type}</td>
+            <td class="py-1.5 px-2 font-medium ${actionColors[q.action] || 'text-gray-400'}">${q.action}</td>
+        </tr>`;
+    }
+
+    function connectSSE() {
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        if (!liveEnabled) return;
+        eventSource = new EventSource(API + '/stats/live');
+        eventSource.onmessage = (e) => {
+            try {
+                const q = JSON.parse(e.data);
+                const tbody = document.getElementById('stats-query-log');
+                if (tbody.querySelector('td[colspan]')) tbody.innerHTML = '';
+                tbody.insertAdjacentHTML('afterbegin', renderQueryRow(q));
+                // Cap live rows to avoid unbounded growth.
+                while (tbody.children.length > STATS_PAGE) tbody.removeChild(tbody.lastChild);
+            } catch {}
+        };
+        eventSource.onerror = () => {
+            // Reconnect after 3s on error.
+            eventSource.close();
+            eventSource = null;
+            if (liveEnabled) reconnectTimer = setTimeout(connectSSE, 3000);
+        };
+    }
+
+    function disconnectSSE() {
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        if (eventSource) { eventSource.close(); eventSource = null; }
+    }
+
+    function toggleLive() {
+        liveEnabled = !liveEnabled;
+        const btn = document.getElementById('live-btn');
+        const dot = document.getElementById('live-dot');
+        const label = document.getElementById('live-label');
+        if (liveEnabled) {
+            btn.classList.remove('bg-gray-600', 'hover:bg-gray-500');
+            btn.classList.add('bg-emerald-600', 'hover:bg-emerald-700');
+            dot.classList.remove('bg-gray-400', 'animate-pulse');
+            dot.classList.add('bg-emerald-300', 'animate-pulse');
+            label.textContent = 'Live';
+            connectSSE();
+        } else {
+            btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-700');
+            btn.classList.add('bg-gray-600', 'hover:bg-gray-500');
+            dot.classList.remove('bg-emerald-300', 'animate-pulse');
+            dot.classList.add('bg-gray-400');
+            label.textContent = 'Paused';
+            disconnectSSE();
+        }
+    }
 
     async function loadStats() {
+        // Load historical page from DB.
         const queries = await fetch(API + `/stats/queries?limit=${STATS_PAGE}&offset=${statsOffset}`).then(r => r.json());
         const tbody = document.getElementById('stats-query-log');
         tbody.innerHTML = queries.length
-            ? queries.map(q => {
-                const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
-                return `<tr class="border-b border-gray-700/50 hover:bg-gray-700/30">
-                    <td class="py-1.5 px-2 text-gray-400 whitespace-nowrap">${q.timestamp}</td>
-                    <td class="py-1.5 px-2 font-mono">${q.client_ip}</td>
-                    <td class="py-1.5 px-2 font-mono truncate max-w-xs">${q.domain}</td>
-                    <td class="py-1.5 px-2 text-gray-400">${q.query_type}</td>
-                    <td class="py-1.5 px-2 font-medium ${actionColors[q.action] || 'text-gray-400'}">${q.action}</td>
-                </tr>`;
-            }).join('')
+            ? queries.map(q => renderQueryRow(q)).join('')
             : '<tr><td colspan="5" class="py-4 text-center text-gray-500">No queries logged yet</td></tr>';
 
         document.getElementById('stats-prev').disabled = statsOffset === 0;
         document.getElementById('stats-next').disabled = queries.length < STATS_PAGE;
-        document.getElementById('stats-page-info').textContent = `Page ${Math.floor(statsOffset / STATS_PAGE) + 1}`;
+        document.getElementById('stats-page-info').textContent = statsOffset === 0
+            ? 'Live feed — newest first'
+            : `Page ${Math.floor(statsOffset / STATS_PAGE) + 1}`;
+
+        // Connect SSE only on page 0 (live feed).
+        if (statsOffset === 0 && liveEnabled) {
+            connectSSE();
+        } else {
+            disconnectSSE();
+        }
     }
 
     function statsPrevPage() {
