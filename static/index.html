@@ -32,7 +32,7 @@
 
         <!-- Dashboard -->
         <div id="tab-dashboard" class="tab-content">
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                     <div class="text-sm text-gray-400">Blocked Domains</div>
                     <div id="stat-blocked" class="text-3xl font-bold text-red-400">-</div>
@@ -48,6 +48,38 @@
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                     <div class="text-sm text-gray-400">Upstream Servers</div>
                     <div id="stat-upstreams" class="text-3xl font-bold text-purple-400">-</div>
+                </div>
+            </div>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
+                    <div class="text-2xl font-bold text-emerald-400" id="stat-total-queries">0</div>
+                    <div class="text-xs text-gray-400">Total Queries</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
+                    <div class="text-2xl font-bold text-red-400" id="stat-q-blocked">0</div>
+                    <div class="text-xs text-gray-400">Blocked</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
+                    <div class="text-2xl font-bold text-green-400" id="stat-q-allowed">0</div>
+                    <div class="text-xs text-gray-400">Allowed</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
+                    <div class="text-2xl font-bold text-blue-400" id="stat-q-rewritten">0</div>
+                    <div class="text-xs text-gray-400">Rewritten</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
+                    <div class="text-2xl font-bold text-yellow-400" id="stat-q-forwarded">0</div>
+                    <div class="text-xs text-gray-400">Forwarded</div>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Clients</h3>
+                    <div id="stats-top-clients" class="space-y-1"></div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Domains</h3>
+                    <div id="stats-top-domains" class="space-y-1"></div>
                 </div>
             </div>
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
@@ -159,38 +191,6 @@
 
         <!-- Stats -->
         <div id="tab-stats" class="tab-content hidden">
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
-                    <div class="text-2xl font-bold text-emerald-400" id="stat-total-queries">0</div>
-                    <div class="text-xs text-gray-400">Total Queries</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
-                    <div class="text-2xl font-bold text-red-400" id="stat-q-blocked">0</div>
-                    <div class="text-xs text-gray-400">Blocked</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
-                    <div class="text-2xl font-bold text-green-400" id="stat-q-allowed">0</div>
-                    <div class="text-xs text-gray-400">Allowed</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
-                    <div class="text-2xl font-bold text-blue-400" id="stat-q-rewritten">0</div>
-                    <div class="text-xs text-gray-400">Rewritten</div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
-                    <div class="text-2xl font-bold text-yellow-400" id="stat-q-forwarded">0</div>
-                    <div class="text-xs text-gray-400">Forwarded</div>
-                </div>
-            </div>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Clients</h3>
-                    <div id="stats-top-clients" class="space-y-1"></div>
-                </div>
-                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Domains</h3>
-                    <div id="stats-top-domains" class="space-y-1"></div>
-                </div>
-            </div>
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                 <div class="flex items-center justify-between mb-3">
                     <h3 class="text-sm font-semibold text-gray-300">Recent Queries</h3>
@@ -253,17 +253,34 @@
     // --- Dashboard ---
 
     async function loadDashboard() {
-        const [blocklist, allowlist, rewrites, upstreams, sources] = await Promise.all([
+        const [blocklist, allowlist, rewrites, upstreams, sources, stats] = await Promise.all([
             fetch(API + '/blocklist?limit=0').then(r => r.json()),
             fetch(API + '/allowlist?limit=0').then(r => r.json()),
             fetch(API + '/rewrites').then(r => r.json()),
             fetch(API + '/upstreams').then(r => r.json()),
             fetch(API + '/sources').then(r => r.json()),
+            fetch(API + '/stats?limit=10').then(r => r.json()),
         ]);
         document.getElementById('stat-blocked').textContent = blocklist.total;
         document.getElementById('stat-allowed').textContent = allowlist.total;
         document.getElementById('stat-rewrites').textContent = rewrites.length;
         document.getElementById('stat-upstreams').textContent = upstreams.length;
+
+        document.getElementById('stat-total-queries').textContent = stats.total_queries.toLocaleString();
+        document.getElementById('stat-q-blocked').textContent = stats.blocked.toLocaleString();
+        document.getElementById('stat-q-allowed').textContent = stats.allowed.toLocaleString();
+        document.getElementById('stat-q-rewritten').textContent = stats.rewritten.toLocaleString();
+        document.getElementById('stat-q-forwarded').textContent = stats.forwarded.toLocaleString();
+
+        const clientsDiv = document.getElementById('stats-top-clients');
+        clientsDiv.innerHTML = stats.top_clients.length
+            ? stats.top_clients.map(c => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300">${c.ip}</span><span class="text-gray-400">${c.count.toLocaleString()}</span></div>`).join('')
+            : '<div class="text-gray-500 text-xs">No data yet</div>';
+
+        const domainsDiv = document.getElementById('stats-top-domains');
+        domainsDiv.innerHTML = stats.top_domains.length
+            ? stats.top_domains.map(d => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300 truncate max-w-xs">${d.domain}</span><span class="text-gray-400">${d.count.toLocaleString()}</span></div>`).join('')
+            : '<div class="text-gray-500 text-xs">No data yet</div>';
 
         const srcDiv = document.getElementById('dashboard-sources');
         if (!sources.length) {
@@ -629,26 +646,7 @@
     const STATS_PAGE = 50;
 
     async function loadStats() {
-        const [stats, queries] = await Promise.all([
-            fetch(API + '/stats?limit=10').then(r => r.json()),
-            fetch(API + `/stats/queries?limit=${STATS_PAGE}&offset=${statsOffset}`).then(r => r.json()),
-        ]);
-        document.getElementById('stat-total-queries').textContent = stats.total_queries.toLocaleString();
-        document.getElementById('stat-q-blocked').textContent = stats.blocked.toLocaleString();
-        document.getElementById('stat-q-allowed').textContent = stats.allowed.toLocaleString();
-        document.getElementById('stat-q-rewritten').textContent = stats.rewritten.toLocaleString();
-        document.getElementById('stat-q-forwarded').textContent = stats.forwarded.toLocaleString();
-
-        const clientsDiv = document.getElementById('stats-top-clients');
-        clientsDiv.innerHTML = stats.top_clients.length
-            ? stats.top_clients.map(c => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300">${c.ip}</span><span class="text-gray-400">${c.count.toLocaleString()}</span></div>`).join('')
-            : '<div class="text-gray-500 text-xs">No data yet</div>';
-
-        const domainsDiv = document.getElementById('stats-top-domains');
-        domainsDiv.innerHTML = stats.top_domains.length
-            ? stats.top_domains.map(d => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300 truncate max-w-xs">${d.domain}</span><span class="text-gray-400">${d.count.toLocaleString()}</span></div>`).join('')
-            : '<div class="text-gray-500 text-xs">No data yet</div>';
-
+        const queries = await fetch(API + `/stats/queries?limit=${STATS_PAGE}&offset=${statsOffset}`).then(r => r.json());
         const tbody = document.getElementById('stats-query-log');
         tbody.innerHTML = queries.length
             ? queries.map(q => {
