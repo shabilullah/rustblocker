@@ -90,9 +90,11 @@ setup_data_dir() {
         mkdir -p "$DATA_DIR"
         info "Created data directory: $DATA_DIR"
     fi
-    # Migrate DB from old location (working directory was /) to DATA_DIR.
+    # Migrate DB and WAL/SHM from old location (working directory was /) to DATA_DIR.
     if [ -f /rustblocker.db ] && [ ! -f "$DATA_DIR/rustblocker.db" ]; then
-        mv /rustblocker.db "$DATA_DIR/"
+        for f in /rustblocker.db /rustblocker.db-wal /rustblocker.db-shm; do
+            [ -f "$f" ] && mv "$f" "$DATA_DIR/"
+        done
         info "Migrated existing database to $DATA_DIR/"
     fi
 }
@@ -223,12 +225,13 @@ uninstall() {
         warn "Data directory not found at $DATA_DIR"
     fi
 
-    # Clean up DB from old location (working directory was / before v2)
-    if [ -f /rustblocker.db ]; then
-        rm -f /rustblocker.db
-        info "Removed old database at /rustblocker.db"
-    fi
-
+    # Clean up DB and WAL/SHM from old location (working directory was / before v2)
+    for f in /rustblocker.db /rustblocker.db-wal /rustblocker.db-shm; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            info "Removed old database file: $f"
+        fi
+    done
 
     # Remove compiled blocklist files (may be in working dir)
     for f in compiled-blocklist.txt compiled-allowlist.txt; do
