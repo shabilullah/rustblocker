@@ -88,6 +88,26 @@ impl DomainStore {
         count
     }
 
+    /// Insert a domain into the store, normalizing it first
+    /// (lowercase, strip trailing dot).
+    pub fn insert(&mut self, domain: &str) {
+        let normalized = normalize_domain(domain);
+        if let Some(stripped) = normalized.strip_prefix("*.") {
+            self.wildcards.insert(stripped.to_string());
+        } else {
+            self.exact.insert(normalized);
+        }
+    }
+
+    /// Remove a domain from the store, normalizing it first.
+    pub fn remove(&mut self, domain: &str) {
+        let normalized = normalize_domain(domain);
+        if let Some(stripped) = normalized.strip_prefix("*.") {
+            self.wildcards.remove(stripped);
+        }
+        self.exact.remove(&normalized);
+    }
+
     /// Check if a normalized domain matches this store.
     pub fn matches(&self, domain: &str) -> bool {
         // Exact match

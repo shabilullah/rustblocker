@@ -49,11 +49,7 @@ fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
     let domains = db::get_domains(pool, table);
     let mut store = DomainStore::default();
     for d in &domains {
-        if let Some(stripped) = d.domain.strip_prefix("*.") {
-            store.wildcards.insert(stripped.to_lowercase());
-        } else {
-            store.exact.insert(d.domain.to_lowercase());
-        }
+        store.insert(&d.domain);
     }
     store
 }

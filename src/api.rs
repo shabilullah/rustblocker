@@ -83,21 +83,12 @@ async fn resolve_import_content(body: &BulkImport) -> String {
 
 /// Insert a domain into the correct set (exact or wildcard) of a DomainStore.
 fn insert_domain(store: &mut DomainStore, domain: &str) {
-    let lower = domain.to_lowercase();
-    if let Some(stripped) = lower.strip_prefix("*.") {
-        store.wildcards.insert(stripped.to_string());
-    } else {
-        store.exact.insert(lower);
-    }
+    store.insert(domain);
 }
 
 /// Remove a domain from both sets of a DomainStore.
 fn remove_domain(store: &mut DomainStore, domain: &str) {
-    let lower = domain.to_lowercase();
-    if let Some(stripped) = lower.strip_prefix("*.") {
-        store.wildcards.remove(stripped);
-    }
-    store.exact.remove(&lower);
+    store.remove(domain);
 }
 
 // --- Settings ---
