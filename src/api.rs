@@ -9,7 +9,7 @@ use crate::acl::SharedAcl;
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
 use crate::forwarder::ParallelForwarder;
-use crate::lists::DomainStore;
+use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
 
 #[derive(Debug, Deserialize)]
@@ -214,7 +214,7 @@ async fn add_blocklist_domain(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
+    blocklist: web::Data<BlocklistStore>,
     body: web::Json<DomainAdd>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -229,7 +229,7 @@ async fn delete_blocklist_domain(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
+    blocklist: web::Data<BlocklistStore>,
     path: web::Path<i64>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -255,7 +255,7 @@ async fn bulk_import_blocklist(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
+    blocklist: web::Data<BlocklistStore>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -297,7 +297,7 @@ async fn add_allowlist_domain(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    allowlist: web::Data<AllowlistStore>,
     body: web::Json<DomainAdd>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -312,7 +312,7 @@ async fn delete_allowlist_domain(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    allowlist: web::Data<AllowlistStore>,
     path: web::Path<i64>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -338,7 +338,7 @@ async fn bulk_import_allowlist(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    allowlist: web::Data<AllowlistStore>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -442,8 +442,8 @@ async fn add_source(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
-    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    blocklist: web::Data<BlocklistStore>,
+    allowlist: web::Data<AllowlistStore>,
     body: web::Json<SourceAdd>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
@@ -488,8 +488,8 @@ async fn refresh_all_sources(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
-    blocklist: web::Data<Arc<RwLock<DomainStore>>>,
-    allowlist: web::Data<Arc<RwLock<DomainStore>>>,
+    blocklist: web::Data<BlocklistStore>,
+    allowlist: web::Data<AllowlistStore>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));

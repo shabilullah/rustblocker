@@ -492,8 +492,8 @@ pub fn get_stale_sources(pool: &DbPool) -> Vec<DbSource> {
 pub async fn refresh_source(
     pool: &DbPool,
     source: &DbSource,
-    blocklist_store: Option<&parking_lot::RwLock<crate::lists::DomainStore>>,
-    allowlist_store: Option<&parking_lot::RwLock<crate::lists::DomainStore>>,
+    blocklist_store: Option<&std::sync::Arc<parking_lot::RwLock<crate::lists::DomainStore>>>,
+    allowlist_store: Option<&std::sync::Arc<parking_lot::RwLock<crate::lists::DomainStore>>>,
 ) -> String {
     let table = match source.list_type.as_str() {
         "allowlist" => "allowlist_domains",

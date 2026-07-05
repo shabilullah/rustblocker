@@ -14,7 +14,9 @@ use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
 use rustblocker::forwarder::ParallelForwarder;
 use rustblocker::handler::DnsBlockerHandler;
-use rustblocker::lists::{DomainStore, RewriteMap, normalize_domain};
+use rustblocker::lists::{
+    AllowlistStore, BlocklistStore, DomainStore, RewriteMap, normalize_domain,
+};
 use rustblocker::stats::QueryLog;
 
 #[derive(Parser)]
@@ -106,8 +108,14 @@ async fn run_server(cli: Cli) -> Result<()> {
         info!("ACL enabled: {}", allowed_networks);
     }
 
-    let blocklist = Arc::new(RwLock::new(load_store_from_db(&pool, "blocklist_domains")));
-    let allowlist = Arc::new(RwLock::new(load_store_from_db(&pool, "allowlist_domains")));
+    let blocklist = BlocklistStore(Arc::new(RwLock::new(load_store_from_db(
+        &pool,
+        "blocklist_domains",
+    ))));
+    let allowlist = AllowlistStore(Arc::new(RwLock::new(load_store_from_db(
+        &pool,
+        "allowlist_domains",
+    ))));
     let rewrites = Arc::new(RwLock::new(load_rewrites_from_db(&pool)));
 
     info!(
@@ -243,9 +251,13 @@ async fn run_server(cli: Cli) -> Result<()> {
             }
             info!("Auto-refreshing {} stale source(s)...", stale.len());
             for source in &stale {
-                let status =
-                    db::refresh_source(&refresh_pool, source, Some(&refresh_bl), Some(&refresh_al))
-                        .await;
+                let status = db::refresh_source(
+                    &refresh_pool,
+                    source,
+                    Some(&*refresh_bl),
+                    Some(&*refresh_al),
+                )
+                .await;
                 info!("Auto-refreshed {}: {}", source.url, status);
             }
         }

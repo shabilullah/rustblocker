@@ -13,12 +13,12 @@ use tracing::{debug, info, warn};
 
 use crate::acl::SharedAcl;
 use crate::forwarder::ParallelForwarder;
-use crate::lists::{DomainStore, RewriteMap, normalize_domain};
+use crate::lists::{AllowlistStore, BlocklistStore, RewriteMap, normalize_domain};
 use crate::stats::{QueryAction, QueryEntry, QueryLog};
 
 pub struct DnsBlockerHandler {
-    pub blocklist: Arc<RwLock<DomainStore>>,
-    pub allowlist: Arc<RwLock<DomainStore>>,
+    pub blocklist: BlocklistStore,
+    pub allowlist: AllowlistStore,
     pub rewrites: Arc<RwLock<RewriteMap>>,
     forwarder: Arc<RwLock<ParallelForwarder>>,
     sinkhole_ipv4: Ipv4Addr,
@@ -30,8 +30,8 @@ pub struct DnsBlockerHandler {
 impl DnsBlockerHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        blocklist: Arc<RwLock<DomainStore>>,
-        allowlist: Arc<RwLock<DomainStore>>,
+        blocklist: BlocklistStore,
+        allowlist: AllowlistStore,
         rewrites: Arc<RwLock<RewriteMap>>,
         forwarder: Arc<RwLock<ParallelForwarder>>,
         sinkhole_ipv4: Ipv4Addr,

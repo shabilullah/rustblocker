@@ -1,6 +1,9 @@
-use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use parking_lot::RwLock;
 use tracing::info;
 
 /// Store for domain block/allow lists with exact and wildcard matching.
@@ -8,6 +11,28 @@ use tracing::info;
 pub struct DomainStore {
     pub exact: HashSet<String>,
     pub wildcards: HashSet<String>, // stored as "example.com" from "*.example.com"
+}
+
+/// Newtype wrapper so actix can distinguish blocklist from allowlist in app data.
+#[derive(Clone)]
+pub struct BlocklistStore(pub Arc<RwLock<DomainStore>>);
+
+/// Newtype wrapper so actix can distinguish allowlist from blocklist in app data.
+#[derive(Clone)]
+pub struct AllowlistStore(pub Arc<RwLock<DomainStore>>);
+
+impl std::ops::Deref for BlocklistStore {
+    type Target = Arc<RwLock<DomainStore>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for AllowlistStore {
+    type Target = Arc<RwLock<DomainStore>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl DomainStore {
