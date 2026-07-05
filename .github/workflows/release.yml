@@ -25,9 +25,6 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -58,12 +55,6 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../rustblocker-${{ github.ref_name }}-${{ matrix.target }}.tar.gz rustblocker
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: bash
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../rustblocker-${{ github.ref_name }}-${{ matrix.target }}.zip rustblocker.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

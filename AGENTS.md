@@ -70,5 +70,5 @@ If any check fails, fix it before proceeding. Never commit code that fails CI.
 ## Release
 
 - Tag with `v*` to trigger release workflow
-- Builds: `x86_64-unknown-linux-musl` (Linux/Alpine), `x86_64-pc-windows-msvc` (Windows)
+- Builds: `x86_64-unknown-linux-musl` (Linux/Alpine), `aarch64-unknown-linux-musl` (ARM)
 - Single binary, no file dependencies (web UI embedded)
