@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustBlocker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+    <nav class="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
+        <h1 class="text-xl font-bold text-emerald-400">RustBlocker</h1>
+        <span id="status" class="text-sm text-gray-400">Loading...</span>
+    </nav>
+
+    <div class="max-w-6xl mx-auto p-6">
+        <!-- Tabs -->
+        <div class="flex gap-1 mb-6 border-b border-gray-700">
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-400 text-emerald-400" data-tab="dashboard">Dashboard</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="blocklist">Blocklist</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="allowlist">Allowlist</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="rewrites">Rewrites</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="settings">Settings</button>
+        </div>
+
+        <!-- Dashboard -->
+        <div id="tab-dashboard" class="tab-content">
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <div class="text-sm text-gray-400">Blocked Domains</div>
+                    <div id="stat-blocked" class="text-3xl font-bold text-red-400">-</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <div class="text-sm text-gray-400">Allowed Domains</div>
+                    <div id="stat-allowed" class="text-3xl font-bold text-green-400">-</div>
+                </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <div class="text-sm text-gray-400">Rewrites</div>
+                    <div id="stat-rewrites" class="text-3xl font-bold text-blue-400">-</div>
+                </div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                <h2 class="text-lg font-semibold mb-3">Upstream Servers</h2>
+                <div id="upstream-list" class="text-sm text-gray-300">Loading...</div>
+            </div>
+        </div>
+
+        <!-- Blocklist -->
+        <div id="tab-blocklist" class="tab-content hidden">
+            <div class="flex gap-3 mb-4">
+                <input id="blocklist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addDomain('blocklist')" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-medium">Block</button>
+                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
+                    Import
+                    <input type="file" class="hidden" onchange="importFile('blocklist', this)">
+                </label>
+            </div>
+            <div id="blocklist-count" class="text-sm text-gray-400 mb-2"></div>
+            <div id="blocklist-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
+        </div>
+
+        <!-- Allowlist -->
+        <div id="tab-allowlist" class="tab-content hidden">
+            <div class="flex gap-3 mb-4">
+                <input id="allowlist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addDomain('allowlist')" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm font-medium">Allow</button>
+                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
+                    Import
+                    <input type="file" class="hidden" onchange="importFile('allowlist', this)">
+                </label>
+            </div>
+            <div id="allowlist-count" class="text-sm text-gray-400 mb-2"></div>
+            <div id="allowlist-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
+        </div>
+
+        <!-- Rewrites -->
+        <div id="tab-rewrites" class="tab-content hidden">
+            <div class="flex gap-3 mb-4">
+                <input id="rewrite-domain" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="rewrite-ipv4" type="text" placeholder="IPv4" class="w-36 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="rewrite-ipv6" type="text" placeholder="IPv6" class="w-48 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addRewrite()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm font-medium">Add</button>
+            </div>
+            <div id="rewrites-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
+        </div>
+
+        <!-- Settings -->
+        <div id="tab-settings" class="tab-content hidden">
+            <div class="bg-gray-800 rounded-lg p-6 border border-gray-700">
+                <h2 class="text-lg font-semibold mb-4">Server Settings</h2>
+                <div id="settings-form" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+                <button onclick="saveSettings()" class="mt-4 bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Save Settings</button>
+                <span id="settings-status" class="ml-3 text-sm text-gray-400"></span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const API = '/api';
+
+    // Tab switching
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                b.classList.remove('border-emerald-400', 'text-emerald-400');
+                b.classList.add('border-transparent', 'text-gray-400');
+            });
+            btn.classList.add('border-emerald-400', 'text-emerald-400');
+            btn.classList.remove('border-transparent', 'text-gray-400');
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+            document.getElementById('tab-' + btn.dataset.tab).classList.remove('hidden');
+            loadTab(btn.dataset.tab);
+        });
+    });
+
+    async function loadTab(tab) {
+        switch(tab) {
+            case 'dashboard': return loadDashboard();
+            case 'blocklist': return loadDomainList('blocklist');
+            case 'allowlist': return loadDomainList('allowlist');
+            case 'rewrites': return loadRewrites();
+            case 'settings': return loadSettings();
+        }
+    }
+
+    async function loadDashboard() {
+        const [blocklist, allowlist, rewrites, upstreams] = await Promise.all([
+            fetch(API + '/blocklist').then(r => r.json()),
+            fetch(API + '/allowlist').then(r => r.json()),
+            fetch(API + '/rewrites').then(r => r.json()),
+            fetch(API + '/upstreams').then(r => r.json()),
+        ]);
+        document.getElementById('stat-blocked').textContent = blocklist.length;
+        document.getElementById('stat-allowed').textContent = allowlist.length;
+        document.getElementById('stat-rewrites').textContent = rewrites.length;
+        document.getElementById('upstream-list').innerHTML = upstreams.length
+            ? upstreams.map(u => `<div class="py-1"><span class="font-mono">${u.address}:${u.port}</span></div>`).join('')
+            : '<div class="text-gray-500">No upstreams configured</div>';
+    }
+
+    async function loadDomainList(type) {
+        const data = await fetch(API + '/' + type).then(r => r.json());
+        document.getElementById(type + '-count').textContent = data.length + ' domains';
+        const list = document.getElementById(type + '-list');
+        if (!data.length) {
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No domains</div>';
+            return;
+        }
+        list.innerHTML = data.map(d =>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
+                <span class="font-mono text-sm">${d.domain}</span>
+                <button onclick="deleteDomain('${type}', ${d.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            </div>`
+        ).join('');
+    }
+
+    async function loadRewrites() {
+        const data = await fetch(API + '/rewrites').then(r => r.json());
+        const list = document.getElementById('rewrites-list');
+        if (!data.length) {
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No rewrites</div>';
+            return;
+        }
+        list.innerHTML = data.map(r =>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
+                <span class="font-mono text-sm">${r.domain} &rarr; ${r.ipv4 || '-'} ${r.ipv6 || ''}</span>
+                <button onclick="deleteRewrite(${r.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            </div>`
+        ).join('');
+    }
+
+    async function loadSettings() {
+        const data = await fetch(API + '/settings').then(r => r.json());
+        const form = document.getElementById('settings-form');
+        const fields = [
+            {key: 'listen_address', label: 'Listen Address'},
+            {key: 'listen_port', label: 'Listen Port'},
+            {key: 'sinkhole_ipv4', label: 'Sinkhole IPv4'},
+            {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
+            {key: 'log_level', label: 'Log Level'},
+            {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
+        ];
+        form.innerHTML = fields.map(f =>
+            `<div>
+                <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
+                <input id="setting-${f.key}" type="text" value="${data[f.key] || ''}"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+            </div>`
+        ).join('');
+    }
+
+    async function addDomain(type) {
+        const input = document.getElementById(type + '-input');
+        const domain = input.value.trim();
+        if (!domain) return;
+        await fetch(API + '/' + type, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({domain})
+        });
+        input.value = '';
+        loadDomainList(type);
+    }
+
+    async function deleteDomain(type, id) {
+        await fetch(API + '/' + type + '/' + id, {method: 'DELETE'});
+        loadDomainList(type);
+    }
+
+    async function importFile(type, input) {
+        const file = input.files[0];
+        if (!file) return;
+        const content = await file.text();
+        await fetch(API + '/' + type + '/import', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({content})
+        });
+        input.value = '';
+        loadDomainList(type);
+    }
+
+    async function addRewrite() {
+        const domain = document.getElementById('rewrite-domain').value.trim();
+        const ipv4 = document.getElementById('rewrite-ipv4').value.trim() || null;
+        const ipv6 = document.getElementById('rewrite-ipv6').value.trim() || null;
+        if (!domain) return;
+        await fetch(API + '/rewrites', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({domain, ipv4, ipv6})
+        });
+        document.getElementById('rewrite-domain').value = '';
+        document.getElementById('rewrite-ipv4').value = '';
+        document.getElementById('rewrite-ipv6').value = '';
+        loadRewrites();
+    }
+
+    async function deleteRewrite(id) {
+        await fetch(API + '/rewrites/' + id, {method: 'DELETE'});
+        loadRewrites();
+    }
+
+    async function saveSettings() {
+        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs'];
+        for (const key of keys) {
+            const el = document.getElementById('setting-' + key);
+            if (el) {
+                await fetch(API + '/settings', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({key, value: el.value})
+                });
+            }
+        }
+        const status = document.getElementById('settings-status');
+        status.textContent = 'Saved!';
+        setTimeout(() => status.textContent = '', 2000);
+    }
+
+    // Health check
+    async function checkHealth() {
+        try {
+            const r = await fetch(API + '/health');
+            const data = await r.json();
+            document.getElementById('status').textContent = 'Online';
+            document.getElementById('status').className = 'text-sm text-green-400';
+        } catch {
+            document.getElementById('status').textContent = 'Offline';
+            document.getElementById('status').className = 'text-sm text-red-400';
+        }
+    }
+
+    // Enter key support
+    document.getElementById('blocklist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('blocklist'); });
+    document.getElementById('allowlist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('allowlist'); });
+
+    // Init
+    checkHealth();
+    loadDashboard();
+    </script>
+</body>
+</html>

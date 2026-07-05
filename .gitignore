@@ -1,0 +1,4 @@
+/target
+rustblocker.db
+compiled-blocklist.txt
+compiled-allowlist.txt
