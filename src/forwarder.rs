@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use hickory_proto::op::{Metadata, ResponseCode};
@@ -14,15 +14,24 @@ use tracing::{debug, warn};
 
 use crate::config::UpstreamConfig;
 
+/// Result of a successful upstream resolve, including timing info.
+pub struct ResolveResult {
+    pub info: ResponseInfo,
+    pub resolver: String,
+    pub latency_us: u64,
+}
+
 /// Parallel DNS forwarder that races queries across multiple upstream resolvers.
 pub struct ParallelForwarder {
     resolvers: Vec<TokioResolver>,
+    addresses: Vec<String>,
     timeout: Duration,
 }
 
 impl ParallelForwarder {
     pub fn new(upstreams: &[UpstreamConfig], timeout_secs: u64) -> Result<Self> {
         let mut resolvers = Vec::with_capacity(upstreams.len());
+        let mut addresses = Vec::with_capacity(upstreams.len());
         for upstream in upstreams {
             let ip: IpAddr = upstream
                 .address
@@ -35,11 +44,13 @@ impl ParallelForwarder {
             let resolver =
                 Resolver::builder_with_config(config, TokioRuntimeProvider::default()).build()?;
             resolvers.push(resolver);
+            addresses.push(upstream.address.clone());
             debug!("Added upstream resolver: {}", upstream.address);
         }
 
         Ok(Self {
             resolvers,
+            addresses,
             timeout: Duration::from_secs(timeout_secs),
         })
     }
@@ -49,7 +60,7 @@ impl ParallelForwarder {
         &self,
         request: &hickory_server::server::Request,
         mut response_handle: impl hickory_server::server::ResponseHandler,
-    ) -> Result<ResponseInfo> {
+    ) -> Result<ResolveResult> {
         let query = request
             .queries
             .queries()
@@ -60,13 +71,15 @@ impl ParallelForwarder {
 
         debug!("Forwarding query: {} ({})", name, query_type);
 
+        let start = Instant::now();
         let futures: Vec<_> = self
             .resolvers
             .iter()
-            .map(|resolver| {
+            .enumerate()
+            .map(|(idx, resolver)| {
                 let name = name.clone();
                 let rtype = query_type;
-                async move { resolver.lookup(name, rtype).await }
+                async move { (idx, resolver.lookup(name, rtype).await) }
             })
             .collect();
 
@@ -77,10 +90,9 @@ impl ParallelForwarder {
                 let (resolved, _idx, remaining) = futures::future::select_all(futs).await;
                 futs = remaining;
                 match resolved {
-                    Ok(lookup) => {
-                        // Build answer records from the lookup
+                    (idx, Ok(lookup)) => {
+                        let latency_us = start.elapsed().as_micros() as u64;
                         let answers = extract_answers(query_type, &lookup);
-                        // Build and send response while answers are alive
                         let builder = MessageResponseBuilder::from_message_request(request);
                         let mut metadata = Metadata::response_from_request(&request.metadata);
                         metadata.response_code = ResponseCode::NoError;
@@ -92,9 +104,18 @@ impl ParallelForwarder {
                             [].iter(),
                         );
                         let info = response_handle.send_response(response).await?;
-                        return Ok(info);
+                        let resolver = self
+                            .addresses
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or_else(|| "unknown".to_string());
+                        return Ok(ResolveResult {
+                            info,
+                            resolver,
+                            latency_us,
+                        });
                     }
-                    Err(e) => {
+                    (_, Err(e)) => {
                         warn!("Upstream resolver failed: {}", e);
                         last_err = Some(e);
                     }
@@ -108,14 +129,23 @@ impl ParallelForwarder {
         .await;
 
         match result {
-            Ok(Ok(info)) => Ok(info),
+            Ok(Ok(resolve_result)) => Ok(resolve_result),
             Ok(Err(e)) => {
                 warn!("Forwarding error: {}, sending SERVFAIL", e);
-                send_servfail(request, &mut response_handle).await
+                let info = send_servfail(request, &mut response_handle).await?;
+                Ok(ResolveResult {
+                    info,
+                    resolver: "error".to_string(),
+                    latency_us: start.elapsed().as_micros() as u64,
+                })
             }
             Err(_) => {
                 warn!("All upstream resolvers timed out, sending SERVFAIL");
-                send_servfail(request, &mut response_handle).await
+                Ok(ResolveResult {
+                    info: send_servfail(request, &mut response_handle).await?,
+                    resolver: "timeout".to_string(),
+                    latency_us: start.elapsed().as_micros() as u64,
+                })
             }
         }
     }

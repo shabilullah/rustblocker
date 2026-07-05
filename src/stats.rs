@@ -36,6 +36,8 @@ pub struct QueryEntry {
     pub domain: String,
     pub query_type: RecordType,
     pub action: QueryAction,
+    pub resolver: Option<String>,
+    pub latency_us: Option<u64>,
 }
 
 /// Aggregate stats returned by the API.
@@ -48,6 +50,8 @@ pub struct StatsSummary {
     pub forwarded: u64,
     pub top_clients: Vec<ClientCount>,
     pub top_domains: Vec<DomainCount>,
+    pub top_blocked_domains: Vec<DomainCount>,
+    pub upstream_stats: Vec<UpstreamStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +66,15 @@ pub struct DomainCount {
     pub count: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct UpstreamStats {
+    pub resolver: String,
+    pub count: u64,
+    pub avg_latency_us: u64,
+    pub min_latency_us: u64,
+    pub max_latency_us: u64,
+}
+
 /// Lightweight query log entry for the API.
 #[derive(Debug, Serialize)]
 pub struct QueryLogEntry {
@@ -71,6 +84,8 @@ pub struct QueryLogEntry {
     pub domain: String,
     pub query_type: String,
     pub action: String,
+    pub resolver: Option<String>,
+    pub latency_us: Option<u64>,
 }
 
 /// Serializable entry for SSE live streaming.
@@ -80,6 +95,8 @@ pub struct LiveQuery {
     pub domain: String,
     pub query_type: String,
     pub action: String,
+    pub resolver: Option<String>,
+    pub latency_us: Option<u64>,
 }
 
 /// Thread-safe query log with atomic counters and a background batch writer.
@@ -138,6 +155,8 @@ impl QueryLog {
             domain: entry.domain.clone(),
             query_type: entry.query_type.to_string(),
             action: entry.action.to_string(),
+            resolver: entry.resolver.clone(),
+            latency_us: entry.latency_us,
         };
         let _ = self.live_tx.send(live);
 
@@ -220,8 +239,8 @@ impl QueryLog {
             let query_type_str = entry.query_type.to_string();
             let ip_str = entry.client_ip.to_string();
             let _ = tx.execute(
-                "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action) VALUES (datetime('now'), ?1, ?2, ?3, ?4)",
-                rusqlite::params![ip_str, entry.domain, query_type_str, action_str],
+                "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action, resolver, latency_us) VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![ip_str, entry.domain, query_type_str, action_str, entry.resolver, entry.latency_us],
             );
         }
 
@@ -251,6 +270,8 @@ impl QueryLog {
                     forwarded: 0,
                     top_clients: vec![],
                     top_domains: vec![],
+                    top_blocked_domains: vec![],
+                    upstream_stats: vec![],
                 };
             }
         };
@@ -292,9 +313,7 @@ impl QueryLog {
             .unwrap_or(0);
 
         let mut stmt = conn
-            .prepare(
-                "SELECT client_ip, COUNT(*) as cnt FROM query_log GROUP BY client_ip ORDER BY cnt DESC LIMIT ?1",
-            )
+            .prepare("SELECT client_ip, COUNT(*) as cnt FROM query_log GROUP BY client_ip ORDER BY cnt DESC LIMIT ?1")
             .unwrap();
         let top_clients: Vec<ClientCount> = stmt
             .query_map(rusqlite::params![limit], |row| {
@@ -308,15 +327,46 @@ impl QueryLog {
             .collect();
 
         let mut stmt = conn
-            .prepare(
-                "SELECT domain, COUNT(*) as cnt FROM query_log GROUP BY domain ORDER BY cnt DESC LIMIT ?1",
-            )
+            .prepare("SELECT domain, COUNT(*) as cnt FROM query_log GROUP BY domain ORDER BY cnt DESC LIMIT ?1")
             .unwrap();
         let top_domains: Vec<DomainCount> = stmt
             .query_map(rusqlite::params![limit], |row| {
                 Ok(DomainCount {
                     domain: row.get(0)?,
                     count: row.get(1)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Top blocked domains
+        let mut stmt = conn
+            .prepare("SELECT domain, COUNT(*) as cnt FROM query_log WHERE action = 'blocked' GROUP BY domain ORDER BY cnt DESC LIMIT ?1")
+            .unwrap();
+        let top_blocked_domains: Vec<DomainCount> = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok(DomainCount {
+                    domain: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Upstream stats
+        let mut stmt = conn
+            .prepare("SELECT resolver, COUNT(*), CAST(AVG(latency_us) AS INTEGER), MIN(latency_us), MAX(latency_us) FROM query_log WHERE resolver IS NOT NULL AND resolver != '' GROUP BY resolver ORDER BY COUNT(*) DESC")
+            .unwrap();
+        let upstream_stats: Vec<UpstreamStats> = stmt
+            .query_map([], |row| {
+                Ok(UpstreamStats {
+                    resolver: row.get(0)?,
+                    count: row.get(1)?,
+                    avg_latency_us: row.get(2)?,
+                    min_latency_us: row.get(3)?,
+                    max_latency_us: row.get(4)?,
                 })
             })
             .unwrap()
@@ -331,6 +381,8 @@ impl QueryLog {
             forwarded,
             top_clients,
             top_domains,
+            top_blocked_domains,
+            upstream_stats,
         }
     }
 
@@ -343,7 +395,7 @@ impl QueryLog {
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, timestamp, client_ip, domain, query_type, action FROM query_log ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+                "SELECT id, timestamp, client_ip, domain, query_type, action, resolver, latency_us FROM query_log ORDER BY id DESC LIMIT ?1 OFFSET ?2",
             )
             .unwrap();
 
@@ -355,6 +407,8 @@ impl QueryLog {
                 domain: row.get(3)?,
                 query_type: row.get(4)?,
                 action: row.get(5)?,
+                resolver: row.get(6)?,
+                latency_us: row.get(7)?,
             })
         })
         .unwrap()

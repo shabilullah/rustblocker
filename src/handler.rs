@@ -134,6 +134,8 @@ impl RequestHandler for DnsBlockerHandler {
                     domain: domain.clone(),
                     query_type,
                     action: QueryAction::Rewritten,
+                    resolver: None,
+                    latency_us: None,
                 });
                 info!("Rewrite: {} -> {}", domain, rdata);
                 let builder = MessageResponseBuilder::from_message_request(request);
@@ -165,6 +167,8 @@ impl RequestHandler for DnsBlockerHandler {
                             domain: domain.clone(),
                             query_type,
                             action: QueryAction::Blocked,
+                            resolver: None,
+                            latency_us: None,
                         });
                         Some(build_rdata(
                             query_type,
@@ -194,17 +198,20 @@ impl RequestHandler for DnsBlockerHandler {
 
             // 3. Forward to upstream
             debug!("Forwarding: {}", domain);
+            let result = self
+                .forwarder
+                .resolve(request, response_handle)
+                .await
+                .expect("forwarder failed to send response");
             self.query_log.record(QueryEntry {
                 client_ip: src_ip,
                 domain,
                 query_type,
                 action: QueryAction::Forwarded,
+                resolver: Some(result.resolver),
+                latency_us: Some(result.latency_us),
             });
-            let rh = response_handle;
-            self.forwarder
-                .resolve(request, rh)
-                .await
-                .expect("forwarder failed to send response")
+            result.info
         })
     }
 }

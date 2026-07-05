@@ -73,16 +73,13 @@
                     <div id="stats-top-clients" class="space-y-1"></div>
                 </div>
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Domains</h3>
-                    <div id="stats-top-domains" class="space-y-1"></div>
+                    <h3 class="text-sm font-semibold mb-3 text-gray-300">Top Blocked Domains</h3>
+                    <div id="stats-top-blocked-domains" class="space-y-1"></div>
                 </div>
             </div>
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <div class="flex justify-between items-center mb-3">
-                    <h2 class="text-lg font-semibold">Auto-Update Sources</h2>
-                    <button onclick="refreshAllSources()" id="refresh-all-btn" class="bg-yellow-600 hover:bg-yellow-700 px-3 py-1 rounded text-sm font-medium">Refresh All Now</button>
-                </div>
-                <div id="dashboard-sources" class="text-sm text-gray-300">Loading...</div>
+            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 mb-4">
+                <h3 class="text-sm font-semibold mb-3 text-gray-300">Upstream Resolvers</h3>
+                <div id="stats-upstream-resolvers" class="text-sm"></div>
             </div>
         </div>
 
@@ -279,10 +276,32 @@
             ? stats.top_clients.map(c => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300">${c.ip}</span><span class="text-gray-400">${c.count.toLocaleString()}</span></div>`).join('')
             : '<div class="text-gray-500 text-xs">No data yet</div>';
 
-        const domainsDiv = document.getElementById('stats-top-domains');
-        domainsDiv.innerHTML = stats.top_domains.length
-            ? stats.top_domains.map(d => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300 truncate max-w-xs">${d.domain}</span><span class="text-gray-400">${d.count.toLocaleString()}</span></div>`).join('')
+        const blockedDiv = document.getElementById('stats-top-blocked-domains');
+        blockedDiv.innerHTML = stats.top_blocked_domains.length
+            ? stats.top_blocked_domains.map(d => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300 truncate max-w-xs">${d.domain}</span><span class="text-gray-400">${d.count.toLocaleString()}</span></div>`).join('')
             : '<div class="text-gray-500 text-xs">No data yet</div>';
+
+        const upstreamDiv = document.getElementById('stats-upstream-resolvers');
+        upstreamDiv.innerHTML = stats.upstream_stats.length
+            ? `<table class="w-full text-xs">
+                <thead><tr class="text-gray-400 border-b border-gray-700">
+                    <th class="text-left py-1.5 px-2">Resolver</th>
+                    <th class="text-right py-1.5 px-2">Queries</th>
+                    <th class="text-right py-1.5 px-2">Avg</th>
+                    <th class="text-right py-1.5 px-2">Min</th>
+                    <th class="text-right py-1.5 px-2">Max</th>
+                </tr></thead>
+                <tbody>${stats.upstream_stats.map(u => `
+                    <tr class="border-b border-gray-700/50">
+                        <td class="py-1.5 px-2 font-mono">${u.resolver}</td>
+                        <td class="py-1.5 px-2 text-right">${u.count.toLocaleString()}</td>
+                        <td class="py-1.5 px-2 text-right text-gray-300">${formatLatency(u.avg_latency_us)}</td>
+                        <td class="py-1.5 px-2 text-right text-gray-400">${formatLatency(u.min_latency_us)}</td>
+                        <td class="py-1.5 px-2 text-right text-gray-400">${formatLatency(u.max_latency_us)}</td>
+                    </tr>`).join('')}
+                </tbody>
+            </table>`
+            : '<div class="text-gray-500 text-xs">No upstream queries yet</div>';
 
         const srcDiv = document.getElementById('dashboard-sources');
         if (!sources.length) {
@@ -626,6 +645,12 @@
         const status = document.getElementById('settings-status');
         status.textContent = 'Saved! Restart to apply.';
         setTimeout(() => status.textContent = '', 3000);
+    }
+
+    function formatLatency(us) {
+        if (us == null) return '-';
+        if (us >= 1000) return (us / 1000).toFixed(1) + ' ms';
+        return us + ' μs';
     }
 
     // --- Health ---

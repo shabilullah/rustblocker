@@ -57,7 +57,9 @@ fn init_schema(conn: &rusqlite::Connection) {
             client_ip TEXT NOT NULL,
             domain TEXT NOT NULL,
             query_type TEXT NOT NULL,
-            action TEXT NOT NULL
+            action TEXT NOT NULL,
+            resolver TEXT,
+            latency_us INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_query_log_timestamp ON query_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_query_log_client_ip ON query_log(client_ip);
