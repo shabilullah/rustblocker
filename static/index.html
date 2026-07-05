@@ -253,19 +253,21 @@
     // --- Dashboard ---
 
     async function loadDashboard() {
-        const [blocklist, allowlist, rewrites, upstreams, sources, stats] = await Promise.all([
+        const [blocklist, allowlist, rewrites, upstreams] = await Promise.all([
             fetch(API + '/blocklist?limit=0').then(r => r.json()),
             fetch(API + '/allowlist?limit=0').then(r => r.json()),
             fetch(API + '/rewrites').then(r => r.json()),
             fetch(API + '/upstreams').then(r => r.json()),
-            fetch(API + '/sources').then(r => r.json()),
-            fetch(API + '/stats?limit=10').then(r => r.json()),
         ]);
         document.getElementById('stat-blocked').textContent = blocklist.total;
         document.getElementById('stat-allowed').textContent = allowlist.total;
         document.getElementById('stat-rewrites').textContent = rewrites.length;
         document.getElementById('stat-upstreams').textContent = upstreams.length;
+        await refreshDashboardStats();
+    }
 
+    async function refreshDashboardStats() {
+        const stats = await fetch(API + '/stats?limit=10').then(r => r.json());
         document.getElementById('stat-total-queries').textContent = stats.total_queries.toLocaleString();
         document.getElementById('stat-q-blocked').textContent = stats.blocked.toLocaleString();
         document.getElementById('stat-q-allowed').textContent = stats.allowed.toLocaleString();
@@ -303,18 +305,6 @@
                 </tbody>
             </table>`
             : '<div class="text-gray-500 text-xs">No upstream queries yet</div>';
-
-        const srcDiv = document.getElementById('dashboard-sources');
-        if (!sources.length) {
-            srcDiv.innerHTML = '<div class="text-gray-500">No auto-update sources configured.</div>';
-        } else {
-            srcDiv.innerHTML = sources.map(s =>
-                `<div class="flex items-center justify-between py-1 border-b border-gray-700 last:border-0">
-                    <span class="font-mono text-xs truncate max-w-md">${s.url}</span>
-                    <span class="text-xs px-2 py-0.5 rounded ${s.last_status && s.last_status.startsWith('ok') ? 'bg-green-900 text-green-300' : s.last_status ? 'bg-red-900 text-red-300' : 'bg-gray-700 text-gray-400'}">${s.last_status || 'pending'}</span>
-                </div>`
-            ).join('');
-        }
     }
 
     // --- Upstreams ---
@@ -739,7 +729,7 @@
     }
     function startDashboardPoll() {
         if (dashboardInterval) clearInterval(dashboardInterval);
-        dashboardInterval = setInterval(() => { loadDashboard(); }, 2000);
+        dashboardInterval = setInterval(() => { refreshDashboardStats(); }, 3000);
     }
 
     function stopDashboardPoll() {
@@ -748,7 +738,6 @@
             dashboardInterval = null;
         }
     }
-
 
     async function loadStats() {
         // Load historical page from DB.
