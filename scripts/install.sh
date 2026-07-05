@@ -90,6 +90,11 @@ setup_data_dir() {
         mkdir -p "$DATA_DIR"
         info "Created data directory: $DATA_DIR"
     fi
+    # Migrate DB from old location (working directory was /) to DATA_DIR.
+    if [ -f /rustblocker.db ] && [ ! -f "$DATA_DIR/rustblocker.db" ]; then
+        mv /rustblocker.db "$DATA_DIR/"
+        info "Migrated existing database to $DATA_DIR/"
+    fi
 }
 
 setup_service() {
@@ -113,10 +118,16 @@ name="rustblocker"
 description="RustBlocker DNS Blocker"
 command="/usr/local/bin/rustblocker"
 command_args="--dns-port 53"
-command_background=true
 pidfile="/run/rustblocker.pid"
 output_log="/var/log/rustblocker.log"
 error_log="/var/log/rustblocker.log"
+
+start() {
+    cd /var/lib/rustblocker || return 1
+    start-stop-daemon --start --background --make-pidfile \
+        --pidfile "$pidfile" \
+        --exec "$command" -- $command_args
+}
 
 depend() {
     need net
@@ -141,6 +152,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/rustblocker --dns-port 53
+WorkingDirectory=/var/lib/rustblocker
 Restart=on-failure
 RestartSec=5
 
@@ -210,6 +222,13 @@ uninstall() {
     else
         warn "Data directory not found at $DATA_DIR"
     fi
+
+    # Clean up DB from old location (working directory was / before v2)
+    if [ -f /rustblocker.db ]; then
+        rm -f /rustblocker.db
+        info "Removed old database at /rustblocker.db"
+    fi
+
 
     # Remove compiled blocklist files (may be in working dir)
     for f in compiled-blocklist.txt compiled-allowlist.txt; do
