@@ -238,10 +238,12 @@ impl QueryLog {
             let action_str = entry.action.to_string();
             let query_type_str = entry.query_type.to_string();
             let ip_str = entry.client_ip.to_string();
-            let _ = tx.execute(
+            if let Err(e) = tx.execute(
                 "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action, resolver, latency_us) VALUES (datetime('now'), ?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![ip_str, entry.domain, query_type_str, action_str, entry.resolver, entry.latency_us],
-            );
+            ) {
+                warn!("Failed to insert query log entry: {}", e);
+            }
         }
 
         if let Err(e) = tx.commit() {

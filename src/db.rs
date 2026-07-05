@@ -69,6 +69,10 @@ fn init_schema(conn: &rusqlite::Connection) {
         CREATE INDEX IF NOT EXISTS idx_query_log_action ON query_log(action);",
     )
     .expect("failed to init schema");
+    // Migration: add columns that may be missing in databases created by older versions.
+    // CREATE TABLE IF NOT EXISTS won't alter existing tables, so we do it explicitly.
+    let _ = conn.execute("ALTER TABLE query_log ADD COLUMN resolver TEXT", []);
+    let _ = conn.execute("ALTER TABLE query_log ADD COLUMN latency_us INTEGER", []);
 }
 
 /// Seed the database with sensible defaults (only if tables are empty).
