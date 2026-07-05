@@ -34,14 +34,13 @@ If any check fails, fix it before proceeding. Never commit code that fails CI.
 | File | Purpose |
 |------|---------|
 | `src/config.rs` | `UpstreamConfig` and `RewriteRule` structs only |
-| `src/db.rs` | SQLite schema, CRUD, `seed_defaults()`, `fetch_source()` |
+| `src/db.rs` | SQLite schema, CRUD, `seed_defaults()`, `fetch_source()`, `refresh_source()`, source management |
 | `src/lists.rs` | `DomainStore` (HashSet-based), `RewriteMap`, domain matching |
 | `src/handler.rs` | `DnsBlockerHandler` implementing `RequestHandler` |
 | `src/forwarder.rs` | `ParallelForwarder` racing upstream resolvers |
 | `src/api.rs` | REST API endpoints (actix-web handlers) |
-| `src/main.rs` | Server startup, CLI args (`--dns-port`, `--web-port`), DB init, DNS + web server via `tokio::select!` |
+| `src/main.rs` | Server startup, CLI args (`--dns-port`, `--web-port`), DB init, auto-refresh scheduler, DNS + web server via `tokio::select!` |
 | `static/index.html` | Web UI (TailwindCSS, vanilla JS) — embedded in binary |
-
 ## Rules
 
 1. Always run `cargo fmt --all` before committing
