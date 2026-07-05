@@ -16,6 +16,7 @@
         <!-- Tabs -->
         <div class="flex gap-1 mb-6 border-b border-gray-700">
             <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-400 text-emerald-400" data-tab="dashboard">Dashboard</button>
+            <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="upstreams">Upstreams</button>
             <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="blocklist">Blocklist</button>
             <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="allowlist">Allowlist</button>
             <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-transparent text-gray-400 hover:text-gray-200" data-tab="rewrites">Rewrites</button>
@@ -24,7 +25,7 @@
 
         <!-- Dashboard -->
         <div id="tab-dashboard" class="tab-content">
-            <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
                     <div class="text-sm text-gray-400">Blocked Domains</div>
                     <div id="stat-blocked" class="text-3xl font-bold text-red-400">-</div>
@@ -37,11 +38,22 @@
                     <div class="text-sm text-gray-400">Rewrites</div>
                     <div id="stat-rewrites" class="text-3xl font-bold text-blue-400">-</div>
                 </div>
+                <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <div class="text-sm text-gray-400">Upstream Servers</div>
+                    <div id="stat-upstreams" class="text-3xl font-bold text-purple-400">-</div>
+                </div>
             </div>
-            <div class="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                <h2 class="text-lg font-semibold mb-3">Upstream Servers</h2>
-                <div id="upstream-list" class="text-sm text-gray-300">Loading...</div>
+        </div>
+
+        <!-- Upstreams -->
+        <div id="tab-upstreams" class="tab-content hidden">
+            <div class="flex gap-3 mb-4">
+                <input id="upstream-address" type="text" placeholder="8.8.8.8" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="upstream-port" type="number" placeholder="53" value="53" class="w-24 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addUpstream()" class="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded text-sm font-medium">Add Upstream</button>
             </div>
+            <div id="upstream-count" class="text-sm text-gray-400 mb-2"></div>
+            <div id="upstream-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
         </div>
 
         <!-- Blocklist -->
@@ -115,6 +127,7 @@
     async function loadTab(tab) {
         switch(tab) {
             case 'dashboard': return loadDashboard();
+            case 'upstreams': return loadUpstreams();
             case 'blocklist': return loadDomainList('blocklist');
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
@@ -132,9 +145,42 @@
         document.getElementById('stat-blocked').textContent = blocklist.length;
         document.getElementById('stat-allowed').textContent = allowlist.length;
         document.getElementById('stat-rewrites').textContent = rewrites.length;
-        document.getElementById('upstream-list').innerHTML = upstreams.length
-            ? upstreams.map(u => `<div class="py-1"><span class="font-mono">${u.address}:${u.port}</span></div>`).join('')
-            : '<div class="text-gray-500">No upstreams configured</div>';
+        document.getElementById('stat-upstreams').textContent = upstreams.length;
+    }
+
+    async function loadUpstreams() {
+        const data = await fetch(API + '/upstreams').then(r => r.json());
+        document.getElementById('upstream-count').textContent = data.length + ' servers';
+        const list = document.getElementById('upstream-list');
+        if (!data.length) {
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No upstream servers configured</div>';
+            return;
+        }
+        list.innerHTML = data.map(u =>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
+                <span class="font-mono text-sm">${u.address}:${u.port}</span>
+                <button onclick="deleteUpstream(${u.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            </div>`
+        ).join('');
+    }
+
+    async function addUpstream() {
+        const address = document.getElementById('upstream-address').value.trim();
+        const port = parseInt(document.getElementById('upstream-port').value) || 53;
+        if (!address) return;
+        await fetch(API + '/upstreams', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({address, port})
+        });
+        document.getElementById('upstream-address').value = '';
+        document.getElementById('upstream-port').value = '53';
+        loadUpstreams();
+    }
+
+    async function deleteUpstream(id) {
+        await fetch(API + '/upstreams/' + id, {method: 'DELETE'});
+        loadUpstreams();
     }
 
     async function loadDomainList(type) {
@@ -149,41 +195,6 @@
             `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
                 <span class="font-mono text-sm">${d.domain}</span>
                 <button onclick="deleteDomain('${type}', ${d.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
-            </div>`
-        ).join('');
-    }
-
-    async function loadRewrites() {
-        const data = await fetch(API + '/rewrites').then(r => r.json());
-        const list = document.getElementById('rewrites-list');
-        if (!data.length) {
-            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No rewrites</div>';
-            return;
-        }
-        list.innerHTML = data.map(r =>
-            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
-                <span class="font-mono text-sm">${r.domain} &rarr; ${r.ipv4 || '-'} ${r.ipv6 || ''}</span>
-                <button onclick="deleteRewrite(${r.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
-            </div>`
-        ).join('');
-    }
-
-    async function loadSettings() {
-        const data = await fetch(API + '/settings').then(r => r.json());
-        const form = document.getElementById('settings-form');
-        const fields = [
-            {key: 'listen_address', label: 'Listen Address'},
-            {key: 'listen_port', label: 'Listen Port'},
-            {key: 'sinkhole_ipv4', label: 'Sinkhole IPv4'},
-            {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
-            {key: 'log_level', label: 'Log Level'},
-            {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
-        ];
-        form.innerHTML = fields.map(f =>
-            `<div>
-                <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
-                <input id="setting-${f.key}" type="text" value="${data[f.key] || ''}"
-                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
             </div>`
         ).join('');
     }
@@ -219,6 +230,21 @@
         loadDomainList(type);
     }
 
+    async function loadRewrites() {
+        const data = await fetch(API + '/rewrites').then(r => r.json());
+        const list = document.getElementById('rewrites-list');
+        if (!data.length) {
+            list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No rewrites</div>';
+            return;
+        }
+        list.innerHTML = data.map(r =>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
+                <span class="font-mono text-sm">${r.domain} &rarr; ${r.ipv4 || '-'} ${r.ipv6 || ''}</span>
+                <button onclick="deleteRewrite(${r.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            </div>`
+        ).join('');
+    }
+
     async function addRewrite() {
         const domain = document.getElementById('rewrite-domain').value.trim();
         const ipv4 = document.getElementById('rewrite-ipv4').value.trim() || null;
@@ -240,6 +266,26 @@
         loadRewrites();
     }
 
+    async function loadSettings() {
+        const data = await fetch(API + '/settings').then(r => r.json());
+        const form = document.getElementById('settings-form');
+        const fields = [
+            {key: 'listen_address', label: 'Listen Address'},
+            {key: 'listen_port', label: 'DNS Port'},
+            {key: 'sinkhole_ipv4', label: 'Sinkhole IPv4'},
+            {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
+            {key: 'log_level', label: 'Log Level'},
+            {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
+        ];
+        form.innerHTML = fields.map(f =>
+            `<div>
+                <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
+                <input id="setting-${f.key}" type="text" value="${data[f.key] || ''}"
+                    class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+            </div>`
+        ).join('');
+    }
+
     async function saveSettings() {
         const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs'];
         for (const key of keys) {
@@ -253,15 +299,15 @@
             }
         }
         const status = document.getElementById('settings-status');
-        status.textContent = 'Saved!';
-        setTimeout(() => status.textContent = '', 2000);
+        status.textContent = 'Saved! Restart to apply.';
+        setTimeout(() => status.textContent = '', 3000);
     }
 
     // Health check
     async function checkHealth() {
         try {
             const r = await fetch(API + '/health');
-            const data = await r.json();
+            await r.json();
             document.getElementById('status').textContent = 'Online';
             document.getElementById('status').className = 'text-sm text-green-400';
         } catch {
@@ -273,6 +319,7 @@
     // Enter key support
     document.getElementById('blocklist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('blocklist'); });
     document.getElementById('allowlist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('allowlist'); });
+    document.getElementById('upstream-address').addEventListener('keydown', e => { if (e.key === 'Enter') addUpstream(); });
 
     // Init
     checkHealth();
