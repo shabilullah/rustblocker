@@ -202,6 +202,35 @@ Changes made via the web UI or API take effect **immediately** for:
 
 Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) require a server restart.
 
+## Network Access Control
+
+RustBlocker has two layers of access control:
+
+| Setting | Controls | Default |
+|---------|----------|---------|
+| `listen_address` | OS-level bind restriction (who can connect) | `0.0.0.0` (all interfaces) |
+| `allowed_networks` | Application-level ACL (who gets a response) | empty (allow all) |
+
+Both layers must allow a client for the request to succeed. Examples:
+
+| `listen_address` | `allowed_networks` | Result |
+|---|---|---|
+| `127.0.0.1` | empty | Only localhost — OS blocks everyone else |
+| `0.0.0.0` | empty | Anyone on the network — no restrictions |
+| `0.0.0.0` | `192.168.0.0/24` | Server binds everywhere, ACL rejects non-matching IPs |
+| `127.0.0.1` | `192.168.0.0/24` | Only localhost — ACL is irrelevant, OS already restricts |
+
+The ACL applies to **both DNS and web UI**. Set `allowed_networks` via the web UI Settings tab or API:
+
+```bash
+# Restrict to local network
+curl -X PUT http://127.0.0.1:54/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{"key": "allowed_networks", "value": "192.168.0.0/24,10.0.0.0/22"}'
+```
+
+Changes take effect immediately — no restart needed.
+
 ## Default Settings
 
 | Setting | Default | Description |
@@ -212,6 +241,7 @@ Changes to **settings** (listen address, port, sinkhole IPs, upstream timeout) r
 | `sinkhole_ipv6` | `::` | IPv6 returned for blocked domains |
 | `log_level` | `info` | Log level (overridable via `RUST_LOG` env var) |
 | `upstream_timeout_secs` | `5` | Timeout for upstream DNS queries |
+| `allowed_networks` | empty | CIDR list for ACL (empty = allow all) |
 
 ## Deploy on Alpine Linux
 
