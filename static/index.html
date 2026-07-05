@@ -664,6 +664,7 @@
     const STATS_PAGE = 50;
     let liveEnabled = true;
     let eventSource = null;
+    let reconnectTimer = null;
     let dashboardInterval = null;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
 
