@@ -41,6 +41,7 @@ If any check fails, fix it before proceeding. Never commit code that fails CI.
 | `src/api.rs` | REST API endpoints (actix-web handlers) |
 | `src/main.rs` | Server startup, CLI args (`--dns-port`, `--web-port`), DB init, auto-refresh scheduler, DNS + web server via `tokio::select!` |
 | `static/index.html` | Web UI (TailwindCSS, vanilla JS) — embedded in binary |
+
 ## Rules
 
 1. Always run `cargo fmt --all` before committing
