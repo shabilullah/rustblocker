@@ -165,7 +165,11 @@ async fn run_server() -> Result<()> {
             .app_data(allowlist_data.clone())
             .app_data(rewrites_data.clone())
             .configure(api::configure)
-            .service(actix_files::Files::new("/", "static").index_file("index.html"))
+            .route("/", actix_web::web::get().to(|| async {
+                actix_web::HttpResponse::Ok()
+                    .content_type("text/html; charset=utf-8")
+                    .body(include_str!("../static/index.html"))
+            }))
     })
     .bind(&web_addr)
     .with_context(|| format!("Failed to bind web server on {}", web_addr))?;
