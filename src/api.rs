@@ -19,7 +19,8 @@ struct DomainAdd {
 
 #[derive(Debug, Deserialize)]
 struct BulkImport {
-    content: String,
+    content: Option<String>,
+    url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +34,17 @@ struct RewriteAdd {
     domain: String,
     ipv4: Option<String>,
     ipv6: Option<String>,
+}
+
+/// Resolve import content from either inline content or a URL.
+async fn resolve_import_content(body: &BulkImport) -> String {
+    if let Some(ref url) = body.url {
+        db::fetch_source(url).await
+    } else if let Some(ref content) = body.content {
+        content.clone()
+    } else {
+        String::new()
+    }
 }
 
 /// Insert a domain into the correct set (exact or wildcard) of a DomainStore.
@@ -130,7 +142,12 @@ async fn bulk_import_blocklist(
     blocklist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
-    let count = db::bulk_import_domains(&pool, "blocklist_domains", &body.content);
+    let content = resolve_import_content(&body).await;
+    if content.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "no content or url provided"}));
+    }
+    let count = db::bulk_import_domains(&pool, "blocklist_domains", &content);
     reload_domain_store(&pool, "blocklist_domains", &blocklist);
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }
@@ -178,7 +195,12 @@ async fn bulk_import_allowlist(
     allowlist: web::Data<Arc<RwLock<DomainStore>>>,
     body: web::Json<BulkImport>,
 ) -> impl Responder {
-    let count = db::bulk_import_domains(&pool, "allowlist_domains", &body.content);
+    let content = resolve_import_content(&body).await;
+    if content.is_empty() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "no content or url provided"}));
+    }
+    let count = db::bulk_import_domains(&pool, "allowlist_domains", &content);
     reload_domain_store(&pool, "allowlist_domains", &allowlist);
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }

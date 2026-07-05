@@ -62,10 +62,15 @@
                 <input id="blocklist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                 <button onclick="addDomain('blocklist')" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-medium">Block</button>
                 <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
-                    Import
+                    Import File
                     <input type="file" class="hidden" onchange="importFile('blocklist', this)">
                 </label>
             </div>
+            <div class="flex gap-3 mb-4">
+                <input id="blocklist-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="importUrl('blocklist')" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium">Import URL</button>
+            </div>
+            <div id="blocklist-status" class="text-sm text-gray-400 mb-2"></div>
             <div id="blocklist-count" class="text-sm text-gray-400 mb-2"></div>
             <div id="blocklist-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
         </div>
@@ -76,10 +81,15 @@
                 <input id="allowlist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                 <button onclick="addDomain('allowlist')" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm font-medium">Allow</button>
                 <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
-                    Import
+                    Import File
                     <input type="file" class="hidden" onchange="importFile('allowlist', this)">
                 </label>
             </div>
+            <div class="flex gap-3 mb-4">
+                <input id="allowlist-url" type="text" placeholder="https://example.com/allowlist.txt" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="importUrl('allowlist')" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium">Import URL</button>
+            </div>
+            <div id="allowlist-status" class="text-sm text-gray-400 mb-2"></div>
             <div id="allowlist-count" class="text-sm text-gray-400 mb-2"></div>
             <div id="allowlist-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
         </div>
@@ -220,13 +230,40 @@
     async function importFile(type, input) {
         const file = input.files[0];
         if (!file) return;
+        const status = document.getElementById(type + '-status');
+        status.textContent = 'Importing file...';
         const content = await file.text();
-        await fetch(API + '/' + type + '/import', {
+        const resp = await fetch(API + '/' + type + '/import', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({content})
         });
+        const result = await resp.json();
+        status.textContent = 'Imported ' + (result.imported || 0) + ' domains';
+        setTimeout(() => status.textContent = '', 3000);
         input.value = '';
+        loadDomainList(type);
+    }
+
+    async function importUrl(type) {
+        const urlInput = document.getElementById(type + '-url');
+        const url = urlInput.value.trim();
+        if (!url) return;
+        const status = document.getElementById(type + '-status');
+        status.textContent = 'Fetching from URL...';
+        const resp = await fetch(API + '/' + type + '/import', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({url})
+        });
+        const result = await resp.json();
+        if (resp.ok) {
+            status.textContent = 'Imported ' + (result.imported || 0) + ' domains from URL';
+            urlInput.value = '';
+        } else {
+            status.textContent = 'Error: ' + (result.error || 'import failed');
+        }
+        setTimeout(() => status.textContent = '', 5000);
         loadDomainList(type);
     }
 
@@ -303,7 +340,6 @@
         setTimeout(() => status.textContent = '', 3000);
     }
 
-    // Health check
     async function checkHealth() {
         try {
             const r = await fetch(API + '/health');
@@ -320,8 +356,9 @@
     document.getElementById('blocklist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('blocklist'); });
     document.getElementById('allowlist-input').addEventListener('keydown', e => { if (e.key === 'Enter') addDomain('allowlist'); });
     document.getElementById('upstream-address').addEventListener('keydown', e => { if (e.key === 'Enter') addUpstream(); });
+    document.getElementById('blocklist-url').addEventListener('keydown', e => { if (e.key === 'Enter') importUrl('blocklist'); });
+    document.getElementById('allowlist-url').addEventListener('keydown', e => { if (e.key === 'Enter') importUrl('allowlist'); });
 
-    // Init
     checkHealth();
     loadDashboard();
     </script>
