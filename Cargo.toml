@@ -23,5 +23,4 @@ serde_json = "1"
 parking_lot = "0.12"
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
-[dev-dependencies]
 hickory-net = "0.26"

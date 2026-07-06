@@ -3,8 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use hickory_net::{DnsError, NetError};
 use hickory_proto::op::{Metadata, ResponseCode};
-use hickory_proto::rr::{RData, Record, RecordType};
+use hickory_proto::rr::{RData, Record, RecordData, RecordType};
 use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
@@ -104,7 +105,7 @@ impl ParallelForwarder {
             .collect();
 
         let result = timeout(self.timeout, async {
-            let mut last_err = None;
+            let mut last_err: Option<NetError> = None;
             let mut futs: Vec<_> = futures.into_iter().map(Box::pin).collect();
             while !futs.is_empty() {
                 let (resolved, _idx, remaining) = futures::future::select_all(futs).await;
@@ -136,25 +137,36 @@ impl ParallelForwarder {
                         });
                     }
                     (_, Err(e)) => {
-                        warn!("Upstream resolver failed: {}", e);
+                        debug!("Upstream resolver failed: {}", e);
                         last_err = Some(e);
                     }
                 }
             }
-            Err(anyhow::anyhow!(
-                "All upstream resolvers failed: {:?}",
-                last_err
-            ))
+            Err(last_err)
         })
         .await;
 
         match result {
             Ok(Ok(resolve_result)) => Ok(resolve_result),
-            Ok(Err(e)) => {
-                warn!("Forwarding error: {}, sending SERVFAIL", e);
-                let info = send_servfail(request, &mut response_handle).await?;
+            Ok(Err(Some(last_err))) => {
+                let latency_us = start.elapsed().as_micros() as u64;
+                // NoRecordsFound is a legitimate upstream response: it covers
+                // NODATA (NOERROR with 0 answers, e.g. an AAAA query for a
+                // domain with only A records) and NXDomain (nonexistent domain).
+                // Forward it to the client verbatim with the original response
+                // code and authority records rather than masking it as SERVFAIL.
+                let (info, resolver) =
+                    build_error_response(request, &mut response_handle, &last_err).await?;
                 Ok(ResolveResult {
                     info,
+                    resolver,
+                    latency_us,
+                })
+            }
+            Ok(Err(None)) => {
+                warn!("All upstream resolvers failed without a captured error");
+                Ok(ResolveResult {
+                    info: send_servfail(request, &mut response_handle).await?,
                     resolver: "error".to_string(),
                     latency_us: start.elapsed().as_micros() as u64,
                 })
@@ -210,6 +222,80 @@ fn extract_answers(
     answers
 }
 
+/// Classify an upstream error into a response code and resolver label.
+///
+/// Returns `(response_code, label)`:
+/// - `NoRecordsFound` (NODATA / NXDomain) → the upstream's original code,
+///   `"negative"`. These are legitimate responses, not failures.
+/// - Any other error → `ServFail`, `"error"`. Real transport/protocol
+///   failures warrant SERVFAIL.
+fn classify_upstream_error(err: &NetError) -> (ResponseCode, &'static str) {
+    match err {
+        NetError::Dns(DnsError::NoRecordsFound(no_records)) => {
+            (no_records.response_code, "negative")
+        }
+        _ => (ResponseCode::ServFail, "error"),
+    }
+}
+
+/// Build a response for an upstream error, forwarding legitimate negative
+/// responses (NODATA / NXDomain) verbatim and SERVFAIL for real failures.
+async fn build_error_response(
+    request: &hickory_server::server::Request,
+    response_handle: &mut impl hickory_server::server::ResponseHandler,
+    err: &NetError,
+) -> Result<(ResponseInfo, String)> {
+    let (rcode, label) = classify_upstream_error(err);
+    if label == "negative" {
+        // NoRecordsFound carries optional SOA + authority records that should
+        // be preserved for downstream negative caching.
+        let no_records = match err {
+            NetError::Dns(DnsError::NoRecordsFound(nr)) => nr,
+            _ => unreachable!(),
+        };
+        let ttl = no_records.negative_ttl.unwrap_or(0);
+        let soa_records: Vec<Record> = no_records
+            .soa
+            .as_ref()
+            .map(|soa| {
+                Record::from_rdata(
+                    soa.name.clone(),
+                    ttl.max(soa.ttl),
+                    soa.data.clone().into_rdata(),
+                )
+            })
+            .into_iter()
+            .collect();
+        let auth_records: Vec<Record> = no_records
+            .authorities
+            .as_ref()
+            .map(|a| a.iter().cloned().collect())
+            .unwrap_or_default();
+
+        debug!(
+            "Forwarding {} response (negative) for {} (ttl={})",
+            rcode, no_records.query, ttl,
+        );
+
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let mut metadata = Metadata::response_from_request(&request.metadata);
+        metadata.response_code = rcode;
+        let response = builder.build(
+            metadata,
+            [].iter(),
+            auth_records.iter(),
+            soa_records.iter(),
+            [].iter(),
+        );
+        let info = response_handle.send_response(response).await?;
+        Ok((info, label.to_string()))
+    } else {
+        warn!("Forwarding error: {}, sending SERVFAIL", err);
+        let info = send_servfail(request, response_handle).await?;
+        Ok((info, label.to_string()))
+    }
+}
+
 async fn send_servfail(
     request: &hickory_server::server::Request,
     response_handle: &mut impl hickory_server::server::ResponseHandler,
@@ -223,6 +309,7 @@ async fn send_servfail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_net::NoRecords;
     use hickory_proto::op::Query;
     use hickory_proto::rr::rdata::{A, CNAME};
     use hickory_proto::rr::{Name, RData};
@@ -283,5 +370,51 @@ mod tests {
         let extracted = extract_answers(RecordType::A, &lookup);
         assert_eq!(extracted.len(), 1);
         assert!(matches!(extracted[0].data, RData::A(_)));
+    }
+
+    // --- classify_upstream_error: response-code preservation for negative
+    // responses (the core fix for the "AAAA forwarded error" bug) ---
+
+    fn no_records_query(name: &str) -> Box<Query> {
+        Query::query(
+            Name::from_ascii(format!("{}.", name)).unwrap(),
+            RecordType::AAAA,
+        )
+        .into()
+    }
+
+    /// NODATA: a domain exists but has no record of the queried type (e.g.
+    /// github.com AAAA). Upstream returns NOERROR with 0 answers; this must
+    /// be forwarded as NOERROR, not masked as SERVFAIL.
+    #[test]
+    fn classify_nodata_returns_noerror() {
+        let nr = NoRecords::new(no_records_query("github.com"), ResponseCode::NoError);
+        let err: NetError = DnsError::NoRecordsFound(nr).into();
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::NoError);
+        assert_eq!(label, "negative");
+    }
+
+    /// NXDomain: the domain does not exist. Must be forwarded as NXDOMAIN,
+    /// not SERVFAIL.
+    #[test]
+    fn classify_nxdomain_returns_nxdomain() {
+        let nr = NoRecords::new(
+            no_records_query("nonexistent.invalid"),
+            ResponseCode::NXDomain,
+        );
+        let err: NetError = DnsError::NoRecordsFound(nr).into();
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::NXDomain);
+        assert_eq!(label, "negative");
+    }
+
+    /// Real transport failures (timeout, IO) must still produce SERVFAIL.
+    #[test]
+    fn classify_transport_error_returns_servfail() {
+        let err: NetError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::ServFail);
+        assert_eq!(label, "error");
     }
 }
