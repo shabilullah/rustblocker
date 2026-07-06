@@ -177,22 +177,34 @@ fn extract_answers(
 ) -> Vec<Record> {
     let mut answers = Vec::new();
     for record in lookup.answers() {
-        match (query_type, &record.data) {
-            (RecordType::A, RData::A(_)) | (RecordType::AAAA, RData::AAAA(_)) => {
-                answers.push(Record::from_rdata(
-                    record.name.clone(),
-                    record.ttl,
-                    record.data.clone(),
-                ));
+        match query_type {
+            RecordType::A | RecordType::AAAA => {
+                // Preserve CNAME records so clients can follow the alias
+                // chain (e.g. click.redditmail.com -> CNAME thirdparty.bnc.lt
+                // -> A 52.11.118.109). Dropping the CNAME leaves a bare A
+                // answer whose name does not match the query name, which
+                // stub resolvers reject.
+                match record.data {
+                    RData::A(_) | RData::AAAA(_) | RData::CNAME(_) => {
+                        answers.push(Record::from_rdata(
+                            record.name.clone(),
+                            record.ttl,
+                            record.data.clone(),
+                        ));
+                    }
+                    _ => {}
+                }
             }
-            _ if query_type != RecordType::A && query_type != RecordType::AAAA => {
-                answers.push(Record::from_rdata(
-                    record.name.clone(),
-                    record.ttl,
-                    record.data.clone(),
-                ));
+            _ => {
+                // Non-address query types: pass through matching records.
+                if record.record_type() == query_type {
+                    answers.push(Record::from_rdata(
+                        record.name.clone(),
+                        record.ttl,
+                        record.data.clone(),
+                    ));
+                }
             }
-            _ => {}
         }
     }
     answers
@@ -206,4 +218,70 @@ async fn send_servfail(
     let response = builder.error_msg(&request.metadata, ResponseCode::ServFail);
     let info = response_handle.send_response(response).await?;
     Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::Query;
+    use hickory_proto::rr::rdata::{A, CNAME};
+    use hickory_proto::rr::{Name, RData};
+    use hickory_resolver::lookup::Lookup;
+    use std::net::Ipv4Addr;
+
+    fn record(name: &str, ttl: u32, data: RData) -> Record {
+        Record::from_rdata(Name::from_ascii(format!("{}.", name)).unwrap(), ttl, data)
+    }
+
+    /// Regression: an A query for a CNAME-chained domain (e.g.
+    /// click.redditmail.com -> CNAME thirdparty.bnc.lt -> A 52.11.118.109)
+    /// must keep the CNAME record in the answer so stub resolvers can link
+    /// the A answer back to the queried name.
+    #[test]
+    fn extract_answers_preserves_cname_chain_for_a_query() {
+        let query = Query::query(
+            Name::from_ascii("click.redditmail.com.").unwrap(),
+            RecordType::A,
+        );
+        let answers = vec![
+            record(
+                "click.redditmail.com",
+                300,
+                RData::CNAME(CNAME(Name::from_ascii("thirdparty.bnc.lt.").unwrap())),
+            ),
+            record(
+                "thirdparty.bnc.lt",
+                60,
+                RData::A(A::from(Ipv4Addr::new(52, 11, 118, 109))),
+            ),
+        ];
+        let lookup = Lookup::new_with_max_ttl(query, answers);
+
+        let extracted = extract_answers(RecordType::A, &lookup);
+
+        // Both the CNAME and the A record must survive.
+        assert_eq!(
+            extracted.len(),
+            2,
+            "CNAME record was dropped from answer chain"
+        );
+        assert!(extracted.iter().any(|r| matches!(r.data, RData::CNAME(_))));
+        assert!(extracted.iter().any(|r| matches!(r.data, RData::A(_))));
+    }
+
+    /// A plain A query (no CNAME) must still return only the A record.
+    #[test]
+    fn extract_answers_returns_a_record_without_cname() {
+        let query = Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::A);
+        let answers = vec![record(
+            "example.com",
+            60,
+            RData::A(A::from(Ipv4Addr::new(93, 184, 216, 34))),
+        )];
+        let lookup = Lookup::new_with_max_ttl(query, answers);
+
+        let extracted = extract_answers(RecordType::A, &lookup);
+        assert_eq!(extracted.len(), 1);
+        assert!(matches!(extracted[0].data, RData::A(_)));
+    }
 }
