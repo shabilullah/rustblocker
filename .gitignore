@@ -3,3 +3,4 @@ rustblocker.db*
 compiled-blocklist.txt
 compiled-allowlist.txt
 node_modules/
+tag.md
