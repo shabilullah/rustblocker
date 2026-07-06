@@ -10,6 +10,7 @@
     <nav class="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
         <h1 class="text-xl font-bold text-emerald-400">RustBlocker</h1>
         <span id="status" class="text-sm text-gray-400">Loading...</span>
+        <span id="version" class="text-sm text-gray-400 ml-4"></span>
     </nav>
 
     <div class="max-w-6xl mx-auto p-6">
@@ -179,6 +180,15 @@
                 <button onclick="saveSettings()" class="mt-4 bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Save Settings</button>
                 <span id="settings-status" class="ml-3 text-sm text-gray-400"></span>
             </div>
+
+            <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 mt-6">
+                <h2 class="text-lg font-semibold mb-4">Update</h2>
+                <div class="flex items-center gap-4">
+                    <span id="update-status" class="text-sm text-gray-400">Checking...</span>
+                    <button id="update-apply-btn" onclick="applyUpdate()" class="bg-emerald-600 hover:bg-emerald-700 px-4 py-2 rounded text-sm hidden">Update Now</button>
+                </div>
+                <div id="update-notes" class="mt-3 text-sm text-gray-500 hidden"></div>
+            </div>
         </div>
 
         <!-- Stats -->
@@ -246,7 +256,7 @@
             case 'blocklist': return loadDomainList('blocklist');
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
-            case 'settings': return loadSettings();
+            case 'settings': loadSettings(); autoCheckUpdate(); return;
             case 'stats': return loadStats();
         }
     }
@@ -265,6 +275,10 @@
         document.getElementById('stat-rewrites').textContent = rewrites.length;
         document.getElementById('stat-upstreams').textContent = upstreams.length;
         await refreshDashboardStats();
+        fetch(API + '/version').then(r => r.json()).then(v => {
+            document.getElementById('version').textContent = 'v' + v.version + ' (' + v.target + ')';
+        }).catch(() => {});
+        autoCheckUpdate();
     }
 
     async function refreshDashboardStats() {
@@ -658,6 +672,60 @@
         return us + ' μs';
     }
 
+
+    // --- Update ---
+
+    async function autoCheckUpdate() {
+        const status = document.getElementById('update-status');
+        const btn = document.getElementById('update-apply-btn');
+        const notes = document.getElementById('update-notes');
+        if (!status) return;
+        status.textContent = 'Checking for updates...';
+        status.className = 'text-sm text-gray-400';
+        btn.classList.add('hidden');
+        notes.classList.add('hidden');
+        try {
+            const r = await fetch(API + '/update/check');
+            const data = await r.json();
+            if (data.update_available) {
+                status.textContent = 'Update available: ' + data.version;
+                status.className = 'text-sm text-emerald-400';
+                notes.textContent = data.notes ? data.notes.substring(0, 500) : '';
+                notes.classList.remove('hidden');
+                btn.classList.remove('hidden');
+            } else {
+                status.textContent = 'Up to date (' + data.current_version + ')';
+                status.className = 'text-sm text-gray-400';
+            }
+        } catch {
+            status.textContent = 'Update check failed';
+            status.className = 'text-sm text-red-400';
+        }
+    }
+
+    async function applyUpdate() {
+        const status = document.getElementById('update-status');
+        const btn = document.getElementById('update-apply-btn');
+        if (!status || !btn) return;
+        status.textContent = 'Updating...';
+        status.className = 'text-sm text-amber-400';
+        btn.disabled = true;
+        try {
+            const r = await fetch(API + '/update/apply', { method: 'POST' });
+            const data = await r.json();
+            if (data.status === 'updated') {
+                status.textContent = 'Updated to ' + data.version + '. Restarting...';
+                status.className = 'text-sm text-emerald-400';
+            } else {
+                throw new Error(data.error || 'Unknown error');
+            }
+        } catch (e) {
+            status.textContent = 'Update failed: ' + (e.message || 'Network error');
+            status.className = 'text-sm text-red-400';
+            btn.disabled = false;
+            btn.classList.remove('hidden');
+        }
+    }
     // --- Health ---
 
     async function checkHealth() {

@@ -12,6 +12,7 @@ use crate::db::{self, DbPool};
 use crate::forwarder::ParallelForwarder;
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
+use crate::update;
 
 #[derive(Debug, Deserialize)]
 struct SettingUpdate {
@@ -649,6 +650,62 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
 }
 
+// --- Update ---
+
+/// GET /api/version — public, no ACL check.
+async fn get_version() -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "version": update::current_version(),
+        "target": env!("TARGET_TRIPLE"),
+    }))
+}
+
+/// GET /api/update/check — ACL-protected.
+async fn check_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    match update::check_for_update() {
+        Ok(Some(info)) => HttpResponse::Ok().json(serde_json::json!({
+            "update_available": true,
+            "version": info.version,
+            "notes": info.notes,
+            "download_url": info.download_url,
+            "current_version": info.current_version,
+        })),
+        Ok(None) => HttpResponse::Ok().json(serde_json::json!({
+            "update_available": false,
+            "current_version": update::current_version(),
+        })),
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
+            "error": format!("{:#}", e),
+        })),
+    }
+}
+
+/// POST /api/update/apply — ACL-protected. Self-replaces binary, then exits.
+async fn apply_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    match tokio::task::spawn_blocking(update::apply_update).await {
+        Ok(Ok(version)) => {
+            tracing::info!("Updated to {}, restarting in 1s...", version);
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                std::process::exit(0);
+            });
+            HttpResponse::Ok().json(serde_json::json!({"status": "updated", "version": version}))
+        }
+        Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("{:#}", e),
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("join error: {:#}", e),
+        })),
+    }
+}
+
 // --- Helper: reload DomainStore from DB, routing wildcards correctly ---
 
 fn reload_domain_store(pool: &DbPool, table: &str, store: &Arc<RwLock<DomainStore>>) {
@@ -666,6 +723,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/api")
             .route("/health", web::get().to(health))
+            .route("/version", web::get().to(get_version))
+            .route("/update/check", web::get().to(check_update))
+            .route("/update/apply", web::post().to(apply_update))
             .route("/settings", web::get().to(get_settings))
             .route("/settings", web::put().to(update_setting))
             .route("/upstreams", web::get().to(get_upstreams))

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+self_update = { version = "0.44", default-features = false, features = ["archive-tar", "compression-flate2", "reqwest", "rustls"] }
+semver = "1"
 hickory-server = { version = "0.26", features = ["resolver"] }
 hickory-resolver = "0.26"
 hickory-proto = "0.26"

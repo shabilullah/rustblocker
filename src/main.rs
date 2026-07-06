@@ -21,7 +21,7 @@ use rustblocker::lists::{
 use rustblocker::stats::QueryLog;
 
 #[derive(Parser)]
-#[command(name = "rustblocker", about = "A DNS blocker written in Rust")]
+#[command(name = "rustblocker", about = "A DNS blocker written in Rust", version)]
 struct Cli {
     /// DNS listen port (overrides database setting)
     #[arg(long)]
