@@ -542,45 +542,45 @@ async fn main() {
     }
 
     // Server-side stats after the bench.
-    if let Some(url) = api_url {
-        if let Some(after) = fetch_api_stats(url).await {
-            println!();
-            println!("Server-side stats (from API):");
-            if let Some(before) = &stats_before {
-                let before_q = before
-                    .get("total_queries")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let after_q = after
-                    .get("total_queries")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let before_blocked = before.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
-                let after_blocked = after.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
-                let before_fwd = before
-                    .get("forwarded")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let after_fwd = after.get("forwarded").and_then(|v| v.as_u64()).unwrap_or(0);
-                println!(
-                    "  Total queries:  {} -> {} (delta: {})",
-                    before_q,
-                    after_q,
-                    after_q.saturating_sub(before_q)
-                );
-                println!(
-                    "  Blocked:        {} -> {} (delta: {})",
-                    before_blocked,
-                    after_blocked,
-                    after_blocked.saturating_sub(before_blocked)
-                );
-                println!(
-                    "  Forwarded:      {} -> {} (delta: {})",
-                    before_fwd,
-                    after_fwd,
-                    after_fwd.saturating_sub(before_fwd)
-                );
-            }
+    if let Some(url) = api_url
+        && let Some(after) = fetch_api_stats(url).await
+    {
+        println!();
+        println!("Server-side stats (from API):");
+        if let Some(before) = &stats_before {
+            let before_q = before
+                .get("total_queries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let after_q = after
+                .get("total_queries")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let before_blocked = before.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+            let after_blocked = after.get("blocked").and_then(|v| v.as_u64()).unwrap_or(0);
+            let before_fwd = before
+                .get("forwarded")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let after_fwd = after.get("forwarded").and_then(|v| v.as_u64()).unwrap_or(0);
+            println!(
+                "  Total queries:  {} -> {} (delta: {})",
+                before_q,
+                after_q,
+                after_q.saturating_sub(before_q)
+            );
+            println!(
+                "  Blocked:        {} -> {} (delta: {})",
+                before_blocked,
+                after_blocked,
+                after_blocked.saturating_sub(before_blocked)
+            );
+            println!(
+                "  Forwarded:      {} -> {} (delta: {})",
+                before_fwd,
+                after_fwd,
+                after_fwd.saturating_sub(before_fwd)
+            );
         }
     }
 

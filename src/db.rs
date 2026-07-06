@@ -203,6 +203,16 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) {
     .ok();
 }
 
+pub fn get_setting(pool: &DbPool, key: &str) -> Option<String> {
+    let conn = pool.get().ok()?;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 // --- Upstreams ---
 
 #[derive(Debug, Serialize, Deserialize)]

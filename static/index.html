@@ -177,6 +177,7 @@
                 <h2 class="text-lg font-semibold mb-4">Server Settings</h2>
                 <div id="settings-form" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
                 <button onclick="saveSettings()" class="mt-4 bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Save Settings</button>
+                <button onclick="restartServer()" class="mt-4 bg-amber-600 hover:bg-amber-700 px-6 py-2 rounded text-sm font-medium ml-2">Restart Server</button>
                 <span id="settings-status" class="ml-3 text-sm text-gray-400"></span>
             </div>
         </div>
@@ -620,13 +621,20 @@
                     class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
             </div>`;
         }).join('');
+        window._originalSettings = data;
     }
 
     async function saveSettings() {
         const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'allowed_networks', 'stats_retention_days'];
+        const restartKeys = ['listen_address', 'listen_port', 'log_level'];
+        let needsRestart = false;
         for (const key of keys) {
             const el = document.getElementById('setting-' + key);
             if (el) {
+                if (restartKeys.includes(key)) {
+                    const orig = (window._originalSettings && window._originalSettings[key]) || '';
+                    if (el.value !== orig) needsRestart = true;
+                }
                 await fetch(API + '/settings', {
                     method: 'PUT',
                     headers: {'Content-Type': 'application/json'},
@@ -635,12 +643,23 @@
             }
         }
         const status = document.getElementById('settings-status');
-        status.textContent = 'Saved. Restarting server...';
-        status.className = 'text-sm text-emerald-400';
+        if (needsRestart) {
+            status.textContent = 'Saved. Restart required for port/address/log changes.';
+            status.className = 'text-sm text-amber-400';
+        } else {
+            status.textContent = 'Saved (applied live).';
+            status.className = 'text-sm text-emerald-400';
+        }
+        setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 5000);
+    }
+
+    async function restartServer() {
+        const status = document.getElementById('settings-status');
+        status.textContent = 'Restarting server...';
+        status.className = 'text-sm text-amber-400';
         try {
             await fetch(API + '/restart', {method: 'POST'});
         } catch {}
-        // Poll until server comes back, then refresh
         const check = async () => {
             try {
                 await fetch(API + '/health');

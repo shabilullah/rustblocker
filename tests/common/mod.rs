@@ -184,15 +184,16 @@ pub fn make_handler(
     let db_path = std::env::temp_dir().join(format!("rb-test-{}.db", unique_id()));
     let pool = rustblocker::db::create_pool(db_path.to_str().expect("path")).expect("db pool");
     rustblocker::db::seed_defaults(&pool);
-    let query_log = rustblocker::stats::QueryLog::new(pool, 30).0;
+    let retention = Arc::new(AtomicU64::new(30));
+    let query_log = rustblocker::stats::QueryLog::new(pool, retention).0;
 
     let handler = DnsBlockerHandler::new(
         blocklist,
         allowlist,
         rewrites,
         forwarder,
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv6Addr::UNSPECIFIED,
+        Arc::new(RwLock::new(Ipv4Addr::new(0, 0, 0, 0))),
+        Arc::new(RwLock::new(Ipv6Addr::UNSPECIFIED)),
         acl,
         query_log.clone(),
     );

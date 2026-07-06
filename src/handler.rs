@@ -21,8 +21,8 @@ pub struct DnsBlockerHandler {
     pub allowlist: AllowlistStore,
     pub rewrites: Arc<RwLock<RewriteMap>>,
     forwarder: Arc<RwLock<ParallelForwarder>>,
-    sinkhole_ipv4: Ipv4Addr,
-    sinkhole_ipv6: Ipv6Addr,
+    sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
+    sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
     acl: SharedAcl,
     query_log: Arc<QueryLog>,
 }
@@ -34,8 +34,8 @@ impl DnsBlockerHandler {
         allowlist: AllowlistStore,
         rewrites: Arc<RwLock<RewriteMap>>,
         forwarder: Arc<RwLock<ParallelForwarder>>,
-        sinkhole_ipv4: Ipv4Addr,
-        sinkhole_ipv6: Ipv6Addr,
+        sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
+        sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
         acl: SharedAcl,
         query_log: Arc<QueryLog>,
     ) -> Self {
@@ -170,11 +170,9 @@ impl RequestHandler for DnsBlockerHandler {
                             resolver: None,
                             latency_us: None,
                         });
-                        Some(build_rdata(
-                            query_type,
-                            self.sinkhole_ipv4,
-                            self.sinkhole_ipv6,
-                        ))
+                        let sink_v4 = *self.sinkhole_ipv4.read();
+                        let sink_v6 = *self.sinkhole_ipv6.read();
+                        Some(build_rdata(query_type, sink_v4, sink_v6))
                     } else {
                         None
                     }

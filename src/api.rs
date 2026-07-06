@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde::Deserialize;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use tracing::warn;
 
 use crate::acl::SharedAcl;
@@ -107,21 +108,61 @@ async fn get_settings(
     HttpResponse::Ok().json(settings)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_setting(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    sinkhole_ipv4: web::Data<Arc<RwLock<Ipv4Addr>>>,
+    sinkhole_ipv6: web::Data<Arc<RwLock<Ipv6Addr>>>,
+    forwarder: web::Data<Arc<RwLock<ParallelForwarder>>>,
+    query_log: web::Data<QueryLog>,
     body: web::Json<SettingUpdate>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     db::set_setting(&pool, &body.key, &body.value);
-    // Hot-reload ACL when allowed_networks is changed
-    if body.key == "allowed_networks" {
-        let mut acl_guard = acl.write();
-        *acl_guard = crate::acl::Acl::parse(&body.value);
-        tracing::info!("ACL reloaded: {}", body.value);
+    // Hot-reload the setting in memory
+    match body.key.as_str() {
+        "sinkhole_ipv4" => {
+            if let Ok(ip) = body.value.parse::<Ipv4Addr>() {
+                *sinkhole_ipv4.write() = ip;
+                tracing::info!("Sinkhole IPv4 reloaded: {}", ip);
+            } else {
+                tracing::warn!("Invalid sinkhole IPv4: {}", body.value);
+            }
+        }
+        "sinkhole_ipv6" => {
+            if let Ok(ip) = body.value.parse::<Ipv6Addr>() {
+                *sinkhole_ipv6.write() = ip;
+                tracing::info!("Sinkhole IPv6 reloaded: {}", ip);
+            } else {
+                tracing::warn!("Invalid sinkhole IPv6: {}", body.value);
+            }
+        }
+        "upstream_timeout_secs" => {
+            if let Ok(secs) = body.value.parse::<u64>() {
+                forwarder.write().set_timeout(secs);
+                tracing::info!("Upstream timeout reloaded: {}s", secs);
+            } else {
+                tracing::warn!("Invalid upstream timeout: {}", body.value);
+            }
+        }
+        "stats_retention_days" => {
+            if let Ok(days) = body.value.parse::<u64>() {
+                query_log.set_retention(days);
+                tracing::info!("Stats retention reloaded: {} days", days);
+            } else {
+                tracing::warn!("Invalid retention days: {}", body.value);
+            }
+        }
+        "allowed_networks" => {
+            let mut acl_guard = acl.write();
+            *acl_guard = crate::acl::Acl::parse(&body.value);
+            tracing::info!("ACL reloaded: {}", body.value);
+        }
+        _ => {}
     }
     HttpResponse::Ok().json(serde_json::json!({"ok": true}))
 }
@@ -183,7 +224,10 @@ fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
             port: Some(u.port as u16),
         })
         .collect();
-    if let Err(e) = forwarder.write().reload(&upstreams) {
+    let timeout_secs: u64 = db::get_setting(pool, "upstream_timeout_secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    if let Err(e) = forwarder.write().reload(&upstreams, timeout_secs) {
         warn!("Failed to reload forwarder: {}", e);
     }
 }

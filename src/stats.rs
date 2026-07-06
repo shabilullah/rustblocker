@@ -108,6 +108,7 @@ pub struct QueryLog {
     forwarded: AtomicU64,
     tx: mpsc::Sender<QueryEntry>,
     live_tx: broadcast::Sender<LiveQuery>,
+    retention_days: Arc<AtomicU64>,
 }
 
 const BATCH_SIZE: usize = 100;
@@ -115,7 +116,10 @@ const FLUSH_INTERVAL_MS: u64 = 1000;
 
 impl QueryLog {
     /// Create a new QueryLog and spawn the background writer task.
-    pub fn new(pool: DbPool, retention_days: u64) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
+    pub fn new(
+        pool: DbPool,
+        retention: Arc<AtomicU64>,
+    ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
         let (tx, rx) = mpsc::channel::<QueryEntry>(4096);
         let (live_tx, _) = broadcast::channel::<LiveQuery>(256);
 
@@ -127,9 +131,10 @@ impl QueryLog {
             forwarded: AtomicU64::new(0),
             tx,
             live_tx,
+            retention_days: retention.clone(),
         });
 
-        let handle = tokio::spawn(Self::writer_task(pool, rx, retention_days));
+        let handle = tokio::spawn(Self::writer_task(pool, rx, retention));
 
         (log, handle)
     }
@@ -176,8 +181,17 @@ impl QueryLog {
         )
     }
 
+    /// Update retention days (hot-reloaded from the web API).
+    pub fn set_retention(&self, days: u64) {
+        self.retention_days.store(days, Ordering::Relaxed);
+    }
+
     /// Background task: batch entries and flush to SQLite periodically.
-    async fn writer_task(pool: DbPool, mut rx: mpsc::Receiver<QueryEntry>, retention_days: u64) {
+    async fn writer_task(
+        pool: DbPool,
+        mut rx: mpsc::Receiver<QueryEntry>,
+        retention: Arc<AtomicU64>,
+    ) {
         let mut batch: Vec<QueryEntry> = Vec::with_capacity(BATCH_SIZE * 2);
         let mut interval =
             tokio::time::interval(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS));
@@ -189,12 +203,12 @@ impl QueryLog {
                         Some(entry) => {
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
-                                Self::flush(&pool, &mut batch, retention_days);
+                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
                             }
                         }
                         None => {
                             if !batch.is_empty() {
-                                Self::flush(&pool, &mut batch, retention_days);
+                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
                             }
                             debug!("QueryLog writer shutting down");
                             return;
@@ -203,7 +217,7 @@ impl QueryLog {
                 }
                 _ = interval.tick() => {
                     if !batch.is_empty() {
-                        Self::flush(&pool, &mut batch, retention_days);
+                        Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
                     }
                 }
             }

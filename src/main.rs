@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -142,24 +143,27 @@ async fn run_server(cli: Cli) -> Result<()> {
     let retention_days: u64 = get_setting_string(&pool, "stats_retention_days")
         .parse()
         .unwrap_or(30);
-    let (query_log, _log_handle) = QueryLog::new(pool.clone(), retention_days);
+    let retention = Arc::new(AtomicU64::new(retention_days));
+    let (query_log, _log_handle) = QueryLog::new(pool.clone(), retention);
 
     let sinkhole_ipv4_str = get_setting_string(&pool, "sinkhole_ipv4");
     let sinkhole_ipv6_str = get_setting_string(&pool, "sinkhole_ipv6");
-    let sinkhole_ipv4: std::net::Ipv4Addr = sinkhole_ipv4_str
+    let sinkhole_ipv4_raw: std::net::Ipv4Addr = sinkhole_ipv4_str
         .parse()
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-    let sinkhole_ipv6: std::net::Ipv6Addr = sinkhole_ipv6_str
+    let sinkhole_ipv6_raw: std::net::Ipv6Addr = sinkhole_ipv6_str
         .parse()
         .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
+    let sinkhole_ipv4 = Arc::new(RwLock::new(sinkhole_ipv4_raw));
+    let sinkhole_ipv6 = Arc::new(RwLock::new(sinkhole_ipv6_raw));
 
     let handler = DnsBlockerHandler::new(
         blocklist.clone(),
         allowlist.clone(),
         rewrites.clone(),
         forwarder.clone(),
-        sinkhole_ipv4,
-        sinkhole_ipv6,
+        sinkhole_ipv4.clone(),
+        sinkhole_ipv6.clone(),
         shared_acl.clone(),
         query_log.clone(),
     );
@@ -187,6 +191,8 @@ async fn run_server(cli: Cli) -> Result<()> {
     let acl_data = actix_web::web::Data::new(shared_acl.clone());
     let query_log_data = actix_web::web::Data::from(query_log.clone());
     let forwarder_data = actix_web::web::Data::new(forwarder.clone());
+    let sinkhole_v4_data = actix_web::web::Data::new(sinkhole_ipv4.clone());
+    let sinkhole_v6_data = actix_web::web::Data::new(sinkhole_ipv6.clone());
 
     let web_server = actix_web::HttpServer::new(move || {
         actix_web::App::new()
@@ -204,6 +210,8 @@ async fn run_server(cli: Cli) -> Result<()> {
             .app_data(acl_data.clone())
             .app_data(query_log_data.clone())
             .app_data(forwarder_data.clone())
+            .app_data(sinkhole_v4_data.clone())
+            .app_data(sinkhole_v6_data.clone())
             .configure(api::configure)
             .route(
                 "/",

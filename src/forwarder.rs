@@ -69,11 +69,17 @@ impl ParallelForwarder {
 
     /// Reload upstream resolvers from a fresh config list.
     /// Called after adding/removing upstreams via the web API.
-    pub fn reload(&mut self, upstreams: &[UpstreamConfig]) -> Result<()> {
-        let fresh = Self::new(upstreams, self.timeout.as_secs())?;
+    pub fn reload(&mut self, upstreams: &[UpstreamConfig], timeout_secs: u64) -> Result<()> {
+        let fresh = Self::new(upstreams, timeout_secs)?;
         self.resolvers = fresh.resolvers;
         self.addresses = fresh.addresses;
+        self.timeout = Duration::from_secs(timeout_secs);
         Ok(())
+    }
+
+    /// Update the upstream timeout without rebuilding resolvers.
+    pub fn set_timeout(&mut self, timeout_secs: u64) {
+        self.timeout = Duration::from_secs(timeout_secs);
     }
 
     /// Race a DNS lookup across all upstream resolvers, return the first successful response.
