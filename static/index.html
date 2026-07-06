@@ -4,16 +4,16 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RustBlocker</title>
-    <link rel="stylesheet" href="/tailwind.min.css">
+    <link rel="stylesheet" href="/tailwind.min.css?v={VERSION}">
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen">
-    <nav class="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
+    <nav class="bg-gray-800 border-b border-gray-700 px-3 sm:px-6 py-3 flex items-center justify-between flex-wrap gap-2">
         <h1 class="text-xl font-bold text-emerald-400">RustBlocker</h1>
         <span id="status" class="text-sm text-gray-400">Loading...</span>
         <span id="version" class="text-sm text-gray-400 ml-4"></span>
     </nav>
 
-    <div class="max-w-6xl mx-auto p-6">
+    <div class="max-w-6xl mx-auto p-3 sm:p-6">
         <!-- Tabs -->
         <div class="flex gap-1 mb-6 border-b border-gray-700 overflow-x-auto">
             <button class="tab-btn px-4 py-2 text-sm font-medium border-b-2 border-emerald-400 text-emerald-400 whitespace-nowrap" data-tab="dashboard">Dashboard</button>
@@ -46,7 +46,7 @@
                     <div id="stat-upstreams" class="text-3xl font-bold text-purple-400">-</div>
                 </div>
             </div>
-            <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
+            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4 mb-4">
                 <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 text-center">
                     <div class="text-2xl font-bold text-emerald-400" id="stat-total-queries">0</div>
                     <div class="text-xs text-gray-400">Total Queries</div>
@@ -86,10 +86,10 @@
 
         <!-- Upstreams -->
         <div id="tab-upstreams" class="tab-content hidden">
-            <div class="flex gap-3 mb-4">
-                <input id="upstream-address" type="text" placeholder="8.8.8.8" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <input id="upstream-port" type="number" placeholder="53" value="53" class="w-24 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="addUpstream()" class="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded text-sm font-medium">Add Upstream</button>
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="upstream-address" type="text" placeholder="8.8.8.8" class="flex-1 min-w-[120px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="upstream-port" type="number" placeholder="53" value="53" class="w-20 sm:w-24 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addUpstream()" class="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Add Upstream</button>
             </div>
             <div id="upstream-count" class="text-sm text-gray-400 mb-2"></div>
             <div id="upstream-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
@@ -98,14 +98,14 @@
         <!-- Sources -->
         <div id="tab-sources" class="tab-content hidden">
             <p class="text-sm text-gray-400 mb-4">Manage blocklist/allowlist URLs. Sources are automatically refreshed on a schedule.</p>
-            <div class="flex gap-3 mb-4">
-                <input id="source-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="source-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 min-w-[160px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                 <select id="source-type" class="bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                     <option value="blocklist">Blocklist</option>
                     <option value="allowlist">Allowlist</option>
                 </select>
-                <input id="source-interval" type="number" placeholder="24" value="24" title="Update interval (hours)" class="w-20 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="addSource()" id="add-source-btn" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded text-sm font-medium">Add Source</button>
+                <input id="source-interval" type="number" placeholder="24" value="24" title="Update interval (hours)" class="w-16 sm:w-20 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addSource()" id="add-source-btn" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Add Source</button>
             </div>
             <div id="source-status" class="text-sm mb-2"></div>
             <div class="flex justify-between items-center mb-2">
@@ -117,19 +117,19 @@
 
         <!-- Blocklist -->
         <div id="tab-blocklist" class="tab-content hidden">
-            <div class="flex gap-3 mb-4">
-                <input id="blocklist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="addDomain('blocklist')" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-medium">Block</button>
-                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="blocklist-input" type="text" placeholder="domain.com" class="flex-1 min-w-[120px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addDomain('blocklist')" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Block</button>
+                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer whitespace-nowrap">
                     Import File
                     <input type="file" class="hidden" onchange="importFile('blocklist', this)">
                 </label>
             </div>
-            <div class="flex gap-3 mb-4">
-                <input id="blocklist-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="importUrl('blocklist')" id="blocklist-url-btn" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium">Import URL</button>
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="blocklist-url" type="text" placeholder="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" class="flex-1 min-w-[160px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="importUrl('blocklist')" id="blocklist-url-btn" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Import URL</button>
             </div>
-            <div class="flex gap-3 mb-4">
+            <div class="flex flex-wrap gap-2 mb-4">
                 <input id="blocklist-search" type="text" placeholder="Search domains..." class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
             </div>
             <div id="blocklist-status" class="text-sm mb-2"></div>
@@ -140,19 +140,19 @@
 
         <!-- Allowlist -->
         <div id="tab-allowlist" class="tab-content hidden">
-            <div class="flex gap-3 mb-4">
-                <input id="allowlist-input" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="addDomain('allowlist')" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm font-medium">Allow</button>
-                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer">
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="allowlist-input" type="text" placeholder="domain.com" class="flex-1 min-w-[120px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addDomain('allowlist')" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Allow</button>
+                <label class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded text-sm font-medium cursor-pointer whitespace-nowrap">
                     Import File
                     <input type="file" class="hidden" onchange="importFile('allowlist', this)">
                 </label>
             </div>
-            <div class="flex gap-3 mb-4">
-                <input id="allowlist-url" type="text" placeholder="https://example.com/allowlist.txt" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="importUrl('allowlist')" id="allowlist-url-btn" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium">Import URL</button>
+            <div class="flex flex-wrap gap-2 mb-4">
+                <input id="allowlist-url" type="text" placeholder="https://example.com/allowlist.txt" class="flex-1 min-w-[160px] bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="importUrl('allowlist')" id="allowlist-url-btn" class="bg-orange-600 hover:bg-orange-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Import URL</button>
             </div>
-            <div class="flex gap-3 mb-4">
+            <div class="flex flex-wrap gap-2 mb-4">
                 <input id="allowlist-search" type="text" placeholder="Search domains..." class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
             </div>
             <div id="allowlist-status" class="text-sm mb-2"></div>
@@ -163,11 +163,11 @@
 
         <!-- Rewrites -->
         <div id="tab-rewrites" class="tab-content hidden">
-            <div class="flex gap-3 mb-4">
-                <input id="rewrite-domain" type="text" placeholder="domain.com" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <input id="rewrite-ipv4" type="text" placeholder="IPv4" class="w-36 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <input id="rewrite-ipv6" type="text" placeholder="IPv6" class="w-48 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
-                <button onclick="addRewrite()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm font-medium">Add</button>
+            <div class="flex flex-col sm:flex-row gap-2 mb-4">
+                <input id="rewrite-domain" type="text" placeholder="domain.com" class="w-full sm:flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="rewrite-ipv4" type="text" placeholder="IPv4" class="w-full sm:w-32 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <input id="rewrite-ipv6" type="text" placeholder="IPv6" class="w-full sm:w-40 bg-gray-800 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                <button onclick="addRewrite()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded text-sm font-medium whitespace-nowrap">Add</button>
             </div>
             <div id="rewrites-list" class="bg-gray-800 rounded-lg border border-gray-700 max-h-96 overflow-y-auto"></div>
         </div>
@@ -296,12 +296,12 @@
 
         const blockedDiv = document.getElementById('stats-top-blocked-domains');
         blockedDiv.innerHTML = stats.top_blocked_domains.length
-            ? stats.top_blocked_domains.map(d => `<div class="flex justify-between text-xs"><span class="font-mono text-gray-300 truncate max-w-xs">${d.domain}</span><span class="text-gray-400">${d.count.toLocaleString()}</span></div>`).join('')
+            ? stats.top_blocked_domains.map(d => `<div class="flex justify-between text-xs gap-2"><span class="font-mono text-gray-300 truncate max-w-[140px] sm:max-w-xs">${d.domain}</span><span class="text-gray-400 flex-shrink-0">${d.count.toLocaleString()}</span></div>`).join('')
             : '<div class="text-gray-500 text-xs">No data yet</div>';
 
         const upstreamDiv = document.getElementById('stats-upstream-resolvers');
         upstreamDiv.innerHTML = stats.upstream_stats.length
-            ? `<table class="w-full text-xs">
+            ? `<div class="overflow-x-auto"><table class="w-full text-xs">
                 <thead><tr class="text-gray-400 border-b border-gray-700">
                     <th class="text-left py-1.5 px-2">Resolver</th>
                     <th class="text-right py-1.5 px-2">Queries</th>
@@ -318,7 +318,7 @@
                         <td class="py-1.5 px-2 text-right text-gray-400">${formatLatency(u.max_latency_us)}</td>
                     </tr>`).join('')}
                 </tbody>
-            </table>`
+            </table></div>`
             : '<div class="text-gray-500 text-xs">No upstream queries yet</div>';
     }
 
@@ -333,9 +333,9 @@
             return;
         }
         list.innerHTML = data.map(u =>
-            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
-                <span class="font-mono text-sm">${u.address}:${u.port}</span>
-                <button onclick="deleteUpstream(${u.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0 gap-2">
+                <span class="font-mono text-sm break-all">${u.address}:${u.port}</span>
+                <button onclick="deleteUpstream(${u.id})" class="text-red-400 hover:text-red-300 text-xs whitespace-nowrap flex-shrink-0">Remove</button>
             </div>`
         ).join('');
     }
@@ -372,10 +372,10 @@
         list.innerHTML = data.map(s =>
             `<div class="px-4 py-3 border-b border-gray-700 last:border-0">
                 <div class="flex items-center justify-between mb-1">
-                    <span class="font-mono text-sm truncate max-w-lg">${s.url}</span>
+                    <span class="font-mono text-sm truncate max-w-[150px] sm:max-w-lg">${s.url}</span>
                     <button onclick="deleteSource(${s.id})" class="text-red-400 hover:text-red-300 text-xs ml-2">Remove</button>
                 </div>
-                <div class="flex gap-4 text-xs text-gray-400">
+                <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-gray-400">
                     <span>Type: <span class="text-gray-300">${s.list_type}</span></span>
                     <span>Every: <span class="text-gray-300">${s.update_interval_hours}h</span></span>
                     <span>Last: <span class="${s.last_status && s.last_status.startsWith('ok') ? 'text-green-400' : s.last_status ? 'text-red-400' : 'text-gray-500'}">${s.last_updated || 'never'}</span></span>
@@ -456,9 +456,9 @@
             list.innerHTML = `<div class="p-4 text-gray-500 text-sm">${s.search ? 'No matches' : 'No domains'}</div>`;
         } else {
             list.innerHTML = domains.map(d =>
-                `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
-                    <span class="font-mono text-sm">${d.domain}</span>
-                    <button onclick="deleteDomain('${type}', ${d.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+                `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0 gap-2">
+                    <span class="font-mono text-sm break-all">${d.domain}</span>
+                    <button onclick="deleteDomain('${type}', ${d.id})" class="text-red-400 hover:text-red-300 text-xs whitespace-nowrap flex-shrink-0">Remove</button>
                 </div>`
             ).join('');
         }
@@ -577,9 +577,9 @@
             return;
         }
         list.innerHTML = data.map(r =>
-            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0">
-                <span class="font-mono text-sm">${r.domain} &rarr; ${r.ipv4 || '-'} ${r.ipv6 || ''}</span>
-                <button onclick="deleteRewrite(${r.id})" class="text-red-400 hover:text-red-300 text-xs">Remove</button>
+            `<div class="flex items-center justify-between px-4 py-2 border-b border-gray-700 last:border-0 gap-2">
+                <span class="font-mono text-sm break-all">${r.domain} &rarr; ${r.ipv4 || '-'} ${r.ipv6 || ''}</span>
+                <button onclick="deleteRewrite(${r.id})" class="text-red-400 hover:text-red-300 text-xs whitespace-nowrap flex-shrink-0">Remove</button>
             </div>`
         ).join('');
     }

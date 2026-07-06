@@ -218,7 +218,10 @@ async fn run_server(cli: Cli) -> Result<()> {
                 actix_web::web::get().to(|| async {
                     actix_web::HttpResponse::Ok()
                         .content_type("text/html; charset=utf-8")
-                        .body(include_str!("../static/index.html"))
+                        .body(
+                            include_str!("../static/index.html")
+                                .replace("{VERSION}", env!("CARGO_PKG_VERSION")),
+                        )
                 }),
             )
             .route(
@@ -226,7 +229,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 actix_web::web::get().to(|| async {
                     actix_web::HttpResponse::Ok()
                         .content_type("text/css; charset=utf-8")
-                        .insert_header(("Cache-Control", "public, max-age=86400"))
+                        .insert_header(("Cache-Control", "public, max-age=3600"))
                         .body(include_str!("../static/tailwind.min.css"))
                 }),
             )
