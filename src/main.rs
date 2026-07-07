@@ -42,10 +42,17 @@ struct Cli {
 }
 
 impl Cli {
-    fn db_path(&self) -> &std::path::Path {
-        self.db_path
-            .as_deref()
-            .unwrap_or_else(|| std::path::Path::new("rustblocker.db"))
+    fn db_path(&self) -> std::path::PathBuf {
+        self.db_path.clone().unwrap_or_else(|| {
+            // If the service database already exists, default to it so that
+            // `rustblocker --genpass` works without extra flags on a deployed box.
+            let service_db = std::path::PathBuf::from("/var/lib/rustblocker/rustblocker.db");
+            if service_db.exists() {
+                service_db
+            } else {
+                std::path::PathBuf::from("rustblocker.db")
+            }
+        })
     }
 }
 
@@ -54,7 +61,7 @@ fn main() -> Result<()> {
 
     if cli.genpass {
         let db_path = cli.db_path();
-        let pool = db::create_pool(db_path).context("Failed to create SQLite database")?;
+        let pool = db::create_pool(&db_path).context("Failed to create SQLite database")?;
         db::seed_defaults(&pool);
         let password = rustblocker::auth::AuthState::generate_password();
         let hash = rustblocker::auth::AuthState::hash_password(&password);
@@ -74,15 +81,10 @@ fn main() -> Result<()> {
 
         // Rotate session secret so old sessions are invalidated on the next server start.
         let session_secret = rustblocker::auth::AuthState::generate_secret();
-        db::set_setting(
-            &pool,
-            "session_secret",
-            &rustblocker::auth::encode_secret(&session_secret),
-        );
+        let encoded_secret = rustblocker::auth::encode_secret(&session_secret);
+        db::set_setting(&pool, "session_secret", &encoded_secret);
         let stored_secret = db::get_setting(&pool, "session_secret");
-        if stored_secret.as_deref()
-            != Some(rustblocker::auth::encode_secret(&session_secret).as_str())
-        {
+        if stored_secret.as_deref() != Some(encoded_secret.as_str()) {
             return Err(anyhow::anyhow!(
                 "Session secret was not persisted to {}. \
                  Check file permissions or run as the service user.",
@@ -92,7 +94,7 @@ fn main() -> Result<()> {
 
         println!("Generated admin password:");
         println!("{}", password);
-        let abs_path = std::fs::canonicalize(db_path)
+        let abs_path = std::fs::canonicalize(&db_path)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| db_path.display().to_string());
         eprintln!("Updated database: {}", abs_path);
