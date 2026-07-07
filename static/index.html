@@ -26,6 +26,16 @@
             <h1 class="text-xl font-bold text-emerald-400">RustBlocker</h1>
             <span id="status" class="text-sm text-gray-400">Loading...</span>
             <span id="version" class="text-sm text-gray-400"></span>
+            <button id="header-update-btn" onclick="applyUpdateFromHeader()" class="hidden ml-1 text-emerald-400 hover:text-emerald-300" title="Update available">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="h-4 w-4 animate-bounce">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
+                </svg>
+            </button>
+            <button id="header-refresh-btn" onclick="checkForUpdates()" class="ml-1 text-gray-400 hover:text-gray-200" title="Check for updates">
+                <svg id="header-refresh-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="h-4 w-4">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+            </button>
         </div>
         <button onclick="logout()" class="text-sm text-gray-400 hover:text-gray-200">Logout</button>
     </nav>
@@ -718,6 +728,43 @@
 
     // --- Update ---
 
+    function setHeaderRefreshSpinning(spin) {
+        const icon = document.getElementById('header-refresh-icon');
+        if (!icon) return;
+        if (spin) icon.classList.add('animate-spin');
+        else icon.classList.remove('animate-spin');
+    }
+
+    function renderHeaderUpdate(available, info) {
+        const headerBtn = document.getElementById('header-update-btn');
+        if (!headerBtn) return;
+        if (available && info) {
+            headerBtn.classList.remove('hidden');
+            headerBtn.title = 'Update to ' + info.version;
+            headerBtn.disabled = false;
+            headerBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="h-4 w-4 animate-bounce"><path stroke-linecap="round" stroke-linejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" /></svg>';
+        } else {
+            headerBtn.classList.add('hidden');
+        }
+    }
+
+    function setHeaderUpdating() {
+        const headerBtn = document.getElementById('header-update-btn');
+        if (headerBtn) {
+            headerBtn.disabled = true;
+            headerBtn.innerHTML = '<span class="spinner"></span>';
+        }
+    }
+
+    async function checkForUpdates() {
+        await autoCheckUpdate();
+    }
+
+    function applyUpdateFromHeader() {
+        setHeaderUpdating();
+        applyUpdate();
+    }
+
     async function autoCheckUpdate() {
         const status = document.getElementById('update-status');
         const btn = document.getElementById('update-apply-btn');
@@ -727,22 +774,31 @@
         status.className = 'text-sm text-gray-400';
         btn.classList.add('hidden');
         notes.classList.add('hidden');
+        setHeaderRefreshSpinning(true);
         try {
             const r = await fetch(API + '/update/check');
             const data = await r.json();
             if (data.update_available) {
+                window._updateInfo = data;
                 status.textContent = 'Update available: ' + data.version;
                 status.className = 'text-sm text-emerald-400';
                 notes.textContent = data.notes ? data.notes.substring(0, 500) : '';
                 notes.classList.remove('hidden');
                 btn.classList.remove('hidden');
+                renderHeaderUpdate(true, data);
             } else {
+                window._updateInfo = null;
                 status.textContent = 'Up to date (' + data.current_version + ')';
                 status.className = 'text-sm text-gray-400';
+                renderHeaderUpdate(false);
             }
         } catch {
             status.textContent = 'Update check failed';
             status.className = 'text-sm text-red-400';
+            window._updateInfo = null;
+            renderHeaderUpdate(false);
+        } finally {
+            setHeaderRefreshSpinning(false);
         }
     }
 
@@ -782,6 +838,7 @@
         status.textContent = 'Updating...';
         status.className = 'text-sm text-amber-400';
         btn.disabled = true;
+        setHeaderUpdating();
         try {
             const r = await fetch(API + '/update/apply', { method: 'POST' });
             const data = await r.json();
@@ -797,6 +854,7 @@
             status.className = 'text-sm text-red-400';
             btn.disabled = false;
             btn.classList.remove('hidden');
+            renderHeaderUpdate(false);
         }
     }
     // --- Health ---
