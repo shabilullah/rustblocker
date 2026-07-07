@@ -47,10 +47,15 @@
         document.getElementById('stat-rewrites').textContent = rewrites.length;
         document.getElementById('stat-upstreams').textContent = upstreams.length;
         await refreshDashboardStats();
-        fetch(API + '/version').then(r => r.json()).then(v => {
-            document.getElementById('version').textContent = 'v' + v.version + ' (' + v.target + ')';
-        }).catch(() => {});
+        await refreshHeaderVersion();
         autoCheckUpdate();
+    }
+
+    async function refreshHeaderVersion() {
+        try {
+            const v = await fetch(API + '/version').then(r => r.json());
+            document.getElementById('version').textContent = 'v' + v.version + ' (' + v.target + ')';
+        } catch {}
     }
 
     async function refreshDashboardStats() {
@@ -542,13 +547,12 @@
             try {
                 const r = await fetch(API + '/health');
                 if (r.ok) {
-                    status.textContent = afterText || 'Restart complete';
+                    status.textContent = (afterText || 'Restart complete') + '. Reloading...';
                     status.className = 'text-sm text-emerald-400';
                     btn.classList.add('hidden');
                     notes.classList.add('hidden');
                     btn.disabled = false;
-                    checkHealth();
-                    await autoCheckUpdate();
+                    setTimeout(() => window.location.reload(), 1500);
                     return;
                 }
             } catch {}
