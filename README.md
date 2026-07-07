@@ -47,6 +47,15 @@ cargo build --release
 sudo ./target/release/rustblocker
 ```
 
+For cross-compiling a static Alpine/Linux binary from Windows or another host, use `cargo zigbuild`:
+
+```bash
+cargo install cargo-zigbuild
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+```
+
+See [Deploy on Alpine Linux](#deploy-on-alpine-linux) for the full deployment steps.
+
 The server starts with sensible defaults:
 - DNS on `0.0.0.0:53` (accessible from LAN)
 - Web UI on port 54 (accessible from LAN at `http://<your-ip>:54`)
@@ -61,15 +70,31 @@ Port 53 requires elevated privileges — use `sudo` or run as root.
 ```bash
 rustblocker                                    # Default: DNS 53, web 54
 rustblocker --dns-port 5353 --web-port 8080    # Custom ports (useful for local dev)
-rustblocker --genpass                          # Generate/reset the admin password
+sudo rustblocker --genpass                     # Generate/reset the admin password on a deployed service
+rustblocker --genpass --db-path /path/to/db    # Explicit database path (local dev)
 ```
 
-**Set the admin password before first use:**
+`--genpass` auto-detects the service database at `/var/lib/rustblocker/rustblocker.db` and restarts the `rustblocker` service when run as root, so existing web sessions are invalidated immediately.
+
+**Set or reset the admin password:**
+
+On a deployed service (installed via `scripts/install.sh`), the database lives at `/var/lib/rustblocker/rustblocker.db` and is owned by root. Use `sudo`:
+
 ```bash
-rustblocker --genpass
+sudo rustblocker --genpass
 # Prints a random password, e.g.: 7SsEWF6Gu4i1ALU5eCnAP29S
 ```
-The hash is saved to `rustblocker.db`. You can run `--genpass` before starting the server or while it is running — it updates the database directly and the login takes effect immediately. Re-run `--genpass` any time to reset it.
+
+- The password hash is saved to `rustblocker.db`.
+- `--genpass` verifies the write actually landed and errors out if it couldn't (e.g. permission denied).
+- If a `rustblocker` OpenRC/systemd service is running, `--genpass` restarts it automatically so existing web sessions are invalidated immediately.
+- You can run `--genpass` while the server is running; the login takes effect immediately.
+
+For local development or a custom database location:
+
+```bash
+rustblocker --genpass --db-path /path/to/rustblocker.db
+```
 
 ## Web Management UI
 
@@ -282,11 +307,24 @@ curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts
 
 ### Cross-compile from your machine
 
+The easiest way to deploy or upgrade is the install script (see [One-line install](#one-line-install)). It installs the real binary under `/usr/local/lib/rustblocker/`, creates a `/usr/local/bin/rustblocker` wrapper that defaults to the service database, and sets up the service with `--db-path`.
+
+To build from a non-Linux host (e.g. Windows), `cargo zigbuild` is recommended:
+
+```bash
+cargo install cargo-zigbuild
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+```
+
+On Linux you can also use:
+
 ```bash
 rustup target add x86_64-unknown-linux-musl
+sudo apt-get install musl-tools   # Debian/Ubuntu
 cargo build --release --target x86_64-unknown-linux-musl
-scp target/x86_64-unknown-linux-musl/release/rustblocker user@alpine:/usr/local/bin/
 ```
+
+Then copy the binary to `/usr/local/lib/rustblocker/rustblocker` and create the wrapper script from `scripts/install.sh`, or just re-run the install script to let it handle the layout.
 
 ### Docker multi-stage build
 
@@ -316,16 +354,25 @@ docker run -d --name rustblocker \
 apk add rust cargo musl-dev
 git clone https://github.com/shabilullah/rustblocker.git && cd rustblocker
 cargo build --release
-cp target/release/rustblocker /usr/local/bin/
+
+# Let the install script set up the wrapper, service, and data directory:
+sudo ./scripts/install.sh
+
+# Or manually: copy the binary to /usr/local/lib/rustblocker/ and create
+# the /usr/local/bin/rustblocker wrapper from scripts/install.sh.
 ```
 
 ### Deployment directory layout
 
+When installed via `scripts/install.sh`:
+
 ```
 /usr/local/bin/
-└── rustblocker
+└── rustblocker              # wrapper script (injects --db-path)
+/usr/local/lib/rustblocker/
+└── rustblocker              # real binary
 /var/lib/rustblocker/
-└── rustblocker.db          (created automatically on first run)
+└── rustblocker.db          # created automatically on first run
 /var/log/
 └── rustblocker.log
 ```
