@@ -79,10 +79,12 @@ install_binary() {
 
     info "Installing binary to /usr/local/lib/rustblocker/$BINARY_NAME"
     mkdir -p "/usr/local/lib/rustblocker"
+    rm -f "/usr/local/lib/rustblocker/$BINARY_NAME"
     mv "$TEMP_DIR/$BINARY_NAME" "/usr/local/lib/rustblocker/$BINARY_NAME"
     chmod +x "/usr/local/lib/rustblocker/$BINARY_NAME"
 
     info "Installing wrapper to $INSTALL_DIR/$BINARY_NAME"
+    rm -f "$INSTALL_DIR/$BINARY_NAME"
     cat > "$INSTALL_DIR/$BINARY_NAME" << 'WRAPPEREOf'
 #!/bin/sh
 # Wrapper that defaults to the service database directory unless a --db-path is already given.
