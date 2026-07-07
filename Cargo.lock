@@ -2182,7 +2182,7 @@ dependencies = [
 
 [[package]]
 name = "rustblocker"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "actix-rt",
  "actix-web",
