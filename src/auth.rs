@@ -1,9 +1,8 @@
 //! Password authentication and signed session cookies for the web UI.
 //!
 //! Sessions are stateless: the cookie contains an expiry timestamp signed with
-//! an HMAC-SHA256 key generated at server startup. This keeps the app
-//! zero-config (no Redis/files/server state), at the cost of requiring login
-//! again after the process restarts -- acceptable for a single-user admin UI.
+//! an HMAC-SHA256 key. The key is generated once and persisted in the SQLite
+//! database, so existing login sessions survive process restarts.
 
 use std::sync::Arc;
 
@@ -32,11 +31,21 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    /// Create a new auth state with a randomly generated session signing key.
-    pub fn new() -> Self {
+    /// Generate a new random 256-bit session signing key.
+    pub fn generate_secret() -> Vec<u8> {
         let mut session_secret = vec![0u8; 32];
         rand::thread_rng().fill_bytes(&mut session_secret);
+        session_secret
+    }
+
+    /// Create auth state from an existing secret (loaded from persistent storage).
+    pub fn from_secret(session_secret: Vec<u8>) -> Self {
         Self { session_secret }
+    }
+
+    /// Create a new auth state with a randomly generated session signing key.
+    pub fn new() -> Self {
+        Self::from_secret(Self::generate_secret())
     }
 
     /// Generate a strong, random plaintext admin password.
@@ -222,6 +231,16 @@ fn base64_decode(input: &str) -> anyhow::Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(input)
         .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))
+}
+
+/// Encode a session secret for storage in the database.
+pub fn encode_secret(secret: &[u8]) -> String {
+    base64_encode(secret)
+}
+
+/// Decode a session secret stored in the database.
+pub fn decode_secret(secret: &str) -> anyhow::Result<Vec<u8>> {
+    base64_decode(secret)
 }
 
 #[cfg(test)]

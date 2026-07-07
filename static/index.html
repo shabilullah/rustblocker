@@ -675,6 +675,7 @@
         const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'allowed_networks', 'stats_retention_days'];
         const restartKeys = ['listen_address', 'listen_port', 'log_level'];
         let needsRestart = false;
+        let restartPending = false;
         for (const key of keys) {
             const el = document.getElementById('setting-' + key);
             if (el) {
@@ -682,22 +683,30 @@
                     const orig = (window._originalSettings && window._originalSettings[key]) || '';
                     if (el.value !== orig) needsRestart = true;
                 }
-                await fetch(API + '/settings', {
-                    method: 'PUT',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({key, value: el.value})
-                });
+                try {
+                    const resp = await fetch(API + '/settings', {
+                        method: 'PUT',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({key, value: el.value})
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (data.restart_pending) restartPending = true;
+                } catch {}
             }
         }
         const status = document.getElementById('settings-status');
-        if (needsRestart) {
+        if (restartPending) {
+            status.textContent = 'Saved. Restarting to apply changes...';
+            status.className = 'text-sm text-amber-400';
+            waitForRestart('Settings applied and restarted');
+        } else if (needsRestart) {
             status.textContent = 'Saved. Changes to listen address, port, or log level require manually restarting the process.';
             status.className = 'text-sm text-amber-400';
         } else {
             status.textContent = 'Saved (applied live).';
             status.className = 'text-sm text-emerald-400';
+            setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 5000);
         }
-        setTimeout(() => { status.textContent = ''; status.className = 'text-sm mb-2'; }, 5000);
     }
 
     function formatLatency(us) {

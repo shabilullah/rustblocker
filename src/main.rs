@@ -211,7 +211,18 @@ async fn run_server(cli: Cli) -> Result<()> {
     let forwarder_data = actix_web::web::Data::new(forwarder.clone());
     let sinkhole_v4_data = actix_web::web::Data::new(sinkhole_ipv4.clone());
     let sinkhole_v6_data = actix_web::web::Data::new(sinkhole_ipv6.clone());
-    let auth_data = Arc::new(rustblocker::auth::AuthState::new());
+    let session_secret = db::get_setting(&pool, "session_secret")
+        .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
+        .unwrap_or_else(|| {
+            let secret = rustblocker::auth::AuthState::generate_secret();
+            db::set_setting(
+                &pool,
+                "session_secret",
+                &rustblocker::auth::encode_secret(&secret),
+            );
+            secret
+        });
+    let auth_data = Arc::new(rustblocker::auth::AuthState::from_secret(session_secret));
 
     let web_server = actix_web::HttpServer::new({
         let auth_data = auth_data.clone();
