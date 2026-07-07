@@ -59,6 +59,19 @@ fn main() -> Result<()> {
         let password = rustblocker::auth::AuthState::generate_password();
         let hash = rustblocker::auth::AuthState::hash_password(&password);
         db::set_password_hash(&pool, &hash);
+
+        // Verify the write actually landed. Silent failures (e.g. permission
+        // denied on a root-owned DB) produce the same "invalid password"
+        // symptom that started this investigation.
+        let stored_hash = db::get_password_hash(&pool);
+        if stored_hash.as_deref() != Some(hash.as_str()) {
+            return Err(anyhow::anyhow!(
+                "Password hash was not persisted to {}. \
+                 Check file permissions or run as the service user.",
+                db_path.display()
+            ));
+        }
+
         // Rotate session secret so old sessions are invalidated on the next server start.
         let session_secret = rustblocker::auth::AuthState::generate_secret();
         db::set_setting(
@@ -66,6 +79,17 @@ fn main() -> Result<()> {
             "session_secret",
             &rustblocker::auth::encode_secret(&session_secret),
         );
+        let stored_secret = db::get_setting(&pool, "session_secret");
+        if stored_secret.as_deref()
+            != Some(rustblocker::auth::encode_secret(&session_secret).as_str())
+        {
+            return Err(anyhow::anyhow!(
+                "Session secret was not persisted to {}. \
+                 Check file permissions or run as the service user.",
+                db_path.display()
+            ));
+        }
+
         println!("Generated admin password:");
         println!("{}", password);
         let abs_path = std::fs::canonicalize(db_path)
