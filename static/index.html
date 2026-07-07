@@ -737,6 +737,35 @@
         }
     }
 
+    async function waitForRestart(afterText) {
+        const status = document.getElementById('update-status');
+        const btn = document.getElementById('update-apply-btn');
+        const notes = document.getElementById('update-notes');
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            attempts++;
+            try {
+                const r = await fetch(API + '/health');
+                if (r.ok) {
+                    status.textContent = afterText || 'Restart complete';
+                    status.className = 'text-sm text-emerald-400';
+                    btn.classList.add('hidden');
+                    notes.classList.add('hidden');
+                    btn.disabled = false;
+                    checkHealth();
+                    await autoCheckUpdate();
+                    return;
+                }
+            } catch {}
+            status.textContent = 'Restarting... (' + attempts + ')';
+            status.className = 'text-sm text-amber-400';
+        }
+        status.textContent = 'Restart timed out; please refresh manually';
+        status.className = 'text-sm text-red-400';
+    }
+
     async function applyUpdate() {
         const status = document.getElementById('update-status');
         const btn = document.getElementById('update-apply-btn');
@@ -750,6 +779,7 @@
             if (data.status === 'updated') {
                 status.textContent = 'Updated to ' + data.version + '. Restarting...';
                 status.className = 'text-sm text-emerald-400';
+                waitForRestart('Updated to ' + data.version + ' and restarted');
             } else {
                 throw new Error(data.error || 'Unknown error');
             }
