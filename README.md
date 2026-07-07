@@ -69,7 +69,7 @@ rustblocker --genpass                          # Generate/reset the admin passwo
 rustblocker --genpass
 # Prints a random password, e.g.: 7SsEWF6Gu4i1ALU5eCnAP29S
 ```
-The hash is saved to `rustblocker.db`. Re-run `--genpass` any time to reset it.
+The hash is saved to `rustblocker.db`. You can run `--genpass` before starting the server or while it is running — it updates the database directly and the login takes effect immediately. Re-run `--genpass` any time to reset it.
 
 ## Web Management UI
 
