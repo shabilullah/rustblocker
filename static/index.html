@@ -4,11 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>RustBlocker</title>
+    <link rel="icon" type="image/png" href="/favicon.png">
     <link rel="stylesheet" href="/tailwind.min.css?v={VERSION}">
 </head>
 <body class="bg-gray-900 text-gray-100 min-h-screen">
     <div id="login-screen" class="fixed inset-0 z-50 flex items-center justify-center bg-gray-900">
-        <div class="bg-gray-800 border border-gray-700 rounded-lg p-6 w-full max-w-sm mx-4">
+        <div class="bg-gray-800 border border-gray-700 rounded-lg p-6 w-full max-w-sm mx-4 text-center">
+            <div class="flex justify-center mb-2">
+                <img src="/icon.png" alt="RustBlocker" class="h-10 w-10">
+            </div>
             <h1 class="text-2xl font-bold text-emerald-400 mb-2">RustBlocker</h1>
             <p class="text-sm text-gray-400 mb-4">Enter admin password</p>
             <form id="login-form" onsubmit="submitLogin(event)">
@@ -23,6 +27,7 @@
     <div id="app-content" class="hidden">
     <nav class="bg-gray-800 border-b border-gray-700 px-3 sm:px-6 py-3 flex items-center justify-between flex-wrap gap-2">
         <div class="flex items-center gap-3">
+            <img src="/icon.png" alt="RustBlocker" class="h-8 w-8">
             <h1 class="text-xl font-bold text-emerald-400">RustBlocker</h1>
             <span id="status" class="text-sm text-gray-400">Loading...</span>
             <span id="version" class="text-sm text-gray-400"></span>

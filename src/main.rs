@@ -267,6 +267,33 @@ async fn run_server(cli: Cli) -> Result<()> {
                             .body(include_str!("../static/tailwind.min.css"))
                     }),
                 )
+                .route(
+                    "/icon.png",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("image/png")
+                            .insert_header(("Cache-Control", "public, max-age=86400"))
+                            .body(&include_bytes!("../static/icon.png")[..])
+                    }),
+                )
+                .route(
+                    "/favicon.png",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("image/png")
+                            .insert_header(("Cache-Control", "public, max-age=86400"))
+                            .body(&include_bytes!("../static/favicon.png")[..])
+                    }),
+                )
+                .route(
+                    "/favicon.ico",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("image/x-icon")
+                            .insert_header(("Cache-Control", "public, max-age=86400"))
+                            .body(&include_bytes!("../static/favicon.ico")[..])
+                    }),
+                )
         }
     })
     .bind(&web_addr)
