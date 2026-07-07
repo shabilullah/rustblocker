@@ -103,6 +103,7 @@ impl Default for AuthState {
 pub fn is_public_path(path: &str) -> bool {
     path == "/"
         || path.starts_with("/tailwind.min.css")
+        || path == "/app.js"
         || path == "/icon.png"
         || path == "/favicon.png"
         || path == "/favicon.ico"

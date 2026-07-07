@@ -94,7 +94,7 @@ fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
         .to_string()
 }
 
-const CSP_POLICY: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'";
+const CSP_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'";
 
 async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
@@ -265,6 +265,15 @@ async fn run_server(cli: Cli) -> Result<()> {
                             .content_type("text/css; charset=utf-8")
                             .insert_header(("Cache-Control", "public, max-age=3600"))
                             .body(include_str!("../static/tailwind.min.css"))
+                    }),
+                )
+                .route(
+                    "/app.js",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("application/javascript; charset=utf-8")
+                            .insert_header(("Cache-Control", "public, max-age=3600"))
+                            .body(include_str!("../static/app.js"))
                     }),
                 )
                 .route(
