@@ -98,7 +98,13 @@ fn main() -> Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| db_path.display().to_string());
         eprintln!("Updated database: {}", abs_path);
-        eprintln!("Note: existing web sessions will be invalidated when the server is restarted.");
+        if restart_service_if_running() {
+            eprintln!("RustBlocker service restarted; existing web sessions are now invalidated.");
+        } else {
+            eprintln!(
+                "Note: existing web sessions will be invalidated when the server is restarted."
+            );
+        }
         return Ok(());
     }
 
@@ -113,6 +119,36 @@ fn main() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_server(cli))
+}
+
+/// Restart the rustblocker service if it is currently managed by OpenRC or systemd.
+/// Returns true if a restart command was issued and succeeded.
+fn restart_service_if_running() -> bool {
+    let service_active = |cmd: &str, args: &[&str]| -> bool {
+        std::process::Command::new(cmd)
+            .args(args)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if service_active("rc-service", &["rustblocker", "status"]) {
+        return std::process::Command::new("rc-service")
+            .args(["rustblocker", "restart"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+
+    if service_active("systemctl", &["is-active", "--quiet", "rustblocker"]) {
+        return std::process::Command::new("systemctl")
+            .args(["restart", "rustblocker"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+
+    false
 }
 
 fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
