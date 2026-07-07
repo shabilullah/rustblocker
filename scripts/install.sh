@@ -77,8 +77,28 @@ install_binary() {
 
     stop_service 2>/dev/null || true
 
-    info "Installing binary to $INSTALL_DIR/$BINARY_NAME"
-    mv "$TEMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+    info "Installing binary to /usr/local/lib/rustblocker/$BINARY_NAME"
+    mkdir -p "/usr/local/lib/rustblocker"
+    mv "$TEMP_DIR/$BINARY_NAME" "/usr/local/lib/rustblocker/$BINARY_NAME"
+    chmod +x "/usr/local/lib/rustblocker/$BINARY_NAME"
+
+    info "Installing wrapper to $INSTALL_DIR/$BINARY_NAME"
+    cat > "$INSTALL_DIR/$BINARY_NAME" << 'WRAPPEREOf'
+#!/bin/sh
+# Wrapper that defaults to the service database directory unless a --db-path is already given.
+REAL_BIN=/usr/local/lib/rustblocker/rustblocker
+DB_PATH=/var/lib/rustblocker/rustblocker.db
+
+for arg in "$@"; do
+    case "$arg" in
+        --db-path|--db-path=*)
+            exec "$REAL_BIN" "$@"
+            ;;
+    esac
+done
+
+exec "$REAL_BIN" --db-path "$DB_PATH" "$@"
+WRAPPEREOf
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
     rm -rf "$TEMP_DIR"
@@ -120,7 +140,7 @@ supervisor=supervise-daemon
 name="rustblocker"
 description="RustBlocker DNS Blocker"
 command="/usr/local/bin/rustblocker"
-command_args="--dns-port 53"
+command_args="--dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db"
 directory="/var/lib/rustblocker"
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/rustblocker.log"
@@ -151,7 +171,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/rustblocker --dns-port 53
+ExecStart=/usr/local/bin/rustblocker --dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db
 WorkingDirectory=/var/lib/rustblocker
 Restart=always
 RestartSec=5
@@ -207,12 +227,18 @@ uninstall() {
         fi
     fi
 
-    # Remove binary
+    # Remove wrapper and real binary
     if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
         rm -f "$INSTALL_DIR/$BINARY_NAME"
-        info "Removed binary: $INSTALL_DIR/$BINARY_NAME"
+        info "Removed wrapper: $INSTALL_DIR/$BINARY_NAME"
     else
-        warn "Binary not found at $INSTALL_DIR/$BINARY_NAME"
+        warn "Wrapper not found at $INSTALL_DIR/$BINARY_NAME"
+    fi
+
+    if [ -f "/usr/local/lib/rustblocker/$BINARY_NAME" ]; then
+        rm -f "/usr/local/lib/rustblocker/$BINARY_NAME"
+        rmdir "/usr/local/lib/rustblocker" 2>/dev/null || true
+        info "Removed binary: /usr/local/lib/rustblocker/$BINARY_NAME"
     fi
 
     # Remove data directory
@@ -274,10 +300,14 @@ print_summary() {
     echo "  DNS port:  53"
     echo "  Web UI:    http://${LAN_IP}:54"
     echo "  Data:      $DATA_DIR/rustblocker.db"
-    echo "  Binary:    $INSTALL_DIR/$BINARY_NAME"
+    echo "  Binary:    /usr/local/lib/rustblocker/$BINARY_NAME"
+    echo "  Wrapper:   $INSTALL_DIR/$BINARY_NAME"
     echo ""
     echo "  Manage via web UI or API:"
     echo "    curl http://${LAN_IP}:54/api/health"
+    echo ""
+    echo "  Reset admin password:"
+    echo "    sudo rustblocker --genpass"
     echo ""
     echo "  CLI options:"
     echo "    rustblocker --dns-port 5353 --web-port 8080"
