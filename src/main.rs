@@ -30,10 +30,24 @@ struct Cli {
     /// Web UI listen port (overrides database setting, defaults to dns_port + 1)
     #[arg(long)]
     web_port: Option<u16>,
+
+    /// Generate/reset the admin password, save its hash, and print the password
+    #[arg(long)]
+    genpass: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.genpass {
+        let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
+        db::seed_defaults(&pool);
+        let password = rustblocker::auth::AuthState::generate_password();
+        let hash = rustblocker::auth::AuthState::hash_password(&password);
+        db::set_password_hash(&pool, &hash);
+        println!("{}", password);
+        return Ok(());
+    }
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -86,6 +100,10 @@ async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
 
     db::seed_defaults(&pool);
+
+    if db::get_password_hash(&pool).is_none() {
+        warn!("No admin password set. Use `rustblocker --genpass` before accessing the web UI.");
+    }
 
     let listen_address = get_setting_string(&pool, "listen_address");
     let db_dns_port: u16 = get_setting_string(&pool, "listen_port")
@@ -193,46 +211,52 @@ async fn run_server(cli: Cli) -> Result<()> {
     let forwarder_data = actix_web::web::Data::new(forwarder.clone());
     let sinkhole_v4_data = actix_web::web::Data::new(sinkhole_ipv4.clone());
     let sinkhole_v6_data = actix_web::web::Data::new(sinkhole_ipv6.clone());
+    let auth_data = Arc::new(rustblocker::auth::AuthState::new());
 
-    let web_server = actix_web::HttpServer::new(move || {
-        actix_web::App::new()
-            .wrap(
-                actix_web::middleware::DefaultHeaders::new()
-                    .add(("Content-Security-Policy", CSP_POLICY))
-                    .add(("X-Content-Type-Options", "nosniff"))
-                    .add(("X-Frame-Options", "DENY"))
-                    .add(("Referrer-Policy", "no-referrer")),
-            )
-            .app_data(pool_data.clone())
-            .app_data(blocklist_data.clone())
-            .app_data(allowlist_data.clone())
-            .app_data(rewrites_data.clone())
-            .app_data(acl_data.clone())
-            .app_data(query_log_data.clone())
-            .app_data(forwarder_data.clone())
-            .app_data(sinkhole_v4_data.clone())
-            .app_data(sinkhole_v6_data.clone())
-            .configure(api::configure)
-            .route(
-                "/",
-                actix_web::web::get().to(|| async {
-                    actix_web::HttpResponse::Ok()
-                        .content_type("text/html; charset=utf-8")
-                        .body(
-                            include_str!("../static/index.html")
-                                .replace("{VERSION}", env!("CARGO_PKG_VERSION")),
-                        )
-                }),
-            )
-            .route(
-                "/tailwind.min.css",
-                actix_web::web::get().to(|| async {
-                    actix_web::HttpResponse::Ok()
-                        .content_type("text/css; charset=utf-8")
-                        .insert_header(("Cache-Control", "public, max-age=3600"))
-                        .body(include_str!("../static/tailwind.min.css"))
-                }),
-            )
+    let web_server = actix_web::HttpServer::new({
+        let auth_data = auth_data.clone();
+        move || {
+            actix_web::App::new()
+                .wrap(
+                    actix_web::middleware::DefaultHeaders::new()
+                        .add(("Content-Security-Policy", CSP_POLICY))
+                        .add(("X-Content-Type-Options", "nosniff"))
+                        .add(("X-Frame-Options", "DENY"))
+                        .add(("Referrer-Policy", "no-referrer")),
+                )
+                .wrap(rustblocker::auth::AuthMiddleware::new(auth_data.clone()))
+                .app_data(pool_data.clone())
+                .app_data(blocklist_data.clone())
+                .app_data(allowlist_data.clone())
+                .app_data(rewrites_data.clone())
+                .app_data(acl_data.clone())
+                .app_data(query_log_data.clone())
+                .app_data(forwarder_data.clone())
+                .app_data(sinkhole_v4_data.clone())
+                .app_data(sinkhole_v6_data.clone())
+                .app_data(actix_web::web::Data::new(auth_data.clone()))
+                .configure(api::configure)
+                .route(
+                    "/",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("text/html; charset=utf-8")
+                            .body(
+                                include_str!("../static/index.html")
+                                    .replace("{VERSION}", env!("CARGO_PKG_VERSION")),
+                            )
+                    }),
+                )
+                .route(
+                    "/tailwind.min.css",
+                    actix_web::web::get().to(|| async {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("text/css; charset=utf-8")
+                            .insert_header(("Cache-Control", "public, max-age=3600"))
+                            .body(include_str!("../static/tailwind.min.css"))
+                    }),
+                )
+        }
     })
     .bind(&web_addr)
     .with_context(|| format!("Failed to bind web server on {}", web_addr))?;

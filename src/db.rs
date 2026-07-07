@@ -189,6 +189,9 @@ pub fn get_settings(pool: &DbPool) -> serde_json::Value {
 
     let mut map = serde_json::Map::new();
     for (key, value) in rows {
+        if key == "admin_password_hash" {
+            continue; // never expose the password hash through the settings API
+        }
         map.insert(key, serde_json::Value::String(value));
     }
     serde_json::Value::Object(map)
@@ -201,6 +204,14 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) {
         params![key, value],
     )
     .ok();
+}
+
+pub fn get_password_hash(pool: &DbPool) -> Option<String> {
+    get_setting(pool, "admin_password_hash")
+}
+
+pub fn set_password_hash(pool: &DbPool, hash: &str) {
+    set_setting(pool, "admin_password_hash", hash);
 }
 
 pub fn get_setting(pool: &DbPool, key: &str) -> Option<String> {

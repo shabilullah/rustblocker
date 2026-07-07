@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::acl::SharedAcl;
+use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS};
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
 use crate::forwarder::ParallelForwarder;
@@ -61,6 +62,17 @@ struct StatsQuery {
 struct QueryLogQuery {
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginPayload {
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChangePasswordPayload {
+    current_password: String,
+    new_password: String,
 }
 
 /// ACL check helper — logs rejection and returns false if not allowed.
@@ -675,6 +687,76 @@ async fn restart_server(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Res
     HttpResponse::Ok().json(serde_json::json!({"status": "restarting"}))
 }
 
+// --- Auth ---
+
+fn auth_cookie(session_value: String, max_age: i64) -> actix_web::cookie::Cookie<'static> {
+    actix_web::cookie::Cookie::build(SESSION_COOKIE_NAME, session_value)
+        .http_only(true)
+        .same_site(actix_web::cookie::SameSite::Strict)
+        .path("/")
+        .max_age(actix_web::cookie::time::Duration::seconds(max_age))
+        .finish()
+}
+
+async fn login(
+    pool: web::Data<DbPool>,
+    auth: web::Data<Arc<AuthState>>,
+    body: web::Json<LoginPayload>,
+) -> impl Responder {
+    let hash = match db::get_password_hash(&pool) {
+        Some(h) => h,
+        None => {
+            return HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "no admin password configured"}));
+        }
+    };
+    if !AuthState::verify_password(&body.password, &hash) {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid password"}));
+    }
+    let session = auth.create_session(SESSION_MAX_AGE_SECS);
+    HttpResponse::Ok()
+        .cookie(auth_cookie(session, SESSION_MAX_AGE_SECS as i64))
+        .json(serde_json::json!({"authenticated": true}))
+}
+
+async fn logout() -> impl Responder {
+    HttpResponse::Ok()
+        .cookie(auth_cookie(String::new(), 0))
+        .json(serde_json::json!({"authenticated": false}))
+}
+
+async fn auth_check(auth: web::Data<Arc<AuthState>>, req: HttpRequest) -> impl Responder {
+    let authed = req
+        .cookie(SESSION_COOKIE_NAME)
+        .map(|c| auth.validate_session(c.value()))
+        .unwrap_or(false);
+    HttpResponse::Ok().json(serde_json::json!({"authenticated": authed}))
+}
+
+async fn change_password(
+    pool: web::Data<DbPool>,
+    body: web::Json<ChangePasswordPayload>,
+) -> impl Responder {
+    let hash = match db::get_password_hash(&pool) {
+        Some(h) => h,
+        None => {
+            return HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "no admin password configured"}));
+        }
+    };
+    if !AuthState::verify_password(&body.current_password, &hash) {
+        return HttpResponse::Unauthorized()
+            .json(serde_json::json!({"error": "current password is incorrect"}));
+    }
+    if body.new_password.len() < 6 {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "new password must be at least 6 characters"}));
+    }
+    let new_hash = AuthState::hash_password(&body.new_password);
+    db::set_password_hash(&pool, &new_hash);
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+}
+
 // --- Health ---
 
 async fn health() -> impl Responder {
@@ -757,6 +839,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/api")
             .route("/health", web::get().to(health))
             .route("/version", web::get().to(get_version))
+            .route("/auth/check", web::get().to(auth_check))
+            .route("/auth/login", web::post().to(login))
+            .route("/auth/logout", web::post().to(logout))
+            .route("/auth/password", web::put().to(change_password))
             .route("/update/check", web::get().to(check_update))
             .route("/update/apply", web::post().to(apply_update))
             .route("/settings", web::get().to(get_settings))
