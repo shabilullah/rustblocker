@@ -4,6 +4,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 use tracing::warn;
 
 use crate::acl::SharedAcl;
@@ -74,6 +75,18 @@ fn check_acl(req: &HttpRequest, acl: &SharedAcl) -> bool {
     true
 }
 
+/// Schedule a process restart after a short delay.
+/// Used by settings changes and in-place updates; relies on the service
+/// supervisor (OpenRC/systemd) to respawn the binary.
+fn schedule_restart(reason: &str, delay: Duration) {
+    let reason = reason.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        tracing::info!("Restarting RustBlocker: {}", reason);
+        std::process::exit(0);
+    });
+}
+
 /// Resolve import content from either inline content or a URL.
 async fn resolve_import_content(body: &BulkImport) -> String {
     if let Some(url) = &body.url {
@@ -123,6 +136,27 @@ async fn update_setting(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    // Listening socket settings can only take effect after a restart.
+    if body.key == "listen_address" || body.key == "listen_port" {
+        let valid = match body.key.as_str() {
+            "listen_address" => body.value.parse::<std::net::IpAddr>().is_ok(),
+            "listen_port" => body.value.parse::<u16>().is_ok(),
+            _ => false,
+        };
+        if !valid {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("invalid {}: {}", body.key, body.value)
+            }));
+        }
+        db::set_setting(&pool, &body.key, &body.value);
+        let reason = format!("{} changed to {}", body.key, body.value);
+        schedule_restart(&reason, Duration::from_secs(1));
+        return HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "restart_pending": true,
+        }));
+    }
+
     db::set_setting(&pool, &body.key, &body.value);
     // Hot-reload the setting in memory
     match body.key.as_str() {
@@ -637,10 +671,7 @@ async fn restart_server(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Res
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     tracing::info!("Restart requested via API, exiting in 1s...");
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        std::process::exit(0);
-    });
+    schedule_restart("restart requested via API", Duration::from_secs(1));
     HttpResponse::Ok().json(serde_json::json!({"status": "restarting"}))
 }
 
@@ -690,12 +721,14 @@ async fn apply_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Respo
     }
     match tokio::task::spawn_blocking(update::apply_update).await {
         Ok(Ok(version)) => {
+            let reason = format!("updated to {}", version);
             tracing::info!("Updated to {}, restarting in 1s...", version);
-            tokio::spawn(async {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                std::process::exit(0);
-            });
-            HttpResponse::Ok().json(serde_json::json!({"status": "updated", "version": version}))
+            schedule_restart(&reason, Duration::from_secs(1));
+            HttpResponse::Ok().json(serde_json::json!({
+                "status": "updated",
+                "version": version,
+                "restart_pending": true,
+            }))
         }
         Ok(Err(e)) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("{:#}", e),
