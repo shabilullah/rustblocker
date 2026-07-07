@@ -8,7 +8,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::acl::SharedAcl;
-use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS};
+use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret};
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
 use crate::forwarder::ParallelForwarder;
@@ -735,6 +735,7 @@ async fn auth_check(auth: web::Data<Arc<AuthState>>, req: HttpRequest) -> impl R
 
 async fn change_password(
     pool: web::Data<DbPool>,
+    auth: web::Data<Arc<AuthState>>,
     body: web::Json<ChangePasswordPayload>,
 ) -> impl Responder {
     let hash = match db::get_password_hash(&pool) {
@@ -754,7 +755,15 @@ async fn change_password(
     }
     let new_hash = AuthState::hash_password(&body.new_password);
     db::set_password_hash(&pool, &new_hash);
-    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+
+    // Rotate the session signing secret so existing sessions are invalidated.
+    // Issue a new session cookie for the current user so they stay logged in.
+    let new_secret = auth.rotate_secret();
+    db::set_setting(&pool, "session_secret", &encode_secret(&new_secret));
+    let session = auth.create_session(SESSION_MAX_AGE_SECS);
+    HttpResponse::Ok()
+        .cookie(auth_cookie(session, SESSION_MAX_AGE_SECS as i64))
+        .json(serde_json::json!({"status": "ok"}))
 }
 
 // --- Health ---

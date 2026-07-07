@@ -45,7 +45,16 @@ fn main() -> Result<()> {
         let password = rustblocker::auth::AuthState::generate_password();
         let hash = rustblocker::auth::AuthState::hash_password(&password);
         db::set_password_hash(&pool, &hash);
+        // Rotate session secret so old sessions are invalidated on the next server start.
+        let session_secret = rustblocker::auth::AuthState::generate_secret();
+        db::set_setting(
+            &pool,
+            "session_secret",
+            &rustblocker::auth::encode_secret(&session_secret),
+        );
+        println!("Generated admin password:");
         println!("{}", password);
+        eprintln!("Note: existing web sessions will be invalidated when the server is restarted.");
         return Ok(());
     }
 

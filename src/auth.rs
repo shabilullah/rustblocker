@@ -15,8 +15,9 @@ use base64::Engine;
 use bcrypt::{DEFAULT_COST, hash, verify};
 use futures::future::{LocalBoxFuture, Ready, ready};
 use hmac::{Hmac, Mac};
+use parking_lot::RwLock;
 use rand::RngCore;
-use rand::distributions::{Alphanumeric, DistString};
+use rand::distributions::{Distribution, Uniform};
 use serde_json::json;
 use sha2::Sha256;
 
@@ -27,7 +28,7 @@ pub const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Authentication state shared across worker threads.
 pub struct AuthState {
-    session_secret: Vec<u8>,
+    session_secret: Arc<RwLock<Vec<u8>>>,
 }
 
 impl AuthState {
@@ -40,7 +41,19 @@ impl AuthState {
 
     /// Create auth state from an existing secret (loaded from persistent storage).
     pub fn from_secret(session_secret: Vec<u8>) -> Self {
-        Self { session_secret }
+        Self {
+            session_secret: Arc::new(RwLock::new(session_secret)),
+        }
+    }
+
+    /// Generate a new session signing key and update the in-memory secret.
+    ///
+    /// The caller is responsible for persisting the returned secret to
+    /// persistent storage (e.g. the `session_secret` database setting).
+    pub fn rotate_secret(&self) -> Vec<u8> {
+        let new_secret = Self::generate_secret();
+        *self.session_secret.write() = new_secret.clone();
+        new_secret
     }
 
     /// Create a new auth state with a randomly generated session signing key.
@@ -49,8 +62,18 @@ impl AuthState {
     }
 
     /// Generate a strong, random plaintext admin password.
+    ///
+    /// Uses an unambiguous character set (no `0`/`O`, `1`/`l`/`I`, etc.)
+    /// so the printed password survives copy/paste and manual typing.
     pub fn generate_password() -> String {
-        Alphanumeric.sample_string(&mut rand::thread_rng(), 24)
+        const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz";
+        let uniform = Uniform::from(0..CHARSET.len());
+        let mut rng = rand::thread_rng();
+        uniform
+            .sample_iter(&mut rng)
+            .take(24)
+            .map(|i| CHARSET[i] as char)
+            .collect()
     }
 
     /// Hash a plaintext password with bcrypt for storage in the database.
@@ -219,11 +242,11 @@ fn verify_signature(secret: &[u8], payload: &str, signature: &[u8]) -> bool {
 
 impl AuthState {
     fn sign(&self, payload: &str) -> Vec<u8> {
-        sign(&self.session_secret, payload)
+        sign(&self.session_secret.read(), payload)
     }
 
     fn verify_signature(&self, payload: &str, signature: &[u8]) -> bool {
-        verify_signature(&self.session_secret, payload, signature)
+        verify_signature(&self.session_secret.read(), payload, signature)
     }
 }
 
@@ -275,6 +298,21 @@ mod tests {
         // Give the clock one second to move past the instant we created it.
         std::thread::sleep(std::time::Duration::from_secs(1));
         assert!(!auth.validate_session(&expired));
+    }
+
+    #[test]
+    fn session_secret_rotation_invalidates_existing_sessions() {
+        let auth = AuthState::new();
+        let session = auth.create_session(60);
+        assert!(auth.validate_session(&session));
+
+        // After rotating the signing secret, the old cookie must no longer validate.
+        auth.rotate_secret();
+        assert!(!auth.validate_session(&session));
+
+        // A freshly issued session should validate against the new secret.
+        let new_session = auth.create_session(60);
+        assert!(auth.validate_session(&new_session));
     }
 
     #[test]
