@@ -116,20 +116,18 @@ setup_openrc() {
     cat > "$INIT_SCRIPT" << 'INITEOF'
 #!/sbin/openrc-run
 
+supervisor=supervise-daemon
 name="rustblocker"
 description="RustBlocker DNS Blocker"
 command="/usr/local/bin/rustblocker"
 command_args="--dns-port 53"
-pidfile="/run/rustblocker.pid"
+directory="/var/lib/rustblocker"
+pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/rustblocker.log"
 error_log="/var/log/rustblocker.log"
-
-start() {
-    cd /var/lib/rustblocker || return 1
-    start-stop-daemon --start --background --make-pidfile \
-        --pidfile "$pidfile" \
-        --exec "$command" -- $command_args
-}
+respawn=yes
+respawn_delay=5
+respawn_max=0
 
 depend() {
     need net

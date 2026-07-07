@@ -4,3 +4,6 @@ compiled-blocklist.txt
 compiled-allowlist.txt
 node_modules/
 tag.md
+askpass.sh
+askpass.bat
+remote_downgrade.sh
