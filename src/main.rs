@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -34,13 +35,26 @@ struct Cli {
     /// Generate/reset the admin password, save its hash, and print the password
     #[arg(long)]
     genpass: bool,
+
+    /// Path to the SQLite database (default: rustblocker.db in current directory)
+    #[arg(long, value_name = "PATH")]
+    db_path: Option<PathBuf>,
+}
+
+impl Cli {
+    fn db_path(&self) -> &std::path::Path {
+        self.db_path
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("rustblocker.db"))
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.genpass {
-        let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
+        let db_path = cli.db_path();
+        let pool = db::create_pool(db_path).context("Failed to create SQLite database")?;
         db::seed_defaults(&pool);
         let password = rustblocker::auth::AuthState::generate_password();
         let hash = rustblocker::auth::AuthState::hash_password(&password);
@@ -54,6 +68,10 @@ fn main() -> Result<()> {
         );
         println!("Generated admin password:");
         println!("{}", password);
+        let abs_path = std::fs::canonicalize(db_path)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| db_path.display().to_string());
+        eprintln!("Updated database: {}", abs_path);
         eprintln!("Note: existing web sessions will be invalidated when the server is restarted.");
         return Ok(());
     }
@@ -106,7 +124,7 @@ fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
 const CSP_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'";
 
 async fn run_server(cli: Cli) -> Result<()> {
-    let pool = db::create_pool("rustblocker.db").context("Failed to create SQLite database")?;
+    let pool = db::create_pool(cli.db_path()).context("Failed to create SQLite database")?;
 
     db::seed_defaults(&pool);
 

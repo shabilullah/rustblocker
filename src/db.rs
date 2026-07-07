@@ -2,18 +2,20 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tracing::info;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-pub fn create_pool(db_path: &str) -> Result<DbPool, r2d2::Error> {
-    let manager = SqliteConnectionManager::file(db_path);
+pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, r2d2::Error> {
+    let path = db_path.as_ref();
+    let manager = SqliteConnectionManager::file(path);
     let pool = Pool::new(manager)?;
     {
         let conn = pool.get().expect("failed to get DB connection");
         init_schema(&conn);
     }
-    info!("SQLite database ready: {}", db_path);
+    info!("SQLite database ready: {}", path.display());
     Ok(pool)
 }
 
