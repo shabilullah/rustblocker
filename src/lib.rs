@@ -7,5 +7,6 @@ pub mod forwarder;
 pub mod handler;
 pub mod lists;
 pub mod stats;
+pub mod sync;
 
 pub mod update;

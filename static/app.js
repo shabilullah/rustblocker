@@ -28,7 +28,7 @@
             case 'blocklist': return loadDomainList('blocklist');
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
-            case 'settings': loadSettings(); autoCheckUpdate(); return;
+            case 'settings': loadSettings(); loadSyncConfig(); autoCheckUpdate(); return;
             case 'stats': return loadStats();
         }
     }
@@ -452,6 +452,125 @@
         }
     }
 
+    // --- Sync config ---
+
+    async function loadSyncConfig() {
+        try {
+            const data = await fetch(API + '/sync/config').then(r => r.json());
+            document.getElementById('sync-enabled').checked = !!data.enabled;
+            document.getElementById('sync-master-url').value = data.master_url || '';
+            document.getElementById('sync-interval').value = data.interval_secs || 30;
+            const hint = document.getElementById('sync-password-hint');
+            hint.textContent = data.password_set ? '(password saved)' : '(not set)';
+        } catch (e) {
+            console.warn('Failed to load sync config', e);
+        }
+    }
+
+    async function saveSyncConfig() {
+        const enabled = document.getElementById('sync-enabled').checked;
+        const master_url = document.getElementById('sync-master-url').value.trim();
+        const password = document.getElementById('sync-password').value;
+        const interval_secs = parseInt(document.getElementById('sync-interval').value, 10) || 30;
+        const status = document.getElementById('sync-status');
+
+        if (enabled && !master_url) {
+            status.textContent = 'Master URL is required when sync is enabled.';
+            status.className = 'text-sm text-red-400';
+            return;
+        }
+
+        try {
+            const resp = await fetch(API + '/sync/config', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled, master_url, password, interval_secs})
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) {
+                status.textContent = 'Saved. Restart required for changes to take effect.';
+                status.className = 'text-sm text-amber-400';
+                // Clear password field and refresh hint
+                document.getElementById('sync-password').value = '';
+                const hint = document.getElementById('sync-password-hint');
+                if (password) hint.textContent = '(password saved)';
+            } else {
+                status.textContent = data.error || 'Failed to save.';
+                status.className = 'text-sm text-red-400';
+            }
+        } catch (e) {
+            status.textContent = 'Request failed: ' + e.message;
+            status.className = 'text-sm text-red-400';
+        }
+    }
+
+    // --- Sync status polling ---
+    let _syncPollTimer = null;
+
+    function startSyncStatusPoll() {
+        if (_syncPollTimer) return;
+        updateSyncStatus(); // immediate
+        _syncPollTimer = setInterval(updateSyncStatus, 15000);
+    }
+
+    function stopSyncStatusPoll() {
+        if (_syncPollTimer) { clearInterval(_syncPollTimer); _syncPollTimer = null; }
+    }
+
+    async function updateSyncStatus() {
+        try {
+            const data = await fetch(API + '/sync/status').then(r => r.json());
+            renderSyncUI(data);
+        } catch { /* silent — network error, don't flash error state */ }
+    }
+
+    function renderSyncUI(data) {
+        // status: 'ok' | 'connecting' | 'error' | 'disabled'
+        const pill     = document.getElementById('sync-pill');
+        const pillDot  = document.getElementById('sync-pill-dot');
+        const pillLabel = document.getElementById('sync-pill-label');
+        const badge     = document.getElementById('sync-connection-badge');
+        const badgeDot  = document.getElementById('sync-badge-dot');
+        const badgeLabel = document.getElementById('sync-badge-label');
+
+        if (data.status === 'disabled') {
+            pill.classList.add('hidden');  pill.classList.remove('flex');
+            badge.classList.add('hidden'); badge.classList.remove('flex');
+            return;
+        }
+
+        const scheme = {
+            ok:         { dot: 'bg-emerald-400', border: 'border-emerald-700', text: 'text-emerald-400', pulse: true,  label: 'Replica' },
+            connecting: { dot: 'bg-amber-400',   border: 'border-amber-700',   text: 'text-amber-400',   pulse: true,  label: 'Connecting…' },
+            error:      { dot: 'bg-red-400',     border: 'border-red-700',     text: 'text-red-400',     pulse: false, label: 'Sync error' },
+        }[data.status] || { dot: 'bg-gray-400', border: 'border-gray-600', text: 'text-gray-400', pulse: false, label: data.status };
+
+        function applyScheme(el, dot, label, extraLabel) {
+            el.className = el.className.replace(/\b(border-\S+|text-\S+)\b/g, '').trim();
+            el.classList.add('flex', 'items-center', 'gap-1.5', 'text-xs', 'font-medium', 'px-2', 'py-0.5', 'rounded-full', 'border', scheme.border, scheme.text);
+            el.classList.remove('hidden');
+            dot.className = 'inline-block w-2 h-2 rounded-full ' + scheme.dot + (scheme.pulse ? ' animate-pulse' : '');
+            label.textContent = extraLabel || scheme.label;
+        }
+
+        // header pill
+        const pillText = (data.status === 'ok' && data.master_url) ? 'Replica' : scheme.label;
+        applyScheme(pill, pillDot, pillLabel, pillText);
+        pill.title = (data.status === 'ok' && data.last_sync)
+            ? 'Last sync: ' + Math.round((Date.now() / 1000 - data.last_sync)) + 's ago'
+            : (data.error || 'Replica sync ' + data.status);
+
+        // settings badge
+        let badgeText = scheme.label;
+        if (data.status === 'ok' && data.last_sync) {
+            const ago = Math.round((Date.now() / 1000 - data.last_sync));
+            badgeText = 'Connected · ' + (ago < 60 ? ago + 's ago' : Math.round(ago / 60) + 'm ago');
+        } else if (data.status === 'error' && data.error) {
+            badgeText = data.error;
+        }
+        applyScheme(badge, badgeDot, badgeLabel, badgeText);
+    }
+
     function formatLatency(us) {
         if (us == null) return '-';
         if (us >= 1000) return (us / 1000).toFixed(1) + ' ms';
@@ -736,6 +855,7 @@
 
     function showLogin() {
         stopDashboardPoll();
+        stopSyncStatusPoll();
         disconnectSSE();
         document.getElementById('app-content').classList.add('hidden');
         document.getElementById('login-screen').classList.remove('hidden');
@@ -746,6 +866,7 @@
     function showApp() {
         document.getElementById('login-screen').classList.add('hidden');
         document.getElementById('app-content').classList.remove('hidden');
+        startSyncStatusPoll();
     }
 
     async function init() {
@@ -848,6 +969,7 @@ function attachListeners() {
     document.getElementById('allowlist-url-btn')?.addEventListener('click', () => importUrl('allowlist'));
     document.getElementById('add-rewrite-btn')?.addEventListener('click', addRewrite);
     document.getElementById('save-settings-btn')?.addEventListener('click', saveSettings);
+    document.getElementById('save-sync-btn')?.addEventListener('click', saveSyncConfig);
     document.getElementById('update-apply-btn')?.addEventListener('click', applyUpdate);
     document.getElementById('change-password-btn')?.addEventListener('click', changePassword);
     document.getElementById('live-btn')?.addEventListener('click', toggleLive);

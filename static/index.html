@@ -41,6 +41,10 @@
                     <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                 </svg>
             </button>
+          <span id="sync-pill" class="hidden items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full border" title="Replica sync status">
+            <span id="sync-pill-dot" class="inline-block w-2 h-2 rounded-full"></span>
+            <span id="sync-pill-label">Sync</span>
+          </span>
         </div>
         <button id="logout-btn" class="text-sm text-gray-400 hover:text-gray-200">Logout</button>
     </nav>
@@ -235,6 +239,40 @@
                 <div class="flex items-center gap-3 mt-4">
                     <button id="change-password-btn" class="bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Change Password</button>
                     <span id="password-status" class="text-sm"></span>
+                </div>
+            </div>
+
+            <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 mt-6">
+                <h2 class="text-lg font-semibold mb-1">Sync (Replica Mode)</h2>
+                <p class="text-sm text-gray-400 mb-4">Pull all settings, upstreams, blocklist, allowlist, rewrites and sources from a master instance. Requires a restart to take effect.</p>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="md:col-span-2 flex items-center gap-3">
+                        <input id="sync-enabled" type="checkbox" class="w-4 h-4 accent-emerald-500">
+                        <label for="sync-enabled" class="text-sm text-gray-300">Enable sync (replica mode)</label>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Master URL</label>
+                        <input id="sync-master-url" type="text" placeholder="http://192.168.1.1:54"
+                            class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-gray-400 mb-1">Poll Interval (seconds)</label>
+                        <input id="sync-interval" type="number" min="5" placeholder="30"
+                            class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="block text-sm text-gray-400 mb-1">Master Password <span id="sync-password-hint" class="text-xs text-gray-500 ml-1"></span></label>
+                        <input id="sync-password" type="password" placeholder="Leave blank to keep existing password"
+                            class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
+                    </div>
+                </div>
+                <div class="flex items-center gap-3 mt-4">
+                    <button id="save-sync-btn" class="bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Save Sync Config</button>
+                    <span id="sync-status" class="text-sm text-gray-400"></span>
+              <span id="sync-connection-badge" class="hidden items-center gap-1.5 text-xs px-2 py-0.5 rounded-full border">
+                <span id="sync-badge-dot" class="inline-block w-2 h-2 rounded-full"></span>
+                <span id="sync-badge-label"></span>
+              </span>
                 </div>
             </div>
         </div>

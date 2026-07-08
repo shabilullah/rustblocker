@@ -191,7 +191,7 @@ pub fn get_settings(pool: &DbPool) -> serde_json::Value {
 
     let mut map = serde_json::Map::new();
     for (key, value) in rows {
-        if key == "admin_password_hash" || key == "session_secret" {
+        if key == "admin_password_hash" || key == "session_secret" || key == "sync_password" {
             continue; // never expose sensitive auth state through the settings API
         }
         map.insert(key, serde_json::Value::String(value));
@@ -556,4 +556,174 @@ pub async fn refresh_source(
 
     info!("Source refreshed: {} -> {}", source.url, status);
     status
+}
+// --- Sync manifest ---
+
+/// Compute a deterministic SHA-256 hash for each sync category so slaves can
+/// detect what changed without fetching full payloads every poll cycle.
+///
+/// Returns a map of category name → hex-encoded SHA-256 digest.
+pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let conn = pool.get().expect("failed to get DB connection");
+    let mut map = std::collections::HashMap::new();
+
+    // settings — sorted key=value pairs, excluding auth secrets
+    {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM settings WHERE key != 'admin_password_hash' AND key != 'session_secret' ORDER BY key")
+            .unwrap();
+        let pairs: Vec<String> = stmt
+            .query_map([], |row| {
+                let k: String = row.get(0)?;
+                let v: String = row.get(1)?;
+                Ok(format!("{}={}", k, v))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut h = Sha256::new();
+        for p in &pairs {
+            h.update(p.as_bytes());
+            h.update(b"\n");
+        }
+        map.insert("settings".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    // upstreams — sorted address:port
+    {
+        let mut stmt = conn
+            .prepare("SELECT address, port FROM upstreams ORDER BY address, port")
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |row| {
+                let a: String = row.get(0)?;
+                let p: i64 = row.get(1)?;
+                Ok(format!("{}:{}", a, p))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut h = Sha256::new();
+        for r in &rows {
+            h.update(r.as_bytes());
+            h.update(b"\n");
+        }
+        map.insert("upstreams".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    // rewrites — sorted domain
+    {
+        let mut stmt = conn
+            .prepare("SELECT domain, ipv4, ipv6 FROM rewrites ORDER BY domain")
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |row| {
+                let d: String = row.get(0)?;
+                let v4: Option<String> = row.get(1)?;
+                let v6: Option<String> = row.get(2)?;
+                Ok(format!(
+                    "{}|{}|{}",
+                    d,
+                    v4.as_deref().unwrap_or(""),
+                    v6.as_deref().unwrap_or("")
+                ))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut h = Sha256::new();
+        for r in &rows {
+            h.update(r.as_bytes());
+            h.update(b"\n");
+        }
+        map.insert("rewrites".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    // sources — sorted url
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT url, list_type, enabled, update_interval_hours FROM sources ORDER BY url",
+            )
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |row| {
+                let url: String = row.get(0)?;
+                let lt: String = row.get(1)?;
+                let en: i64 = row.get(2)?;
+                let ih: i64 = row.get(3)?;
+                Ok(format!("{}|{}|{}|{}", url, lt, en, ih))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut h = Sha256::new();
+        for r in &rows {
+            h.update(r.as_bytes());
+            h.update(b"\n");
+        }
+        map.insert("sources".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    // blocklist — sorted domain
+    {
+        let mut h = Sha256::new();
+        let mut stmt = conn
+            .prepare("SELECT domain FROM blocklist_domains ORDER BY domain")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .for_each(|d| {
+                h.update(d.as_bytes());
+                h.update(b"\n");
+            });
+        map.insert("blocklist".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    // allowlist — sorted domain
+    {
+        let mut h = Sha256::new();
+        let mut stmt = conn
+            .prepare("SELECT domain FROM allowlist_domains ORDER BY domain")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .for_each(|d| {
+                h.update(d.as_bytes());
+                h.update(b"\n");
+            });
+        map.insert("allowlist".to_string(), format!("{:x}", h.finalize()));
+    }
+
+    map
+}
+
+/// Return a full snapshot of a single sync category as JSON.
+/// Used by the slave to fetch only categories whose hash changed.
+pub fn sync_snapshot(pool: &DbPool, category: &str) -> Option<serde_json::Value> {
+    match category {
+        "settings" => Some(get_settings(pool)),
+        "upstreams" => Some(serde_json::to_value(get_upstreams(pool)).unwrap_or_default()),
+        "rewrites" => Some(serde_json::to_value(get_rewrites(pool)).unwrap_or_default()),
+        "sources" => Some(serde_json::to_value(get_sources(pool)).unwrap_or_default()),
+        "blocklist" => {
+            let domains: Vec<String> = get_domains(pool, "blocklist_domains")
+                .into_iter()
+                .map(|d| d.domain)
+                .collect();
+            Some(serde_json::to_value(domains).unwrap_or_default())
+        }
+        "allowlist" => {
+            let domains: Vec<String> = get_domains(pool, "allowlist_domains")
+                .into_iter()
+                .map(|d| d.domain)
+                .collect();
+            Some(serde_json::to_value(domains).unwrap_or_default())
+        }
+        _ => None,
+    }
 }

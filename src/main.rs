@@ -20,6 +20,7 @@ use rustblocker::lists::{
     AllowlistStore, BlocklistStore, DomainStore, RewriteMap, normalize_domain,
 };
 use rustblocker::stats::QueryLog;
+use rustblocker::sync;
 
 #[derive(Parser)]
 #[command(name = "rustblocker", about = "A DNS blocker written in Rust", version)]
@@ -39,6 +40,18 @@ struct Cli {
     /// Path to the SQLite database (default: rustblocker.db in current directory)
     #[arg(long, value_name = "PATH")]
     db_path: Option<PathBuf>,
+
+    /// Sync slave mode: URL of the master RustBlocker (overrides DB setting)
+    #[arg(long, value_name = "URL")]
+    sync_master: Option<String>,
+
+    /// Password to authenticate with the master (overrides DB setting)
+    #[arg(long, value_name = "PASSWORD")]
+    sync_password: Option<String>,
+
+    /// Poll interval seconds (overrides DB setting, default: 30)
+    #[arg(long, value_name = "SECS")]
+    sync_interval: Option<u64>,
 }
 
 impl Cli {
@@ -300,6 +313,10 @@ async fn run_server(cli: Cli) -> Result<()> {
     let forwarder_data = actix_web::web::Data::new(forwarder.clone());
     let sinkhole_v4_data = actix_web::web::Data::new(sinkhole_ipv4.clone());
     let sinkhole_v6_data = actix_web::web::Data::new(sinkhole_ipv6.clone());
+    let sync_state: rustblocker::sync::SharedSyncState = Arc::new(parking_lot::Mutex::new(
+        rustblocker::sync::SyncState::default(),
+    ));
+    let sync_state_data = actix_web::web::Data::new(sync_state.clone());
     let session_secret = db::get_setting(&pool, "session_secret")
         .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
         .unwrap_or_else(|| {
@@ -335,6 +352,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(sinkhole_v4_data.clone())
                 .app_data(sinkhole_v6_data.clone())
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
+                .app_data(sync_state_data.clone())
                 .configure(api::configure)
                 .route(
                     "/",
@@ -433,6 +451,51 @@ async fn run_server(cli: Cli) -> Result<()> {
             }
         }
     });
+    // Sync slave: read config from DB (CLI args override DB values).
+    {
+        let cli_had_sync_master = cli.sync_master.is_some();
+        let master_url = cli
+            .sync_master
+            .or_else(|| db::get_setting(&pool, "sync_master"))
+            .unwrap_or_default();
+        let enabled: bool = db::get_setting(&pool, "sync_enabled")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let password = cli
+            .sync_password
+            .or_else(|| db::get_setting(&pool, "sync_password"))
+            .unwrap_or_default();
+        let interval_secs = cli
+            .sync_interval
+            .or_else(|| db::get_setting(&pool, "sync_interval_secs").and_then(|v| v.parse().ok()))
+            .unwrap_or(30);
+
+        if !master_url.is_empty() && (enabled || cli_had_sync_master) {
+            if password.is_empty() {
+                warn!(
+                    "Sync master configured but sync_password is empty; sync will fail authentication"
+                );
+            }
+            let sync_cfg = sync::SyncConfig {
+                master_url: master_url.clone(),
+                password,
+                interval: Duration::from_secs(interval_secs),
+            };
+            sync::spawn(
+                sync_cfg,
+                pool.clone(),
+                blocklist.clone(),
+                allowlist.clone(),
+                rewrites.clone(),
+                forwarder.clone(),
+                sync_state.clone(),
+            );
+            info!(
+                "Sync slave started, polling master {} every {}s",
+                master_url, interval_secs
+            );
+        }
+    }
 
     tokio::select! {
         result = web_handle => {

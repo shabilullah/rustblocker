@@ -14,6 +14,7 @@ use crate::db::{self, DbPool};
 use crate::forwarder::ParallelForwarder;
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
+use crate::sync::SharedSyncState;
 use crate::update;
 
 #[derive(Debug, Deserialize)]
@@ -842,6 +843,109 @@ fn reload_domain_store(pool: &DbPool, table: &str, store: &Arc<RwLock<DomainStor
     }
 }
 
+// --- Sync config (slave-side settings stored in DB) ---
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SyncConfig {
+    enabled: bool,
+    master_url: String,
+    password: String,
+    interval_secs: u64,
+}
+
+async fn get_sync_config(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    // Return config but never expose the stored password — just whether it is set.
+    let master_url = db::get_setting(&pool, "sync_master").unwrap_or_default();
+    let enabled: bool = db::get_setting(&pool, "sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let interval_secs: u64 = db::get_setting(&pool, "sync_interval_secs")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let password_set = db::get_setting(&pool, "sync_password")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    HttpResponse::Ok().json(serde_json::json!({
+        "enabled": enabled,
+        "master_url": master_url,
+        "password_set": password_set,
+        "interval_secs": interval_secs,
+    }))
+}
+
+async fn put_sync_config(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<SyncConfig>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    db::set_setting(
+        &pool,
+        "sync_enabled",
+        if body.enabled { "true" } else { "false" },
+    );
+    db::set_setting(&pool, "sync_master", &body.master_url);
+    db::set_setting(&pool, "sync_interval_secs", &body.interval_secs.to_string());
+    // Only update password if a non-empty value was sent (empty = keep existing).
+    if !body.password.is_empty() {
+        db::set_setting(&pool, "sync_password", &body.password);
+    }
+    HttpResponse::Ok().json(serde_json::json!({"ok": true, "restart_required": true}))
+}
+
+// --- Sync (master-side endpoints) ---
+
+async fn sync_manifest(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let hashes = db::sync_manifest(&pool);
+    HttpResponse::Ok().json(serde_json::json!({"hashes": hashes}))
+}
+
+async fn sync_snapshot(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    path: web::Path<String>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let category = path.into_inner();
+    match db::sync_snapshot(&pool, &category) {
+        Some(data) => HttpResponse::Ok().json(data),
+        None => HttpResponse::NotFound()
+            .json(serde_json::json!({"error": format!("unknown category: {}", category)})),
+    }
+}
+
+async fn get_sync_status(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    state: web::Data<SharedSyncState>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let s = state.lock().clone();
+    HttpResponse::Ok().json(s)
+}
+
 /// Configure all API routes.
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -878,6 +982,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/stats/queries", web::get().to(get_queries))
             .route("/stats", web::delete().to(clear_stats))
             .route("/stats/live", web::get().to(live_queries))
-            .route("/restart", web::post().to(restart_server)),
+            .route("/restart", web::post().to(restart_server))
+            .route("/sync/manifest", web::get().to(sync_manifest))
+            .route("/sync/snapshot/{category}", web::get().to(sync_snapshot))
+            .route("/sync/config", web::get().to(get_sync_config))
+            .route("/sync/config", web::put().to(put_sync_config))
+            .route("/sync/status", web::get().to(get_sync_status)),
     );
 }

@@ -21,6 +21,7 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 - **Hosts file format** — auto-strips `0.0.0.0` / `127.0.0.1` prefixes
 - **Admin password authentication** — login-protected web UI, password generated/reset via CLI (`--genpass`)
 - **Security headers** — CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
+- **Replica sync** — configure a second RustBlocker as a replica; it polls a master and pulls only changed categories (hash-diffed, efficient for large blocklists)
 
 ## Quick Start
 
@@ -108,7 +109,7 @@ The first time you open it, a login screen asks for the admin password. There is
 - **Blocklist** — add, remove, bulk import, search/paginate blocked domains; import from URL
 - **Allowlist** — add, remove, bulk import, search/paginate allowed domains; import from URL
 - **Rewrites** — manage DNS rewrite rules (domain → custom IP)
-- **Settings** — configure listen address, port, sinkhole IPs, upstream timeout
+- **Settings** — configure listen address, port, sinkhole IPs, upstream timeout, and replica sync config
 - **Theme** — dark mode with TailwindCSS
 
 Changes to blocklist, allowlist, and rewrites take effect **immediately**. Changes to settings (listen address, port, sinkhole IPs) require a restart.
@@ -157,6 +158,10 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 | `GET` | `/api/stats/queries` | Get recent query log (paginated) |
 | `GET` | `/api/stats/live` | Live query stream (SSE) |
 | `DELETE` | `/api/stats` | Clear all query statistics |
+| `GET` | `/api/sync/config` | Get replica sync configuration (password masked) |
+| `PUT` | `/api/sync/config` | Save replica sync configuration |
+| `GET` | `/api/sync/manifest` | (Master) Per-category SHA-256 hashes for change detection |
+| `GET` | `/api/sync/snapshot/{category}` | (Master) Full data snapshot for one category |
 
 ### Example API usage
 
@@ -228,6 +233,79 @@ curl -X POST http://127.0.0.1:54/api/blocklist/import \
 ```
 
 This fetches the URL, parses all domains (including hosts-file format), and imports them. Use this for one-time imports; use Sources for recurring updates.
+
+## Replica Sync
+
+RustBlocker supports a master/replica setup where a second instance automatically mirrors all configuration from a primary instance. The replica polls the master periodically and only fetches categories (settings, upstreams, blocklist, allowlist, rewrites, sources) whose content has changed — so a 100k-domain blocklist is not re-downloaded on every poll, only when it actually changes.
+
+### How it works
+
+1. The master runs normally with no special configuration.
+2. The replica authenticates to the master using the master's admin password, then polls `GET /api/sync/manifest` at the configured interval.
+3. The manifest returns a SHA-256 hash per category. When a hash differs from the last-seen value, the replica fetches `GET /api/sync/snapshot/{category}` and applies the update atomically.
+4. The in-memory DNS stores (blocklist, allowlist, rewrites) are hot-reloaded — DNS resolution on the replica reflects the change on the next query.
+
+### Setup via the web UI
+
+On the **replica** instance:
+
+1. Open the web UI → **Settings** tab → scroll to **Sync (Replica Mode)**
+2. Check **Enable sync (replica mode)**
+3. Enter the master's URL (e.g. `http://192.168.1.1:54`)
+4. Enter the master's admin password
+5. Set the poll interval (default: 30 seconds)
+6. Click **Save Sync Config**
+7. Restart the replica (the prompt appears automatically)
+
+After restart the replica begins syncing. The password is stored in the replica's SQLite database and is never returned by the API.
+
+### Setup via the API
+
+```bash
+# Configure the replica to mirror http://192.168.1.1:54
+curl -b jar.txt -X PUT http://192.168.1.2:54/api/sync/config \
+  -H "Content-Type: application/json" \
+  -d '{
+    "enabled": true,
+    "master_url": "http://192.168.1.1:54",
+    "password": "<master-admin-password>",
+    "interval_secs": 30
+  }'
+
+# Check current sync config (password masked)
+curl -b jar.txt http://192.168.1.2:54/api/sync/config
+# {"enabled":true,"master_url":"http://192.168.1.1:54","password_set":true,"interval_secs":30}
+```
+
+Then restart the replica for the setting to take effect.
+
+### What syncs and what doesn't
+
+| Category | Synced | Notes |
+|----------|--------|-------|
+| Blocklist | Yes | Full replace on change |
+| Allowlist | Yes | Full replace on change |
+| Rewrites | Yes | Full replace on change |
+| Upstreams | Yes | Hot-reloads forwarder |
+| Sources | Yes | URL list only, not domain contents |
+| Settings | Yes (partial) | See below |
+| Listen address / port | **No** | Replica keeps its own |
+| Allowed networks (ACL) | **No** | Replica keeps its own |
+| Admin password | **No** | Never synced |
+
+Settings that could lock the replica admin out (`listen_address`, `listen_port`, `allowed_networks`) or compromise credentials (`admin_password_hash`, `session_secret`, `sync_password`) are never overwritten by sync.
+
+### CLI overrides
+
+The DB-based sync config can be overridden at startup with CLI flags (useful for scripted deployments):
+
+```bash
+rustblocker --sync-master http://192.168.1.1:54 \
+             --sync-password <master-admin-password> \
+             --sync-interval 30
+```
+
+CLI flags take precedence over the stored DB config. `--sync-master` alone also bypasses the `sync_enabled` flag in the DB.
 
 
 ## Blocklist Format
@@ -409,6 +487,13 @@ Web UI + API (actix-web on port+1)
      ├─ SQLite database (rustblocker.db)
      ├─ Hot-reload Arc<RwLock<>> stores
      └─ Changes take effect immediately
+
+Replica Sync (sync.rs — slave side)
+     │
+     ├─ POST /api/auth/login      → authenticate to master
+     ├─ GET  /api/sync/manifest   → SHA-256 hash per category
+     ├─ diff vs. last-seen hashes
+     └─ GET  /api/sync/snapshot/{category} → fetch & apply only changed
 ```
 
 ## License
