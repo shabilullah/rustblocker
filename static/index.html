@@ -244,7 +244,7 @@
 
             <div class="bg-gray-800 rounded-lg p-6 border border-gray-700 mt-6">
                 <h2 class="text-lg font-semibold mb-1">Sync (Replica Mode)</h2>
-                <p class="text-sm text-gray-400 mb-4">Pull all settings, upstreams, blocklist, allowlist, rewrites and sources from a master instance. Requires a restart to take effect.</p>
+                <p class="text-sm text-gray-400 mb-4">Pull all settings, upstreams, blocklist, allowlist, rewrites and sources from a master instance.</p>
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div class="md:col-span-2 flex items-center gap-3">
                         <input id="sync-enabled" type="checkbox" class="w-4 h-4 accent-emerald-500">
@@ -266,13 +266,14 @@
                             class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">
                     </div>
                 </div>
-                <div class="flex items-center gap-3 mt-4">
-                    <button id="save-sync-btn" class="bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium">Save Sync Config</button>
+                <div class="flex items-center gap-3 mt-4 flex-wrap">
+                    <button id="test-sync-btn" class="bg-gray-600 hover:bg-gray-500 px-4 py-2 rounded text-sm font-medium">Test Connection</button>
+                    <button id="save-sync-btn" class="bg-emerald-600 hover:bg-emerald-700 px-6 py-2 rounded text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed" disabled>Save &amp; Restart</button>
                     <span id="sync-status" class="text-sm text-gray-400"></span>
-              <span id="sync-connection-badge" class="hidden items-center gap-1.5 text-xs px-2 py-0.5 rounded-full border">
-                <span id="sync-badge-dot" class="inline-block w-2 h-2 rounded-full"></span>
-                <span id="sync-badge-label"></span>
-              </span>
+                    <span id="sync-connection-badge" class="hidden items-center gap-1.5 text-xs px-2 py-0.5 rounded-full border">
+                        <span id="sync-badge-dot" class="inline-block w-2 h-2 rounded-full"></span>
+                        <span id="sync-badge-label"></span>
+                    </span>
                 </div>
             </div>
         </div>

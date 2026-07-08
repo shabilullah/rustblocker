@@ -946,6 +946,77 @@ async fn get_sync_status(
     HttpResponse::Ok().json(s)
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncVerifyPayload {
+    master_url: String,
+    password: Option<String>,
+}
+
+async fn verify_sync_connection(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<SyncVerifyPayload>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    let master_url = body.master_url.trim_end_matches('/').to_string();
+
+    // Resolve password: use provided value or fall back to saved sync_password.
+    let pw = match &body.password {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => match db::get_setting(&pool, "sync_password") {
+            Some(saved) if !saved.is_empty() => saved,
+            _ => {
+                return HttpResponse::Ok()
+                    .json(serde_json::json!({"ok": false, "error": "No password provided"}));
+            }
+        },
+    };
+
+    let client = match reqwest::Client::builder()
+        .cookie_store(true)
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return HttpResponse::Ok()
+                .json(serde_json::json!({"ok": false, "error": e.to_string()}));
+        }
+    };
+
+    let login_url = format!("{}/api/auth/login", master_url);
+    let result = client
+        .post(&login_url)
+        .json(&serde_json::json!({"password": pw}))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(json) if json.get("authenticated") == Some(&serde_json::Value::Bool(true)) => {
+                HttpResponse::Ok().json(serde_json::json!({"ok": true}))
+            }
+            Ok(_) => HttpResponse::Ok()
+                .json(serde_json::json!({"ok": false, "error": "Authentication failed"})),
+            Err(e) => {
+                HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": e.to_string()}))
+            }
+        },
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            HttpResponse::Ok().json(
+                serde_json::json!({"ok": false, "error": format!("HTTP {status}")}
+                ),
+            )
+        }
+        Err(e) => HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
 /// Configure all API routes.
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
@@ -987,6 +1058,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sync/snapshot/{category}", web::get().to(sync_snapshot))
             .route("/sync/config", web::get().to(get_sync_config))
             .route("/sync/config", web::put().to(put_sync_config))
-            .route("/sync/status", web::get().to(get_sync_status)),
+            .route("/sync/status", web::get().to(get_sync_status))
+            .route("/sync/verify", web::post().to(verify_sync_connection)),
     );
 }

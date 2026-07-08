@@ -462,6 +462,11 @@
             document.getElementById('sync-interval').value = data.interval_secs || 30;
             const hint = document.getElementById('sync-password-hint');
             hint.textContent = data.password_set ? '(password saved)' : '(not set)';
+            // Re-enable Save if this node is already configured — no need to re-verify
+            const saveBtn = document.getElementById('save-sync-btn');
+            if (saveBtn && data.enabled && data.master_url) {
+                saveBtn.disabled = false;
+            }
         } catch (e) {
             console.warn('Failed to load sync config', e);
         }
@@ -473,12 +478,17 @@
         const password = document.getElementById('sync-password').value;
         const interval_secs = parseInt(document.getElementById('sync-interval').value, 10) || 30;
         const status = document.getElementById('sync-status');
+        const saveBtn = document.getElementById('save-sync-btn');
 
         if (enabled && !master_url) {
             status.textContent = 'Master URL is required when sync is enabled.';
             status.className = 'text-sm text-red-400';
             return;
         }
+
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving...';
+        status.textContent = '';
 
         try {
             const resp = await fetch(API + '/sync/config', {
@@ -487,21 +497,97 @@
                 body: JSON.stringify({enabled, master_url, password, interval_secs})
             });
             const data = await resp.json().catch(() => ({}));
-            if (resp.ok) {
-                status.textContent = 'Saved. Restart required for changes to take effect.';
-                status.className = 'text-sm text-amber-400';
-                // Clear password field and refresh hint
-                document.getElementById('sync-password').value = '';
-                const hint = document.getElementById('sync-password-hint');
-                if (password) hint.textContent = '(password saved)';
-            } else {
+            if (!resp.ok) {
                 status.textContent = data.error || 'Failed to save.';
                 status.className = 'text-sm text-red-400';
+                saveBtn.disabled = false;
+                saveBtn.textContent = 'Save & Restart';
+                return;
+            }
+            // Clear password field and refresh hint
+            document.getElementById('sync-password').value = '';
+            const hint = document.getElementById('sync-password-hint');
+            if (password) hint.textContent = '(password saved)';
+            // Trigger restart then poll until back up
+            status.textContent = 'Saved. Restarting...';
+            status.className = 'text-sm text-amber-400';
+            try {
+                await fetch(API + '/restart', {method: 'POST'});
+            } catch (_) { /* server may close the connection immediately */ }
+            await syncWaitForRestart();
+        } catch (e) {
+            status.textContent = 'Request failed: ' + e.message;
+            status.className = 'text-sm text-red-400';
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save & Restart';
+        }
+    }
+
+    async function verifySyncConnection() {
+        const btn = document.getElementById('test-sync-btn');
+        const saveBtn = document.getElementById('save-sync-btn');
+        const status = document.getElementById('sync-status');
+        const masterUrl = document.getElementById('sync-master-url').value.trim();
+        const password = document.getElementById('sync-password').value;
+
+        if (!masterUrl) {
+            status.textContent = 'Enter a Master URL first.';
+            status.className = 'text-sm text-red-400';
+            return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = 'Testing...';
+        status.textContent = '';
+        saveBtn.disabled = true;
+
+        try {
+            const resp = await fetch(API + '/sync/verify', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({master_url: masterUrl, password: password || null})
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok && data.ok) {
+                status.textContent = 'Connection successful.';
+                status.className = 'text-sm text-emerald-400';
+                saveBtn.disabled = false;
+            } else {
+                status.textContent = 'Connection failed: ' + (data.error || 'Unknown error');
+                status.className = 'text-sm text-red-400';
+                saveBtn.disabled = true;
             }
         } catch (e) {
             status.textContent = 'Request failed: ' + e.message;
             status.className = 'text-sm text-red-400';
+            saveBtn.disabled = true;
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Test Connection';
         }
+    }
+
+    async function syncWaitForRestart() {
+        const status = document.getElementById('sync-status');
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+            await new Promise(r => setTimeout(r, 2000));
+            attempts++;
+            try {
+                const r = await fetch(API + '/health');
+                if (r.ok) {
+                    status.textContent = 'Restarted. Reloading...';
+                    status.className = 'text-sm text-emerald-400';
+                    setTimeout(() => window.location.reload(), 1500);
+                    return;
+                }
+            } catch (_) { /* server down, keep polling */ }
+            status.textContent = 'Restarting... (' + attempts + ')';
+            status.className = 'text-sm text-amber-400';
+        }
+        status.textContent = 'Restart timed out \u2014 please refresh manually.';
+        status.className = 'text-sm text-red-400';
     }
 
     // --- Sync status polling ---
@@ -970,6 +1056,14 @@ function attachListeners() {
     document.getElementById('add-rewrite-btn')?.addEventListener('click', addRewrite);
     document.getElementById('save-settings-btn')?.addEventListener('click', saveSettings);
     document.getElementById('save-sync-btn')?.addEventListener('click', saveSyncConfig);
+    document.getElementById('test-sync-btn')?.addEventListener('click', verifySyncConnection);
+
+    // Re-disable Save & Restart when credentials change — forces re-verify
+    ['sync-master-url', 'sync-password'].forEach(id => {
+        document.getElementById(id)?.addEventListener('input', () => {
+            document.getElementById('save-sync-btn').disabled = true;
+        });
+    });
     document.getElementById('update-apply-btn')?.addEventListener('click', applyUpdate);
     document.getElementById('change-password-btn')?.addEventListener('click', changePassword);
     document.getElementById('live-btn')?.addEventListener('click', toggleLive);
