@@ -267,13 +267,20 @@ fn apply_settings(data: &serde_json::Value, pool: &DbPool) {
         }
     };
     // Never overwrite keys that are slave-local: network binding, ACL (could
-    // lock admin out if master's ACL differs), and auth secrets.
+    // lock admin out if master's ACL differs), auth secrets, sync config, and
+    // certificate settings for this node's own HTTPS endpoint.
     const SKIP: &[&str] = &[
         "listen_address",
         "listen_port",
         "allowed_networks",
         "admin_password_hash",
         "session_secret",
+        "domain",
+        "acme_email",
+        "acme_error",
+        "acme_directory_url",
+        "cloudflare_api_token",
+        "wildcard_cert",
         "sync_password",
         "sync_master",
         "sync_enabled",

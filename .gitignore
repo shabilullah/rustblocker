@@ -7,3 +7,4 @@ tag.md
 askpass.sh
 askpass.bat
 remote_downgrade.sh
+scripts/.deployenv

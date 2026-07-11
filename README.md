@@ -22,6 +22,9 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 - **Admin password authentication** — login-protected web UI, password generated/reset via CLI (`--genpass`)
 - **Security headers** — CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **Replica sync** — configure a second RustBlocker as a replica; it polls a master and pulls only changed categories (hash-diffed, efficient for large blocklists)
+- **HTTPS with ACME** — automatic Let's Encrypt certificate acquisition via DNS-01 challenge (Cloudflare)
+- **Auto-renewal** — background scheduler renews certificates 30 days before expiry
+- **Activity log** — real-time progress streaming for all operations (ACME, settings, restart) via SSE
 
 ## Quick Start
 
@@ -73,6 +76,9 @@ rustblocker                                    # Default: DNS 53, web 54
 rustblocker --dns-port 5353 --web-port 8080    # Custom ports (useful for local dev)
 sudo rustblocker --genpass                     # Generate/reset the admin password on a deployed service
 rustblocker --genpass --db-path /path/to/db    # Explicit database path (local dev)
+rustblocker                                      # HTTP, plus HTTPS on 443 when a valid cert exists
+rustblocker --https-port 8443                   # Use a custom HTTPS port when a valid cert exists
+rustblocker --force-http                        # Force HTTP-only even if HTTPS configured
 ```
 
 `--genpass` auto-detects the service database at `/var/lib/rustblocker/rustblocker.db` and restarts the `rustblocker` service when run as root, so existing web sessions are invalidated immediately.
@@ -110,6 +116,8 @@ The first time you open it, a login screen asks for the admin password. There is
 - **Allowlist** — add, remove, bulk import, search/paginate allowed domains; import from URL
 - **Rewrites** — manage DNS rewrite rules (domain → custom IP)
 - **Settings** — configure listen address, port, sinkhole IPs, upstream timeout, and replica sync config
+- **HTTPS** — manage TLS certificates, ACME settings, request/renew certificates with real-time progress
+- **Activity Log** — always-visible expandable panel showing live progress for all operations
 - **Theme** — dark mode with TailwindCSS
 
 Changes to blocklist, allowlist, and rewrites take effect **immediately**. Changes to settings (listen address, port, sinkhole IPs) require a restart.
@@ -120,7 +128,7 @@ RustBlocker uses SQLite (`rustblocker.db`) for all configuration:
 
 - **Created automatically** on first run with sensible defaults
 - **No config files needed** — everything is managed via web UI or API
-- **Stores**: settings, upstream servers, blocklist domains, allowlist domains, rewrite rules
+- **Stores**: settings, upstream servers, blocklist domains, allowlist domains, rewrite rules, TLS certificates
 - **Portable**: copy `rustblocker.db` to migrate all configuration
 
 ## REST API
@@ -162,6 +170,11 @@ All configuration is accessible via a REST API at `http://<listen_address>:<list
 | `PUT` | `/api/sync/config` | Save replica sync configuration |
 | `GET` | `/api/sync/manifest` | (Master) Per-category SHA-256 hashes for change detection |
 | `GET` | `/api/sync/snapshot/{category}` | (Master) Full data snapshot for one category |
+| `POST` | `/api/acme/request` | Request ACME certificate (background task) |
+| `POST` | `/api/acme/renew` | Force certificate renewal |
+| `GET` | `/api/acme/status` | Get certificate status (domain, expiry, days remaining) |
+| `GET` | `/api/activity/stream` | Activity log stream (SSE) — real-time progress for all operations |
+| `POST` | `/api/cloudflare/test` | Test Cloudflare API token validity |
 
 ### Example API usage
 
@@ -308,6 +321,97 @@ rustblocker --sync-master http://192.168.1.1:54 \
 CLI flags take precedence over the stored DB config. `--sync-master` alone also bypasses the `sync_enabled` flag in the DB.
 
 
+## HTTPS & ACME Certificate Management
+
+RustBlocker supports automatic HTTPS via Let's Encrypt using the ACME protocol with Cloudflare DNS-01 challenges. Certificates are stored in the SQLite database and auto-renewed 30 days before expiry.
+
+### Prerequisites
+
+- A domain managed by Cloudflare (e.g., `dns.example.com`)
+- A Cloudflare API token with `Zone.DNS: Edit` permission (create at [dash.cloudflare.com](https://dash.cloudflare.com) → API Tokens)
+- An email address for Let's Encrypt notifications
+
+### Setup via the web UI
+
+1. Open the web UI → **HTTPS** tab
+2. Enter your domain (e.g., `dns.example.com`)
+3. Enter your ACME email (for Let's Encrypt notifications)
+4. Enter your Cloudflare API token and click **Test Connection** to verify
+5. Optionally enable wildcard certificate (`*.domain.com`)
+6. Click **Save Settings**
+7. Click **Request Certificate** — real-time progress appears in the Activity Log panel
+8. After the certificate is verified and stored, RustBlocker automatically restarts so the supervised service comes back with HTTPS enabled
+
+### Setup via the API
+
+```bash
+# Configure HTTPS settings
+curl -b jar.txt -X PUT http://127.0.0.1:54/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{"key": "domain", "value": "dns.example.com"}'
+
+curl -b jar.txt -X PUT http://127.0.0.1:54/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{"key": "acme_email", "value": "admin@example.com"}'
+
+curl -b jar.txt -X PUT http://127.0.0.1:54/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{"key": "cloudflare_api_token", "value": "your-token-here"}'
+
+# Test the Cloudflare token
+curl -b jar.txt -X POST http://127.0.0.1:54/api/cloudflare/test \
+  -H "Content-Type: application/json" \
+  -d '{"api_token": "your-token-here"}'
+
+# Request a certificate (runs in background)
+curl -b jar.txt -X POST http://127.0.0.1:54/api/acme/request \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "dns.example.com", "wildcard": false}'
+
+# Check certificate status
+curl -b jar.txt http://127.0.0.1:54/api/acme/status
+```
+
+### Running with HTTPS
+
+```bash
+# Production: HTTPS is attempted automatically on port 443 when a valid cert exists.
+sudo rustblocker
+
+# Development: use a high HTTPS port when a valid cert exists.
+rustblocker --https-port 8443
+
+# HTTP-only (ignores any HTTPS configuration)
+rustblocker --force-http
+```
+
+By default, RustBlocker loads the certificate from the database and binds both HTTP and HTTPS on port 443 when a valid certificate exists. If no valid certificate is found, it runs HTTP-only with a warning. Use `--https-port` to choose a different HTTPS port, or `--force-http` to disable HTTPS even when a certificate exists. After a successful certificate request or renewal, RustBlocker exits after a short delay so OpenRC/systemd restarts it and HTTPS becomes available automatically.
+
+### Auto-renewal
+
+A background task checks every 24 hours for certificates expiring within 30 days and automatically renews them via ACME. On startup, RustBlocker also checks and warns about soon-expiring certificates.
+
+### Activity Log
+
+The **Activity Log** panel (bottom-right corner) shows real-time progress for all operations:
+- Certificate requests and renewals (every ACME step)
+- Settings saves
+- Server restarts
+- Cloudflare connection tests
+
+Click the panel header to expand/collapse. New entries appear with a badge counter when collapsed.
+
+### HTTPS Settings
+
+| Setting | Description |
+|---------|-------------|
+| `domain` | Primary domain for the certificate (e.g., `dns.example.com`) |
+| `acme_email` | Contact email for Let's Encrypt |
+| `cloudflare_api_token` | API token with `Zone.DNS:Edit` permission (masked in API responses) |
+| `wildcard_cert` | `true` to request `*.domain.com + domain.com`, `false` for domain only |
+| `acme_directory_url` | Let's Encrypt directory URL (defaults to production, override for staging testing) |
+
+
 ## Blocklist Format
 
 One entry per line. Lines starting with `#` are comments. Supports three formats:
@@ -374,6 +478,11 @@ Changes take effect immediately — no restart needed.
 | `log_level` | `info` | Log level (overridable via `RUST_LOG` env var) |
 | `upstream_timeout_secs` | `5` | Timeout for upstream DNS queries |
 | `allowed_networks` | empty | CIDR list for ACL (empty = allow all) |
+| `domain` | empty | Primary domain for HTTPS certificate |
+| `acme_email` | empty | Contact email for Let's Encrypt |
+| `cloudflare_api_token` | empty | Cloudflare API token (masked in API responses) |
+| `wildcard_cert` | `false` | Request wildcard certificate (`*.domain.com`) |
+| `acme_directory_url` | Let's Encrypt production | Override for staging/testing |
 
 ## Deploy on Alpine Linux
 
@@ -385,7 +494,7 @@ curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts
 
 ### Cross-compile from your machine
 
-The easiest way to deploy or upgrade is the install script (see [One-line install](#one-line-install)). It installs the real binary under `/usr/local/lib/rustblocker/`, creates a `/usr/local/bin/rustblocker` wrapper that defaults to the service database, and sets up the service with `--db-path`.
+The easiest way to deploy or upgrade is the install script (see [One-line install](#one-line-install)). It installs the real binary under `/usr/local/lib/rustblocker/`, creates a `/usr/local/bin/rustblocker` wrapper that defaults to the service database, and sets up the service with the service database. HTTPS does not require service flags; the binary binds HTTPS on port 443 automatically when a valid certificate exists.
 
 To build from a non-Linux host (e.g. Windows), `cargo zigbuild` is recommended:
 
@@ -403,6 +512,27 @@ cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 Then copy the binary to `/usr/local/lib/rustblocker/rustblocker` and create the wrapper script from `scripts/install.sh`, or just re-run the install script to let it handle the layout.
+
+### Agent deployment mock test
+
+`scripts/mock-deploy.sh` is the agent-friendly end-to-end mock test for a designated deploy machine. It reads credentials from `scripts/.deployenv`, detects the remote Linux architecture, builds the matching release target, uploads the binary through `/tmp`, installs it with root privileges, logs in to the Web UI, saves ACME/Cloudflare settings, requests a certificate, verifies that RustBlocker automatically restarts after certificate storage, and verifies that HTTPS works from the binary's default HTTPS behavior.
+
+```bash
+cp scripts/.deployenv.example scripts/.deployenv
+# Fill SSH_HOST, SSH_USER, SSH_PASSWORD, WEBUI_PASSWORD, DOMAIN, ACME_EMAIL, and CF_TOKEN.
+
+bash scripts/mock-deploy.sh --timeout=45
+```
+
+Useful options:
+
+```bash
+bash scripts/mock-deploy.sh --skip-build
+bash scripts/mock-deploy.sh --skip-deploy
+ACME_POLL_ATTEMPTS=30 bash scripts/mock-deploy.sh --timeout=45
+```
+
+The script prints JSON-lines status records and exits non-zero on any failed step, so agents can use it as the direct verification path for certificate and HTTPS deploy work.
 
 ### Docker multi-stage build
 
@@ -486,7 +616,15 @@ Web UI + API (actix-web on port+1)
      │
      ├─ SQLite database (rustblocker.db)
      ├─ Hot-reload Arc<RwLock<>> stores
+     ├─ Activity Log (broadcast::channel → SSE stream)
      └─ Changes take effect immediately
+
+HTTPS (automatic when a valid certificate exists)
+     │
+     ├─ ACME client (instant-acme) → Let's Encrypt
+     ├─ Cloudflare DNS-01 challenge (api.rs / cloudflare.rs)
+     ├─ TLS via rustls (tls.rs) → bind_rustls_0_23
+     └─ Auto-renewal (renewal.rs) → every 24h, 30-day threshold
 
 Replica Sync (sync.rs — slave side)
      │

@@ -1,0 +1,309 @@
+use anyhow::{Context, Result};
+use instant_acme::{
+    Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
+    OrderStatus,
+};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::activity::ActivityLog;
+use crate::cloudflare::CloudflareClient;
+
+/// ACME manager for certificate acquisition and renewal.
+pub struct AcmeManager {
+    directory_url: String,
+    email: String,
+    cloudflare: Arc<CloudflareClient>,
+}
+
+impl AcmeManager {
+    /// Create a new ACME manager.
+    pub fn new(directory_url: String, email: String, cloudflare: Arc<CloudflareClient>) -> Self {
+        Self {
+            directory_url,
+            email,
+            cloudflare,
+        }
+    }
+
+    /// Order and obtain a certificate for the given domain.
+    /// Returns (private_key_pem, cert_chain_pem).
+    ///
+    /// `log` is optional: pass `Some` for user-facing progress (API requests),
+    /// `None` for background tasks (auto-renewal).
+    /// `op_id` groups all entries for this operation in the activity stream.
+    pub async fn order_certificate(
+        &self,
+        domain: &str,
+        wildcard: bool,
+        log: Option<&ActivityLog>,
+        op_id: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        info!("Starting ACME certificate order for: {}", domain);
+        let op = "Request Certificate";
+        emit(log, op_id, op, &format!("Starting order for: {}", domain));
+
+        let url = if self.directory_url.contains("staging") {
+            LetsEncrypt::Staging.url()
+        } else {
+            LetsEncrypt::Production.url()
+        };
+
+        emit(log, op_id, op, "Creating ACME account...");
+        let (account, _credentials) = Account::create(
+            &NewAccount {
+                contact: &[&format!("mailto:{}", self.email)],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            url,
+            None,
+        )
+        .await
+        .context("failed to create ACME account")?;
+
+        info!("ACME account created");
+        emit(log, op_id, op, "ACME account created");
+
+        let identifiers = if wildcard {
+            vec![
+                Identifier::Dns(format!("*.{}", domain)),
+                Identifier::Dns(domain.to_string()),
+            ]
+        } else {
+            vec![Identifier::Dns(domain.to_string())]
+        };
+
+        emit(log, op_id, op, "Placing certificate order...");
+        let mut order = account
+            .new_order(&NewOrder {
+                identifiers: &identifiers,
+            })
+            .await
+            .context("failed to create ACME order")?;
+
+        let state = order.state();
+        info!("Order state: {:?}", state.status);
+        emit(
+            log,
+            op_id,
+            op,
+            &format!("Order created, status: {:?}", state.status),
+        );
+
+        if !matches!(state.status, OrderStatus::Pending) {
+            anyhow::bail!("unexpected initial order status: {:?}", state.status);
+        }
+
+        let authorizations = order.authorizations().await?;
+        emit(
+            log,
+            op_id,
+            op,
+            &format!("Received {} authorization(s)", authorizations.len()),
+        );
+
+        for authz in &authorizations {
+            if authz.status == AuthorizationStatus::Valid {
+                info!("Authorization already valid for: {:?}", authz.identifier);
+                continue;
+            }
+
+            if authz.status != AuthorizationStatus::Pending {
+                anyhow::bail!(
+                    "unexpected authorization status for {:?}: {:?}",
+                    authz.identifier,
+                    authz.status
+                );
+            }
+
+            let challenge = authz
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::Dns01)
+                .context("no DNS-01 challenge found")?;
+
+            let Identifier::Dns(domain_name) = &authz.identifier;
+            let challenge_domain = domain_name.strip_prefix("*.").unwrap_or(domain_name);
+            info!("Processing DNS-01 challenge for: {}", domain_name);
+            emit(
+                log,
+                op_id,
+                op,
+                &format!("Setting up DNS-01 challenge for: {}", domain_name),
+            );
+
+            let key_auth = order.key_authorization(challenge);
+            let dns_value = key_auth.dns_value();
+            let record_name = format!("_acme-challenge.{}", challenge_domain);
+
+            let zone_id = self.cloudflare.find_zone_id(challenge_domain).await?;
+            info!("Creating TXT record: {} = {}", record_name, dns_value);
+            emit(
+                log,
+                op_id,
+                op,
+                &format!("Creating TXT record: {} via Cloudflare API", record_name),
+            );
+
+            let record_id = self
+                .cloudflare
+                .create_txt_record(&zone_id, &record_name, &dns_value)
+                .await?;
+
+            emit(
+                log,
+                op_id,
+                op,
+                "TXT record created, waiting 10s for DNS propagation...",
+            );
+
+            info!("Waiting 10 seconds for DNS propagation");
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            emit(
+                log,
+                op_id,
+                op,
+                "Notifying Let's Encrypt to validate challenge...",
+            );
+            order
+                .set_challenge_ready(&challenge.url)
+                .await
+                .context("failed to set challenge ready")?;
+
+            info!("Challenge set ready, waiting for validation");
+            emit(
+                log,
+                op_id,
+                op,
+                "Challenge ready; waiting for Let's Encrypt to verify DNS...",
+            );
+
+            let cloudflare_clone = self.cloudflare.clone();
+            let zone_id_clone = zone_id.clone();
+            let record_id_clone = record_id.clone();
+            let record_name_clone = record_name.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                if let Err(e) = cloudflare_clone
+                    .delete_txt_record(&zone_id_clone, &record_id_clone)
+                    .await
+                {
+                    warn!("Failed to clean up TXT record {}: {}", record_name_clone, e);
+                } else {
+                    info!("Cleaned up TXT record: {}", record_name_clone);
+                }
+            });
+        }
+
+        info!("Polling for order to become ready");
+        emit(log, op_id, op, "Polling for order to become ready...");
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+            let state = order.refresh().await?;
+
+            match state.status {
+                OrderStatus::Ready => {
+                    info!("Order is ready for finalization");
+                    emit(log, op_id, op, "Order validated! Generating CSR...");
+                    break;
+                }
+                OrderStatus::Invalid => {
+                    emit(log, op_id, op, "Order became invalid!");
+                    anyhow::bail!("order became invalid");
+                }
+                OrderStatus::Pending | OrderStatus::Processing => {
+                    attempts += 1;
+                    if attempts > 30 {
+                        emit(log, op_id, op, "Timeout waiting for order validation (90s)");
+                        anyhow::bail!("timeout waiting for order to become ready");
+                    }
+                }
+                OrderStatus::Valid => {
+                    anyhow::bail!("order became valid before finalization");
+                }
+            }
+        }
+
+        info!("Finalizing order");
+
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+        if wildcard {
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::DnsName(rcgen::Ia5String::try_from(
+                    format!("*.{}", domain),
+                )?));
+        }
+
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, domain);
+        params.distinguished_name = dn;
+
+        let key_pair = rcgen::KeyPair::generate()?;
+        let csr = params.serialize_request(&key_pair)?;
+
+        order.finalize(csr.der()).await?;
+        emit(log, op_id, op, "CSR submitted, waiting for certificate...");
+
+        info!("Polling for certificate");
+        let mut attempts = 0;
+        let cert_chain = loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+            match order.certificate().await? {
+                Some(cert) => {
+                    info!("Certificate retrieved");
+                    break cert;
+                }
+                None => {
+                    attempts += 1;
+                    if attempts > 30 {
+                        emit(log, op_id, op, "Timeout waiting for certificate");
+                        anyhow::bail!("timeout waiting for certificate");
+                    }
+                }
+            }
+        };
+
+        info!("Certificate issued successfully");
+        emit_success(log, op_id, op, "Certificate issued successfully!");
+
+        Ok((
+            key_pair.serialize_pem().into_bytes(),
+            cert_chain.into_bytes(),
+        ))
+    }
+
+    /// Renew an existing certificate (same as ordering a new one).
+    pub async fn renew_certificate(
+        &self,
+        domain: &str,
+        wildcard: bool,
+        log: Option<&ActivityLog>,
+        op_id: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        info!("Renewing certificate for: {}", domain);
+        emit(
+            log,
+            op_id,
+            "Force Renewal",
+            &format!("Renewing certificate for: {}", domain),
+        );
+        self.order_certificate(domain, wildcard, log, op_id).await
+    }
+}
+
+fn emit(log: Option<&ActivityLog>, op_id: &str, op: &str, message: &str) {
+    if let Some(l) = log {
+        l.info(op_id, op, message);
+    }
+}
+
+fn emit_success(log: Option<&ActivityLog>, op_id: &str, op: &str, message: &str) {
+    if let Some(l) = log {
+        l.success(op_id, op, message);
+    }
+}

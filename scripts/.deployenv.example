@@ -1,0 +1,19 @@
+# Deploy + mock test credentials (keep this file local — gitignored)
+# Copy this file to .deployenv, fill in your values, then run ./scripts/deploy.sh
+
+# SSH connection
+SSH_HOST=192.168.0.4
+SSH_USER=dns2
+SSH_PASSWORD=
+
+# RustBlocker web UI admin password
+WEBUI_PASSWORD=
+
+# Web UI port (default: 54)
+WEB_PORT=54
+
+# HTTPS / ACME settings (leave empty to skip that test step)
+DOMAIN=
+ACME_EMAIL=
+CF_TOKEN=
+WILDCARD=false

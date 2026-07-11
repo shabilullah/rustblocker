@@ -1,6 +1,6 @@
 [package]
 name = "rustblocker"
-version = "0.1.1"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -18,7 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "json", "cookies"], default-features = false }
-actix-web = "4"
+actix-web = { version = "4", features = ["rustls-0_23"] }
 actix-rt = "2"
 bcrypt = "0.16"
 rand = "0.8"
@@ -31,6 +31,20 @@ parking_lot = "0.12"
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 hickory-net = "0.26"
+
+# ACME client
+instant-acme = { version = "0.7", features = ["aws-lc-rs", "hyper-rustls"] }
+rcgen = "0.13"
+pem = "3"
+
+# TLS for actix-web
+rustls = "0.23"
+rustls-pemfile = "2"
+
+
+
+# Certificate parsing
+x509-parser = "0.16"
 
 [dev-dependencies]
 async-trait = "0.1"

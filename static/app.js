@@ -29,6 +29,7 @@
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
             case 'settings': loadSettings(); loadSyncConfig(); autoCheckUpdate(); return;
+            case 'https': return loadHTTPSTab();
             case 'stats': return loadStats();
         }
     }
@@ -381,6 +382,299 @@
         await fetch(API + '/rewrites/' + id, {method: 'DELETE'});
         loadRewrites();
     }
+
+    // --- HTTPS ---
+
+    async function loadHTTPSTab() {
+        await Promise.all([loadCertificateStatus(), loadHTTPSSettings()]);
+    }
+
+    async function loadCertificateStatus() {
+        const container = document.getElementById('cert-status-container');
+        try {
+            const status = await fetch(API + '/acme/status').then(r => r.json());
+            
+            if (!status.has_certificate) {
+                container.innerHTML = '<p class="text-sm text-yellow-400">No certificate found. Configure settings below and request a certificate.</p>';
+                return;
+            }
+
+            const daysRemaining = status.days_remaining;
+            const color = daysRemaining > 30 ? 'text-green-400' : daysRemaining > 15 ? 'text-yellow-400' : 'text-red-400';
+            
+            const issuedDate = new Date(status.issued_at * 1000).toLocaleDateString();
+            const expiresDate = new Date(status.expires_at * 1000).toLocaleDateString();
+            const renewedDate = status.last_renewed ? new Date(status.last_renewed * 1000).toLocaleDateString() : 'Never';
+            
+            container.innerHTML = `
+                <div class="space-y-2 text-sm">
+                    <div><span class="text-gray-400">Domain:</span> <span class="font-mono">${status.domain}</span></div>
+                    <div><span class="text-gray-400">Issued:</span> ${issuedDate}</div>
+                    <div><span class="text-gray-400">Expires:</span> ${expiresDate}</div>
+                    <div><span class="text-gray-400">Days Remaining:</span> <span class="${color} font-semibold">${daysRemaining} days</span></div>
+                    <div><span class="text-gray-400">Last Renewed:</span> ${renewedDate}</div>
+                </div>
+            `;
+        } catch (e) {
+            container.innerHTML = `<p class="text-sm text-red-400">Error loading certificate status: ${e.message}</p>`;
+        }
+    }
+
+    async function loadHTTPSSettings() {
+        try {
+            const settings = await fetch(API + '/settings').then(r => r.json());
+            document.getElementById('https-domain').value = settings.domain || '';
+            document.getElementById('https-email').value = settings.acme_email || '';
+            document.getElementById('https-wildcard').checked = settings.wildcard_cert === 'true';
+        } catch (e) {
+            console.error('Failed to load HTTPS settings:', e);
+        }
+    }
+
+    document.getElementById('save-https-settings').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const email = document.getElementById('https-email').value.trim();
+        const token = document.getElementById('https-cloudflare-token').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+
+        if (!domain || !email) {
+            alert('Domain and email are required');
+            return;
+        }
+
+        try {
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'domain', value: domain})
+            });
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'acme_email', value: email})
+            });
+            if (token) {
+                await fetch(API + '/settings', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({key: 'cloudflare_api_token', value: token})
+                });
+            }
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'wildcard_cert', value: wildcard ? 'true' : 'false'})
+            });
+            alert('Settings saved successfully');
+            document.getElementById('https-cloudflare-token').value = '';
+        } catch (e) {
+            alert('Failed to save settings: ' + e.message);
+        }
+    });
+
+    document.getElementById('request-cert-btn').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+        const statusDiv = document.getElementById('cert-action-status');
+
+        if (!domain) {
+            statusDiv.innerHTML = '<p class="text-red-400">Please set domain in settings first</p>';
+            return;
+        }
+
+        statusDiv.innerHTML = '<p class="text-blue-400">Requesting certificate... This may take 1-2 minutes.</p>';
+        document.getElementById('request-cert-btn').disabled = true;
+
+        try {
+            const response = await fetch(API + '/acme/request', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({domain, wildcard})
+            });
+            const result = await response.json();
+            
+            if (response.ok) {
+                statusDiv.innerHTML = '<p class="text-green-400">Certificate request started in background. Check status in a few minutes.</p>';
+                setTimeout(() => loadCertificateStatus(), 60000);
+            } else {
+                statusDiv.innerHTML = `<p class="text-red-400">Error: ${result.error || 'Request failed'}</p>`;
+            }
+        } catch (e) {
+            statusDiv.innerHTML = `<p class="text-red-400">Request failed: ${e.message}</p>`;
+        } finally {
+            document.getElementById('request-cert-btn').disabled = false;
+        }
+    });
+
+    document.getElementById('renew-cert-btn').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+        const statusDiv = document.getElementById('cert-action-status');
+
+        if (!domain) {
+            statusDiv.innerHTML = '<p class="text-red-400">Please set domain in settings first</p>';
+            return;
+        }
+
+        if (!confirm('Force certificate renewal?')) return;
+
+        statusDiv.innerHTML = '<p class="text-blue-400">Renewing certificate... This may take 1-2 minutes.</p>';
+        document.getElementById('renew-cert-btn').disabled = true;
+
+        try {
+            const response = await fetch(API + '/acme/renew', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({domain, wildcard})
+            });
+            const result = await response.json();
+            
+            if (response.ok) {
+                statusDiv.innerHTML = '<p class="text-green-400">Certificate renewal started in background. Check status in a few minutes.</p>';
+                setTimeout(() => loadCertificateStatus(), 60000);
+            } else {
+                statusDiv.innerHTML = `<p class="text-red-400">Error: ${result.error || 'Renewal failed'}</p>`;
+            }
+        } catch (e) {
+            statusDiv.innerHTML = `<p class="text-red-400">Renewal failed: ${e.message}</p>`;
+        } finally {
+            document.getElementById('renew-cert-btn').disabled = false;
+        }
+    });
+
+
+    // --- Activity Log ---
+
+    const activityState = { entries: [], maxEntries: 200, expanded: false, unread: 0 };
+    let activitySSE = null;
+
+    function connectActivitySSE() {
+        if (activitySSE) return;
+        activitySSE = new EventSource(API + '/activity/stream');
+        activitySSE.onopen = () => {
+            // Connection established — any missed events are gone, but new ones will flow
+        };
+        activitySSE.onmessage = (e) => {
+            if (e.data === '') return;
+            try {
+                const entry = JSON.parse(e.data);
+                addActivityEntry(entry);
+            } catch {}
+        };
+        activitySSE.onerror = () => {
+            activitySSE.close();
+            activitySSE = null;
+            setTimeout(connectActivitySSE, 2000);
+        };
+    }
+
+    function addActivityEntry(entry) {
+        activityState.entries.push(entry);
+        if (activityState.entries.length > activityState.maxEntries) {
+            activityState.entries.shift();
+        }
+        if (!activityState.expanded) {
+            activityState.unread++;
+            updateActivityBadge();
+        }
+        renderActivityEntry(entry);
+    }
+
+    function renderActivityEntry(entry) {
+        const container = document.getElementById('activity-entries');
+        const color = {info:'text-blue-300',success:'text-emerald-300',warning:'text-yellow-300',error:'text-red-300'}[entry.level] || 'text-gray-300';
+        const bg = {error:'bg-red-900/30',warning:'bg-yellow-900/30',success:'bg-emerald-900/30'}[entry.level] || '';
+        const time = new Date(entry.ts * 1000).toLocaleTimeString();
+
+        // Remove pulse from previous latest entry
+        const prev = container.querySelector('.activity-latest');
+        if (prev) {
+            prev.classList.remove('activity-latest', 'animate-pulse');
+        }
+
+        const div = document.createElement('div');
+        const isFinal = entry.level === 'success' || entry.level === 'error';
+        div.className = `flex gap-2 py-1 px-2 rounded ${bg}${isFinal ? '' : ' activity-latest animate-pulse'}`;
+        div.setAttribute('data-op-id', entry.op_id);
+        div.innerHTML = `<span class="text-gray-500 shrink-0">${time}</span><span class="${color} shrink-0 font-medium">${entry.op}</span><span class="text-gray-300">${entry.message}</span>`;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function updateActivityBadge() {
+        const badge = document.getElementById('activity-badge');
+        if (activityState.unread > 0) {
+            badge.textContent = activityState.unread > 9 ? '9+' : activityState.unread;
+            badge.classList.remove('hidden');
+        } else {
+            badge.classList.add('hidden');
+        }
+    }
+
+    document.getElementById('activity-toggle').addEventListener('click', () => {
+        activityState.expanded = !activityState.expanded;
+        const body = document.getElementById('activity-body');
+        const chevron = document.getElementById('activity-chevron');
+        if (activityState.expanded) {
+            body.classList.remove('hidden');
+            chevron.style.transform = 'rotate(180deg)';
+            activityState.unread = 0;
+            updateActivityBadge();
+        } else {
+            body.classList.add('hidden');
+            chevron.style.transform = '';
+        }
+    });
+
+    connectActivitySSE();
+
+    // --- Cloudflare Test Connection ---
+
+    document.getElementById('test-cloudflare-btn').addEventListener('click', async () => {
+        const tokenInput = document.getElementById('https-cloudflare-token');
+        const resultSpan = document.getElementById('cf-test-result');
+        const token = tokenInput.value.trim();
+        if (!token) {
+            resultSpan.textContent = 'Enter a token first';
+            resultSpan.className = 'ml-2 text-xs text-yellow-400';
+            return;
+        }
+        resultSpan.textContent = 'Testing...';
+        resultSpan.className = 'ml-2 text-xs text-blue-400';
+        try {
+            const resp = await fetch(API + '/cloudflare/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({api_token: token})
+            });
+            const result = await resp.json();
+            if (result.ok) {
+                resultSpan.textContent = '✓ Token valid!';
+                resultSpan.className = 'ml-2 text-xs text-emerald-400';
+            } else {
+                resultSpan.textContent = '✗ ' + (result.error || 'Invalid token');
+                resultSpan.className = 'ml-2 text-xs text-red-400';
+            }
+        } catch (e) {
+            resultSpan.textContent = '✗ ' + e.message;
+            resultSpan.className = 'ml-2 text-xs text-red-400';
+        }
+    });
+
+    // --- HTTPS Request Certificate - wire up activity progress ---
+
+    const origRequestBtn = document.getElementById('request-cert-btn');
+    const origRenewBtn = document.getElementById('renew-cert-btn');
+
+    // Expand activity panel when cert request starts
+    function expandActivity() {
+        if (!activityState.expanded) {
+            document.getElementById('activity-toggle').click();
+        }
+    }
+
+    origRequestBtn.addEventListener('click', () => setTimeout(expandActivity, 200));
+    origRenewBtn.addEventListener('click', () => setTimeout(expandActivity, 200));
 
     // --- Settings ---
 

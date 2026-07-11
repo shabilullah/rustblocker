@@ -31,6 +31,15 @@ fn init_schema(conn: &rusqlite::Connection) {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS certificates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL UNIQUE,
+            private_key BLOB NOT NULL,
+            certificate BLOB NOT NULL,
+            issued_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            last_renewed INTEGER
+        );
         CREATE TABLE IF NOT EXISTS upstreams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             address TEXT NOT NULL,
@@ -194,6 +203,12 @@ pub fn get_settings(pool: &DbPool) -> serde_json::Value {
         if key == "admin_password_hash" || key == "session_secret" || key == "sync_password" {
             continue; // never expose sensitive auth state through the settings API
         }
+        // Mask Cloudflare API token in responses
+        let value = if key == "cloudflare_api_token" {
+            "***masked***".to_string()
+        } else {
+            value
+        };
         map.insert(key, serde_json::Value::String(value));
     }
     serde_json::Value::Object(map)
@@ -224,6 +239,95 @@ pub fn get_setting(pool: &DbPool, key: &str) -> Option<String> {
         |row| row.get(0),
     )
     .ok()
+}
+
+pub type CertificateData = (Vec<u8>, Vec<u8>, i64);
+
+// --- Certificates ---
+
+pub fn store_certificate(
+    pool: &DbPool,
+    domain: &str,
+    private_key: &[u8],
+    certificate: &[u8],
+    expires_at: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = pool.get()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO certificates (domain, private_key, certificate, issued_at, expires_at, last_renewed) 
+         VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+        params![domain, private_key, certificate, now, expires_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_certificate(pool: &DbPool, domain: &str) -> anyhow::Result<Option<CertificateData>> {
+    let conn = pool.get()?;
+    let result = conn.query_row(
+        "SELECT private_key, certificate, expires_at FROM certificates WHERE domain = ?1",
+        params![domain],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+
+    match result {
+        Ok(data) => Ok(Some(data)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+pub fn list_expiring_certificates(
+    pool: &DbPool,
+    days_threshold: i64,
+) -> anyhow::Result<Vec<String>> {
+    let conn = pool.get()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    let threshold = now + (days_threshold * 86400);
+
+    let mut stmt = conn.prepare("SELECT domain FROM certificates WHERE expires_at < ?1")?;
+    let domains: Vec<String> = stmt
+        .query_map(params![threshold], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(domains)
+}
+
+pub fn get_certificate_status(pool: &DbPool, domain: &str) -> Option<serde_json::Value> {
+    let conn = pool.get().ok()?;
+    let result: Result<(i64, i64, Option<i64>), _> = conn.query_row(
+        "SELECT issued_at, expires_at, last_renewed FROM certificates WHERE domain = ?1",
+        params![domain],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+
+    match result {
+        Ok((issued_at, expires_at, last_renewed)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let days_remaining = (expires_at - now) / 86400;
+
+            Some(serde_json::json!({
+                "has_certificate": true,
+                "domain": domain,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+                "days_remaining": days_remaining,
+                "last_renewed": last_renewed
+            }))
+        }
+        Err(_) => Some(serde_json::json!({
+            "has_certificate": false
+        })),
+    }
 }
 
 // --- Upstreams ---

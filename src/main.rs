@@ -33,6 +33,18 @@ struct Cli {
     #[arg(long)]
     web_port: Option<u16>,
 
+    /// Enable HTTPS (kept for compatibility; HTTPS is attempted by default when a valid certificate exists)
+    #[arg(long)]
+    https: bool,
+
+    /// HTTPS listen port (default: 443)
+    #[arg(long, default_value = "443")]
+    https_port: u16,
+
+    /// Force HTTP-only mode (disable HTTPS even if configured)
+    #[arg(long)]
+    force_http: bool,
+
     /// Generate/reset the admin password, save its hash, and print the password
     #[arg(long)]
     genpass: bool,
@@ -70,6 +82,7 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
 
     if cli.genpass {
@@ -302,7 +315,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     info!("DNS listening on TCP {}", listen_addr);
     server.register_listener(tcp_listener, Duration::from_secs(5), 1024);
 
-    let web_addr = format!("{}:{}", listen_address, web_port);
+    let web_addr: SocketAddr = format!("{}:{}", listen_address, web_port).parse()?;
 
     let pool_data = actix_web::web::Data::new(pool.clone());
     let blocklist_data = actix_web::web::Data::new(blocklist.clone());
@@ -317,6 +330,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         rustblocker::sync::SyncState::default(),
     ));
     let sync_state_data = actix_web::web::Data::new(sync_state.clone());
+    let activity_log = actix_web::web::Data::new(rustblocker::activity::ActivityLog::new());
     let session_secret = db::get_setting(&pool, "session_secret")
         .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
         .unwrap_or_else(|| {
@@ -329,6 +343,38 @@ async fn run_server(cli: Cli) -> Result<()> {
             secret
         });
     let auth_data = Arc::new(rustblocker::auth::AuthState::from_secret(session_secret));
+
+    // HTTPS is attempted by default. If a valid certificate is stored for the
+    // configured domain, bind HTTPS on `https_port`; otherwise continue HTTP-only.
+    let https_config = if !cli.force_http {
+        // Get domain from settings
+        let domain = db::get_setting(&pool, "domain");
+        match domain {
+            Some(domain) => {
+                info!("Loading TLS certificate for domain: {}", domain);
+                match rustblocker::tls::get_tls_config_from_db(&pool, &domain).await {
+                    Ok(Some(config)) => {
+                        info!("TLS certificate loaded successfully");
+                        Some(config)
+                    }
+                    Ok(None) => {
+                        warn!("No valid certificate found in database, running HTTP-only");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("Failed to load TLS certificate: {}, running HTTP-only", e);
+                        None
+                    }
+                }
+            }
+            None => {
+                warn!("No domain configured for HTTPS, running HTTP-only");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let web_server = actix_web::HttpServer::new({
         let auth_data = auth_data.clone();
@@ -352,6 +398,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(sinkhole_v4_data.clone())
                 .app_data(sinkhole_v6_data.clone())
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
+                .app_data(activity_log.clone())
                 .app_data(sync_state_data.clone())
                 .configure(api::configure)
                 .route(
@@ -411,12 +458,36 @@ async fn run_server(cli: Cli) -> Result<()> {
                     }),
                 )
         }
-    })
-    .bind(&web_addr)
-    .with_context(|| format!("Failed to bind web server on {}", web_addr))?;
+    });
+
+    // Bind HTTP
+    let web_server = web_server
+        .bind(&web_addr)
+        .with_context(|| format!("Failed to bind web server on {}", web_addr))?;
+
+    // Bind HTTPS if config is available
+    let has_https_config = https_config.is_some();
+    let web_server = if let Some(tls_config) = https_config {
+        let https_addr = SocketAddr::new(web_addr.ip(), cli.https_port);
+        info!("Binding HTTPS on {}", https_addr);
+        web_server
+            .bind_rustls_0_23(&https_addr, tls_config)
+            .with_context(|| format!("Failed to bind HTTPS server on {}", https_addr))?
+    } else {
+        web_server
+    };
 
     let web_handle = web_server.run();
-    info!("Web UI listening on http://{}", web_addr);
+    if !cli.force_http && has_https_config {
+        info!(
+            "Web UI listening on http://{} and https://{}:{}",
+            web_addr,
+            web_addr.ip(),
+            cli.https_port
+        );
+    } else {
+        info!("Web UI listening on http://{}", web_addr);
+    }
 
     info!(
         "RustBlocker ready — {} upstream(s), DNS port {}, web port {}",
@@ -451,6 +522,21 @@ async fn run_server(cli: Cli) -> Result<()> {
             }
         }
     });
+
+    // Check for expiring certificates on startup
+    if has_https_config {
+        if let Err(e) = rustblocker::renewal::check_expiring_on_startup(&pool, 30).await {
+            warn!("Failed to check expiring certificates: {}", e);
+        }
+
+        let renewal_pool = pool.clone();
+        let _renewal_handle = rustblocker::renewal::spawn_renewal_task(
+            renewal_pool,
+            24, // Check every 24 hours
+            30, // Renew if expiring within 30 days
+        );
+        info!("Certificate auto-renewal enabled (checks every 24 hours)");
+    }
     // Sync slave: read config from DB (CLI args override DB values).
     {
         let cli_had_sync_master = cli.sync_master.is_some();

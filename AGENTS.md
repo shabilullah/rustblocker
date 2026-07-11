@@ -17,6 +17,13 @@ npm run build:css
 git diff --exit-code static/tailwind.min.css
 ```
 
+**If you changed `static/app.js`, also verify JavaScript syntax:**
+
+```bash
+node --check static/app.js
+```
+
+
 If `tailwind.min.css` changed, commit the updated file. CI will fail if CSS is stale.
 
 If any check fails, fix it before proceeding. Never commit code that fails CI.
