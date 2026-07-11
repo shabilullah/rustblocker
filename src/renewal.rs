@@ -16,13 +16,14 @@ pub fn spawn_renewal_task(
     renewal_threshold_days: i64,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(renewal_interval_hours * 3600));
-        
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(renewal_interval_hours * 3600));
+
         loop {
             interval.tick().await;
-            
+
             info!("Running certificate renewal check");
-            
+
             match check_and_renew_certificates(&pool, renewal_threshold_days).await {
                 Ok(renewed) => {
                     if renewed > 0 {
@@ -55,13 +56,17 @@ async fn check_and_renew_certificates(pool: &DbPool, threshold_days: i64) -> Res
         return Ok(0);
     }
 
-    info!("Found {} certificate(s) expiring within {} days", expiring.len(), threshold_days);
+    info!(
+        "Found {} certificate(s) expiring within {} days",
+        expiring.len(),
+        threshold_days
+    );
 
     let mut renewed_count = 0;
 
     for domain in expiring {
         info!("Attempting to renew certificate for: {}", domain);
-        
+
         match renew_certificate_for_domain(pool, &domain).await {
             Ok(_) => {
                 info!("Successfully renewed certificate for: {}", domain);
@@ -81,10 +86,9 @@ async fn renew_certificate_for_domain(pool: &DbPool, domain: &str) -> Result<()>
     // Get required settings from database
     let cloudflare_token = db::get_setting(pool, "cloudflare_api_token")
         .context("Cloudflare API token not configured")?;
-    
-    let acme_email = db::get_setting(pool, "acme_email")
-        .context("ACME email not configured")?;
-    
+
+    let acme_email = db::get_setting(pool, "acme_email").context("ACME email not configured")?;
+
     let directory_url = db::get_setting(pool, "acme_directory_url")
         .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
 
@@ -127,8 +131,8 @@ async fn renew_certificate_for_domain(pool: &DbPool, domain: &str) -> Result<()>
 fn parse_certificate_expiry(cert_pem: &[u8]) -> Result<i64> {
     use x509_parser::prelude::*;
 
-    let pem_parsed = ::pem::parse(cert_pem)
-        .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
+    let pem_parsed =
+        ::pem::parse(cert_pem).map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
     let cert = X509Certificate::from_der(pem_parsed.contents())?.1;
 
     // Convert ASN1Time to Unix timestamp
@@ -141,7 +145,7 @@ fn parse_certificate_expiry(cert_pem: &[u8]) -> Result<i64> {
 /// This is a one-time check that runs when the server starts.
 pub async fn check_expiring_on_startup(pool: &DbPool, threshold_days: i64) -> Result<()> {
     info!("Checking for expiring certificates on startup");
-    
+
     let expiring = tokio::task::spawn_blocking({
         let pool = pool.clone();
         move || db::list_expiring_certificates(&pool, threshold_days)

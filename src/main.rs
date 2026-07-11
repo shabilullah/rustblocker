@@ -476,7 +476,12 @@ async fn run_server(cli: Cli) -> Result<()> {
 
     let web_handle = web_server.run();
     if cli.https && !cli.force_http && has_https_config {
-        info!("Web UI listening on http://{} and https://{}:{}", web_addr, web_addr.ip(), cli.https_port);
+        info!(
+            "Web UI listening on http://{} and https://{}:{}",
+            web_addr,
+            web_addr.ip(),
+            cli.https_port
+        );
     } else {
         info!("Web UI listening on http://{}", web_addr);
     }

@@ -1,6 +1,6 @@
 [package]
 name = "rustblocker"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -42,7 +42,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 
 # Cloudflare API
-cloudflare = "0.12"
+cloudflare = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Certificate parsing
 x509-parser = "0.16"

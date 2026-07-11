@@ -188,9 +188,11 @@ impl AcmeManager {
         // Generate CSR
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
         if wildcard {
-            params.subject_alt_names.push(rcgen::SanType::DnsName(
-                rcgen::Ia5String::try_from(format!("*.{}", domain))?,
-            ));
+            params
+                .subject_alt_names
+                .push(rcgen::SanType::DnsName(rcgen::Ia5String::try_from(
+                    format!("*.{}", domain),
+                )?));
         }
 
         let mut dn = rcgen::DistinguishedName::new();
