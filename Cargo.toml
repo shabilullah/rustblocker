@@ -41,8 +41,7 @@ pem = "3"
 rustls = "0.23"
 rustls-pemfile = "2"
 
-# Cloudflare API
-cloudflare = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
 
 # Certificate parsing
 x509-parser = "0.16"

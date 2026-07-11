@@ -254,7 +254,86 @@ async fn renew_certificate(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
 
-    request_certificate(pool, req, acl, activity_log, body).await
+    let api_token = match db::get_setting(&pool, "cloudflare_api_token") {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            activity_log.error(
+                "renew",
+                "Force Renewal",
+                "Cloudflare API token not configured",
+            );
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Cloudflare API token not configured"
+            }));
+        }
+    };
+
+    let acme_email = match db::get_setting(&pool, "acme_email") {
+        Some(email) if !email.is_empty() => email,
+        _ => {
+            activity_log.error("renew", "Force Renewal", "ACME email not configured");
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "ACME email not configured"
+            }));
+        }
+    };
+
+    let directory_url = db::get_setting(&pool, "acme_directory_url")
+        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+
+    let domain = body.domain.clone();
+    let domain_for_response = domain.clone();
+    let wildcard = body.wildcard.unwrap_or(false);
+    let op_id = format!(
+        "renew-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+
+    activity_log.info(
+        &op_id,
+        "Force Renewal",
+        &format!("Renewal started for: {}", domain),
+    );
+
+    let log_clone = activity_log.into_inner();
+    let op_id_for_spawn = op_id.clone();
+    let pool_clone = pool.clone();
+
+    tokio::spawn(async move {
+        let log_ref: &ActivityLog = &log_clone;
+        match request_certificate_impl(
+            &pool_clone,
+            &domain,
+            wildcard,
+            &api_token,
+            &acme_email,
+            &directory_url,
+            Some(log_ref),
+            &op_id_for_spawn,
+        )
+        .await
+        {
+            Ok(_) => {
+                log_clone.success(
+                    &op_id_for_spawn,
+                    "Force Renewal",
+                    "Certificate renewed successfully!",
+                );
+            }
+            Err(e) => {
+                log_clone.error(&op_id_for_spawn, "Force Renewal", &format!("Failed: {}", e));
+            }
+        }
+    });
+
+    HttpResponse::Accepted().json(serde_json::json!({
+        "message": "Certificate renewal started",
+        "domain": domain_for_response,
+        "op_id": op_id
+    }))
 }
 
 /// Background task to request certificate via ACME.
