@@ -433,7 +433,7 @@
         const thresholdDays = status.auto_renewal_threshold_days ?? 7;
         const intervalHours = status.auto_renewal_interval_hours ?? 24;
         const badgeClass = enabled ? 'bg-emerald-900 text-emerald-300 border-emerald-700' : 'bg-gray-700 text-gray-300 border-gray-600';
-        const label = enabled ? 'Enabled' : 'Waiting for domain';
+        const label = enabled ? 'Enabled' : 'Waiting for certificate';
 
         renewalEl.innerHTML = `
             <div class="flex flex-wrap items-center justify-between gap-3 text-sm">

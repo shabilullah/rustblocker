@@ -421,8 +421,8 @@ async fn certificate_status(
     // Get domain from settings
     let domain = db::get_setting(&pool, "domain");
     let acme_error = db::get_setting(&pool, "acme_error").unwrap_or_default();
-    let renewal_status = serde_json::json!({
-        "auto_renewal_enabled": domain.is_some(),
+
+    let renewal_policy = serde_json::json!({
         "auto_renewal_threshold_days": crate::renewal::AUTO_RENEWAL_THRESHOLD_DAYS,
         "auto_renewal_interval_hours": crate::renewal::AUTO_RENEWAL_INTERVAL_HOURS,
     });
@@ -430,7 +430,12 @@ async fn certificate_status(
     match domain {
         Some(domain) => match db::get_certificate_status(&pool, &domain) {
             Some(mut status) => {
-                merge_status_object(&mut status, &renewal_status);
+                let has_certificate = status
+                    .get("has_certificate")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                status["auto_renewal_enabled"] = serde_json::json!(has_certificate);
+                merge_status_object(&mut status, &renewal_policy);
                 if !acme_error.is_empty() {
                     status["acme_error"] = serde_json::json!(acme_error);
                 }
@@ -438,7 +443,8 @@ async fn certificate_status(
             }
             None => {
                 let mut resp = serde_json::json!({"has_certificate": false});
-                merge_status_object(&mut resp, &renewal_status);
+                resp["auto_renewal_enabled"] = serde_json::json!(false);
+                merge_status_object(&mut resp, &renewal_policy);
                 if !acme_error.is_empty() {
                     resp["acme_error"] = serde_json::json!(acme_error);
                 }
