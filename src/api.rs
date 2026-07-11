@@ -403,7 +403,7 @@ async fn test_cloudflare_connection(
     };
 
     let result = client
-        .get("https://api.cloudflare.com/client/v4/user/tokens/verify")
+        .get("https://api.cloudflare.com/client/v4/zones?per_page=1")
         .header("Authorization", format!("Bearer {}", body.api_token))
         .send()
         .await;
@@ -419,7 +419,14 @@ async fn test_cloudflare_connection(
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
-            let msg = format!("Cloudflare API returned HTTP {}", status);
+            let msg = if status == 401 || status == 403 {
+                format!(
+                    "Authentication failed (HTTP {}) — check token permissions",
+                    status
+                )
+            } else {
+                format!("Cloudflare API returned HTTP {}", status)
+            };
             activity_log.error("cf-test", "Test Connection", &msg);
             HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": msg}))
         }
