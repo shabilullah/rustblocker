@@ -573,6 +573,7 @@
 
     const activityState = { entries: [], maxEntries: 200, expanded: false, unread: 0 };
     let activitySSE = null;
+    let certRestartWatchActive = false;
 
     function connectActivitySSE() {
         if (activitySSE) return;
@@ -604,6 +605,59 @@
             updateActivityBadge();
         }
         renderActivityEntry(entry);
+        maybeHandleCertificateRestart(entry);
+    }
+
+    function maybeHandleCertificateRestart(entry) {
+        const certOps = ['Request Certificate', 'Force Renewal'];
+        if (!certOps.includes(entry.op) || entry.level !== 'warning') return;
+        if (!entry.message.toLowerCase().includes('restarting server')) return;
+        if (certRestartWatchActive) return;
+
+        certRestartWatchActive = true;
+        const statusDiv = document.getElementById('cert-action-status');
+        if (statusDiv) {
+            statusDiv.innerHTML = '<p class="text-yellow-400">Certificate ready. Restarting server to enable HTTPS...</p>';
+        }
+        waitForCertificateRestart();
+    }
+
+    async function waitForCertificateRestart() {
+        const statusDiv = document.getElementById('cert-action-status');
+        let sawOffline = false;
+        for (let attempt = 1; attempt <= 60; attempt++) {
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            try {
+                const response = await fetch(API + '/health', {cache: 'no-store'});
+                if (response.ok && (sawOffline || attempt > 3)) {
+                    if (statusDiv) {
+                        statusDiv.innerHTML = '<p class="text-green-400">Server restarted. Reloading Web UI...</p>';
+                    }
+                    setTimeout(() => {
+                        if (window.location.protocol === 'http:' && !isLocalHost(window.location.hostname)) {
+                            window.location.href = `https://${window.location.hostname}${window.location.pathname}${window.location.search}`;
+                        } else {
+                            window.location.reload();
+                        }
+                    }, 1200);
+                    return;
+                }
+            } catch {
+                sawOffline = true;
+            }
+            if (statusDiv) {
+                statusDiv.innerHTML = `<p class="text-yellow-400">Waiting for server restart... (${attempt})</p>`;
+            }
+        }
+
+        certRestartWatchActive = false;
+        if (statusDiv) {
+            statusDiv.innerHTML = '<p class="text-red-400">Server restart timed out. Refresh the page manually.</p>';
+        }
+    }
+
+    function isLocalHost(hostname) {
+        return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
     }
 
     function renderActivityEntry(entry) {
