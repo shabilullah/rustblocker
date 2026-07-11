@@ -92,6 +92,46 @@ impl ActivityLog {
             ts: now(),
         });
     }
+
+    /// Run a future while emitting periodic "still working..." heartbeat messages.
+    /// Spawns a background task that emits every `interval_secs` seconds.
+    pub async fn with_progress<F, T>(
+        &self,
+        op_id: &str,
+        op: &str,
+        message: &str,
+        interval_secs: u64,
+        fut: F,
+    ) -> T
+    where
+        F: Future<Output = T>,
+    {
+        let op_id = op_id.to_string();
+        let op = op.to_string();
+        let message = message.to_string();
+
+        // Clone the sender for the heartbeat task
+        let tx = self.tx.clone();
+
+        let heartbeat = tokio::spawn(async move {
+            let mut elapsed = 0u64;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+                elapsed += interval_secs;
+                let _ = tx.send(ActivityEntry {
+                    op_id: op_id.clone(),
+                    op: op.clone(),
+                    message: format!("{} ({}s)...", message, elapsed),
+                    level: Severity::Info,
+                    ts: now(),
+                });
+            }
+        });
+
+        let result = fut.await;
+        heartbeat.abort();
+        result
+    }
 }
 
 impl Default for ActivityLog {

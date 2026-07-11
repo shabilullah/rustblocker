@@ -551,6 +551,9 @@
     function connectActivitySSE() {
         if (activitySSE) return;
         activitySSE = new EventSource(API + '/activity/stream');
+        activitySSE.onopen = () => {
+            // Connection established — any missed events are gone, but new ones will flow
+        };
         activitySSE.onmessage = (e) => {
             if (e.data === '') return;
             try {
@@ -561,7 +564,7 @@
         activitySSE.onerror = () => {
             activitySSE.close();
             activitySSE = null;
-            setTimeout(connectActivitySSE, 5000);
+            setTimeout(connectActivitySSE, 2000);
         };
     }
 
@@ -574,16 +577,21 @@
             activityState.unread++;
             updateActivityBadge();
         }
-        renderActivityEntry(entry);
-    }
-
     function renderActivityEntry(entry) {
         const container = document.getElementById('activity-entries');
         const color = {info:'text-blue-300',success:'text-emerald-300',warning:'text-yellow-300',error:'text-red-300'}[entry.level] || 'text-gray-300';
         const bg = {error:'bg-red-900/30',warning:'bg-yellow-900/30',success:'bg-emerald-900/30'}[entry.level] || '';
         const time = new Date(entry.ts * 1000).toLocaleTimeString();
+
+        // Remove pulse from previous latest entry
+        const prev = container.querySelector('.activity-latest');
+        if (prev) {
+            prev.classList.remove('activity-latest', 'animate-pulse');
+        }
+
         const div = document.createElement('div');
-        div.className = `flex gap-2 py-1 px-2 rounded ${bg}`;
+        const isFinal = entry.level === 'success' || entry.level === 'error';
+        div.className = `flex gap-2 py-1 px-2 rounded ${bg}${isFinal ? '' : ' activity-latest animate-pulse'}`;
         div.setAttribute('data-op-id', entry.op_id);
         div.innerHTML = `<span class="text-gray-500 shrink-0">${time}</span><span class="${color} shrink-0 font-medium">${entry.op}</span><span class="text-gray-300">${entry.message}</span>`;
         container.appendChild(div);
