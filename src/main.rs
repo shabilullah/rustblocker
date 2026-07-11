@@ -329,6 +329,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         rustblocker::sync::SyncState::default(),
     ));
     let sync_state_data = actix_web::web::Data::new(sync_state.clone());
+    let activity_log = actix_web::web::Data::new(rustblocker::activity::ActivityLog::new());
     let session_secret = db::get_setting(&pool, "session_secret")
         .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
         .unwrap_or_else(|| {
@@ -396,6 +397,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(sinkhole_v4_data.clone())
                 .app_data(sinkhole_v6_data.clone())
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
+                .app_data(activity_log.clone())
                 .app_data(sync_state_data.clone())
                 .configure(api::configure)
                 .route(

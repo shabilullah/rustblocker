@@ -6,6 +6,7 @@ use instant_acme::{
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::activity::ActivityLog;
 use crate::cloudflare::CloudflareClient;
 
 /// ACME manager for certificate acquisition and renewal.
@@ -27,12 +28,20 @@ impl AcmeManager {
 
     /// Order and obtain a certificate for the given domain.
     /// Returns (private_key_pem, cert_chain_pem).
+    ///
+    /// `log` is optional — pass `Some` for user-facing progress (API requests),
+    /// `None` for background tasks (auto-renewal).
+    /// `op_id` groups all entries for this operation in the activity stream.
     pub async fn order_certificate(
         &self,
         domain: &str,
         wildcard: bool,
+        log: Option<&ActivityLog>,
+        op_id: &str,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         info!("Starting ACME certificate order for: {}", domain);
+        let op = "Request Certificate";
+        emit(log, op_id, op, &format!("Starting order for: {}", domain));
 
         // Determine directory URL
         let url = if self.directory_url.contains("staging") {
@@ -42,6 +51,7 @@ impl AcmeManager {
         };
 
         // Create account
+        emit(log, op_id, op, "Creating ACME account...");
         let (account, _credentials) = Account::create(
             &NewAccount {
                 contact: &[&format!("mailto:{}", self.email)],
@@ -55,6 +65,7 @@ impl AcmeManager {
         .context("failed to create ACME account")?;
 
         info!("ACME account created");
+        emit(log, op_id, op, "ACME account created");
 
         // Prepare identifiers
         let identifiers = if wildcard {
@@ -67,6 +78,7 @@ impl AcmeManager {
         };
 
         // Create order
+        emit(log, op_id, op, "Placing certificate order...");
         let mut order = account
             .new_order(&NewOrder {
                 identifiers: &identifiers,
@@ -76,6 +88,12 @@ impl AcmeManager {
 
         let state = order.state();
         info!("Order state: {:?}", state.status);
+        emit(
+            log,
+            op_id,
+            op,
+            &format!("Order created, status: {:?}", state.status),
+        );
 
         if !matches!(state.status, OrderStatus::Pending) {
             anyhow::bail!("unexpected initial order status: {:?}", state.status);
@@ -83,6 +101,12 @@ impl AcmeManager {
 
         // Get authorizations
         let authorizations = order.authorizations().await?;
+        emit(
+            log,
+            op_id,
+            op,
+            &format!("Received {} authorization(s)", authorizations.len()),
+        );
 
         // Process each authorization
         for authz in &authorizations {
@@ -108,6 +132,12 @@ impl AcmeManager {
 
             let Identifier::Dns(domain_name) = &authz.identifier;
             info!("Processing DNS-01 challenge for: {}", domain_name);
+            emit(
+                log,
+                op_id,
+                op,
+                &format!("Setting up DNS-01 challenge for: {}", domain_name),
+            );
 
             // Get challenge key authorization and DNS value
             let key_auth = order.key_authorization(challenge);
@@ -119,23 +149,48 @@ impl AcmeManager {
             // Find zone and create record
             let zone_id = self.cloudflare.find_zone_id(domain_name).await?;
             info!("Creating TXT record: {} = {}", record_name, dns_value);
+            emit(
+                log,
+                op_id,
+                op,
+                &format!("Creating TXT record: {} via Cloudflare API", record_name),
+            );
 
             let record_id = self
                 .cloudflare
                 .create_txt_record(&zone_id, &record_name, &dns_value)
                 .await?;
 
+            emit(
+                log,
+                op_id,
+                op,
+                "TXT record created, waiting 10s for DNS propagation...",
+            );
+
             // Wait for DNS propagation
             info!("Waiting 10 seconds for DNS propagation");
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
             // Notify ACME to validate
+            emit(
+                log,
+                op_id,
+                op,
+                "Notifying Let's Encrypt to validate challenge...",
+            );
             order
                 .set_challenge_ready(&challenge.url)
                 .await
                 .context("failed to set challenge ready")?;
 
             info!("Challenge set ready, waiting for validation");
+            emit(
+                log,
+                op_id,
+                op,
+                "Challenge ready — waiting for Let's Encrypt to verify DNS...",
+            );
 
             // Clean up DNS record after delay
             let cloudflare_clone = self.cloudflare.clone();
@@ -157,6 +212,7 @@ impl AcmeManager {
 
         // Poll until order is ready
         info!("Polling for order to become ready");
+        emit(log, op_id, op, "Polling for order to become ready...");
         let mut attempts = 0;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
@@ -165,19 +221,21 @@ impl AcmeManager {
             match state.status {
                 OrderStatus::Ready => {
                     info!("Order is ready for finalization");
+                    emit(log, op_id, op, "Order validated! Generating CSR...");
                     break;
                 }
                 OrderStatus::Invalid => {
+                    emit(log, op_id, op, "Order became invalid!");
                     anyhow::bail!("order became invalid");
                 }
                 OrderStatus::Pending | OrderStatus::Processing => {
                     attempts += 1;
                     if attempts > 30 {
+                        emit(log, op_id, op, "Timeout waiting for order validation (90s)");
                         anyhow::bail!("timeout waiting for order to become ready");
                     }
                 }
                 OrderStatus::Valid => {
-                    // Should not happen before finalization
                     anyhow::bail!("order became valid before finalization");
                 }
             }
@@ -204,6 +262,7 @@ impl AcmeManager {
 
         // Finalize with CSR
         order.finalize(csr.der()).await?;
+        emit(log, op_id, op, "CSR submitted, waiting for certificate...");
 
         // Poll for certificate
         info!("Polling for certificate");
@@ -219,6 +278,7 @@ impl AcmeManager {
                 None => {
                     attempts += 1;
                     if attempts > 30 {
+                        emit(log, op_id, op, "Timeout waiting for certificate");
                         anyhow::bail!("timeout waiting for certificate");
                     }
                 }
@@ -226,6 +286,8 @@ impl AcmeManager {
         };
 
         info!("Certificate issued successfully");
+        emit_success(log, op_id, op, "Certificate issued successfully!");
+
         Ok((
             key_pair.serialize_pem().into_bytes(),
             cert_chain.into_bytes(),
@@ -237,8 +299,30 @@ impl AcmeManager {
         &self,
         domain: &str,
         wildcard: bool,
+        log: Option<&ActivityLog>,
+        op_id: &str,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         info!("Renewing certificate for: {}", domain);
-        self.order_certificate(domain, wildcard).await
+        emit(
+            log,
+            op_id,
+            "Force Renewal",
+            &format!("Renewing certificate for: {}", domain),
+        );
+        self.order_certificate(domain, wildcard, log, op_id).await
+    }
+}
+
+/// Emit an activity event if `log` is Some. No-op if None.
+fn emit(log: Option<&ActivityLog>, op_id: &str, op: &str, message: &str) {
+    if let Some(l) = log {
+        l.info(op_id, op, message);
+    }
+}
+
+/// Emit a success event (called directly with `true` flag).
+fn emit_success(log: Option<&ActivityLog>, op_id: &str, op: &str, message: &str) {
+    if let Some(l) = log {
+        l.success(op_id, op, message);
     }
 }

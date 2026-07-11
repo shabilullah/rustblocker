@@ -542,6 +542,129 @@
         }
     });
 
+
+    // --- Activity Log ---
+
+    const activityState = { entries: [], maxEntries: 200, expanded: false, unread: 0 };
+    let activitySSE = null;
+
+    function connectActivitySSE() {
+        if (activitySSE) return;
+        activitySSE = new EventSource(API + '/activity/stream');
+        activitySSE.onmessage = (e) => {
+            if (e.data === '') return;
+            try {
+                const entry = JSON.parse(e.data);
+                addActivityEntry(entry);
+            } catch {}
+        };
+        activitySSE.onerror = () => {
+            activitySSE.close();
+            activitySSE = null;
+            setTimeout(connectActivitySSE, 5000);
+        };
+    }
+
+    function addActivityEntry(entry) {
+        activityState.entries.push(entry);
+        if (activityState.entries.length > activityState.maxEntries) {
+            activityState.entries.shift();
+        }
+        if (!activityState.expanded) {
+            activityState.unread++;
+            updateActivityBadge();
+        }
+        renderActivityEntry(entry);
+    }
+
+    function renderActivityEntry(entry) {
+        const container = document.getElementById('activity-entries');
+        const color = {info:'text-blue-300',success:'text-emerald-300',warning:'text-yellow-300',error:'text-red-300'}[entry.level] || 'text-gray-300';
+        const bg = {error:'bg-red-900/30',warning:'bg-yellow-900/30',success:'bg-emerald-900/30'}[entry.level] || '';
+        const time = new Date(entry.ts * 1000).toLocaleTimeString();
+        const div = document.createElement('div');
+        div.className = `flex gap-2 py-1 px-2 rounded ${bg}`;
+        div.setAttribute('data-op-id', entry.op_id);
+        div.innerHTML = `<span class="text-gray-500 shrink-0">${time}</span><span class="${color} shrink-0 font-medium">${entry.op}</span><span class="text-gray-300">${entry.message}</span>`;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function updateActivityBadge() {
+        const badge = document.getElementById('activity-badge');
+        if (activityState.unread > 0) {
+            badge.textContent = activityState.unread > 9 ? '9+' : activityState.unread;
+            badge.classList.remove('hidden');
+        } else {
+            badge.classList.add('hidden');
+        }
+    }
+
+    document.getElementById('activity-toggle').addEventListener('click', () => {
+        activityState.expanded = !activityState.expanded;
+        const body = document.getElementById('activity-body');
+        const chevron = document.getElementById('activity-chevron');
+        if (activityState.expanded) {
+            body.classList.remove('hidden');
+            chevron.style.transform = 'rotate(180deg)';
+            activityState.unread = 0;
+            updateActivityBadge();
+        } else {
+            body.classList.add('hidden');
+            chevron.style.transform = '';
+        }
+    });
+
+    connectActivitySSE();
+
+    // --- Cloudflare Test Connection ---
+
+    document.getElementById('test-cloudflare-btn').addEventListener('click', async () => {
+        const tokenInput = document.getElementById('https-cloudflare-token');
+        const resultSpan = document.getElementById('cf-test-result');
+        const token = tokenInput.value.trim();
+        if (!token) {
+            resultSpan.textContent = 'Enter a token first';
+            resultSpan.className = 'ml-2 text-xs text-yellow-400';
+            return;
+        }
+        resultSpan.textContent = 'Testing...';
+        resultSpan.className = 'ml-2 text-xs text-blue-400';
+        try {
+            const resp = await fetch(API + '/cloudflare/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({api_token: token})
+            });
+            const result = await resp.json();
+            if (result.ok) {
+                resultSpan.textContent = '✓ Token valid!';
+                resultSpan.className = 'ml-2 text-xs text-emerald-400';
+            } else {
+                resultSpan.textContent = '✗ ' + (result.error || 'Invalid token');
+                resultSpan.className = 'ml-2 text-xs text-red-400';
+            }
+        } catch (e) {
+            resultSpan.textContent = '✗ ' + e.message;
+            resultSpan.className = 'ml-2 text-xs text-red-400';
+        }
+    });
+
+    // --- HTTPS Request Certificate - wire up activity progress ---
+
+    const origRequestBtn = document.getElementById('request-cert-btn');
+    const origRenewBtn = document.getElementById('renew-cert-btn');
+
+    // Expand activity panel when cert request starts
+    function expandActivity() {
+        if (!activityState.expanded) {
+            document.getElementById('activity-toggle').click();
+        }
+    }
+
+    origRequestBtn.addEventListener('click', () => setTimeout(expandActivity, 200));
+    origRenewBtn.addEventListener('click', () => setTimeout(expandActivity, 200));
+
     // --- Settings ---
 
     async function loadSettings() {

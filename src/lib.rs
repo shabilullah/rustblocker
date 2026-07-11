@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod acme;
+pub mod activity;
 pub mod api;
 pub mod auth;
 pub mod cloudflare;

@@ -105,7 +105,7 @@ async fn renew_certificate_for_domain(pool: &DbPool, domain: &str) -> Result<()>
 
     // Request new certificate
     info!("Ordering new certificate for: {}", domain);
-    let (private_key, certificate) = acme.renew_certificate(domain, wildcard).await?;
+    let (private_key, certificate) = acme.renew_certificate(domain, wildcard, None, "").await?;
 
     // Parse certificate to get expiry
     let expires_at = parse_certificate_expiry(&certificate)?;

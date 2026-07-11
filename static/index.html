@@ -304,6 +304,8 @@
                         <label class="block text-sm font-medium mb-1">Cloudflare API Token</label>
                         <input type="password" id="https-cloudflare-token" class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm" placeholder="Enter token to update">
                         <p class="text-xs text-gray-400 mt-1">Leave empty to keep existing token</p>
+                        <button id="test-cloudflare-btn" class="mt-2 bg-gray-600 hover:bg-gray-500 px-3 py-1.5 rounded text-xs font-medium">Test Connection</button>
+                        <span id="cf-test-result" class="ml-2 text-xs"></span>
                     </div>
                     <div class="flex items-center">
                         <input type="checkbox" id="https-wildcard" class="mr-2">
@@ -354,6 +356,23 @@
                     <span id="stats-page-info" class="text-xs text-gray-400"></span>
                     <button id="stats-next" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-xs disabled:opacity-50" disabled>Next</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activity Log Panel (always visible, outside all tabs) -->
+    <div id="activity-panel" class="fixed bottom-0 right-0 w-full sm:w-96 z-50">
+        <div class="bg-gray-900 border border-gray-700 rounded-t-lg shadow-2xl">
+            <button id="activity-toggle" class="w-full flex items-center justify-between px-4 py-2.5 hover:bg-gray-800 rounded-t-lg transition-colors">
+                <div class="flex items-center gap-2">
+                    <svg class="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>
+                    <span class="text-sm font-medium text-gray-200">Activity Log</span>
+                    <span id="activity-badge" class="hidden bg-emerald-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">0</span>
+                </div>
+                <svg id="activity-chevron" class="w-4 h-4 text-gray-400 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+            </button>
+            <div id="activity-body" class="hidden max-h-64 overflow-y-auto px-4 pb-3">
+                <div id="activity-entries" class="space-y-1.5 text-xs"></div>
             </div>
         </div>
     </div>

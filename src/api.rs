@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::warn;
 
 use crate::acl::SharedAcl;
+use crate::activity::ActivityLog;
 use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret};
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
@@ -147,16 +148,21 @@ async fn request_certificate(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
     body: web::Json<CertificateRequest>,
 ) -> HttpResponse {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-
     // Get Cloudflare API token from settings
     let api_token = match db::get_setting(&pool, "cloudflare_api_token") {
         Some(token) if !token.is_empty() => token,
         _ => {
+            activity_log.error(
+                "cert",
+                "Request Certificate",
+                "Cloudflare API token not configured",
+            );
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": "Cloudflare API token not configured"
             }));
@@ -167,6 +173,7 @@ async fn request_certificate(
     let acme_email = match db::get_setting(&pool, "acme_email") {
         Some(email) if !email.is_empty() => email,
         _ => {
+            activity_log.error("cert", "Request Certificate", "ACME email not configured");
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": "ACME email not configured"
             }));
@@ -180,10 +187,26 @@ async fn request_certificate(
     let domain = body.domain.clone();
     let domain_for_response = domain.clone();
     let wildcard = body.wildcard.unwrap_or(false);
+    let op_id = format!(
+        "cert-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
 
-    // Spawn certificate request in background
+    activity_log.info(
+        &op_id,
+        "Request Certificate",
+        &format!("Request started for: {}", domain),
+    );
+
+    let log_clone = activity_log.into_inner();
+    let op_id_for_spawn = op_id.clone();
     let pool_clone = pool.clone();
+
     tokio::spawn(async move {
+        let log_ref: &ActivityLog = &log_clone;
         match request_certificate_impl(
             &pool_clone,
             &domain,
@@ -191,21 +214,32 @@ async fn request_certificate(
             &api_token,
             &acme_email,
             &directory_url,
+            Some(log_ref),
+            &op_id_for_spawn,
         )
         .await
         {
             Ok(_) => {
-                tracing::info!("Certificate successfully obtained for: {}", domain);
+                log_clone.success(
+                    &op_id_for_spawn,
+                    "Request Certificate",
+                    "Certificate stored successfully!",
+                );
             }
             Err(e) => {
-                tracing::error!("Failed to obtain certificate for {}: {}", domain, e);
+                log_clone.error(
+                    &op_id_for_spawn,
+                    "Request Certificate",
+                    &format!("Failed: {}", e),
+                );
             }
         }
     });
 
     HttpResponse::Accepted().json(serde_json::json!({
         "message": "Certificate request started",
-        "domain": domain_for_response
+        "domain": domain_for_response,
+        "op_id": op_id
     }))
 }
 
@@ -213,16 +247,18 @@ async fn renew_certificate(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
     body: web::Json<CertificateRequest>,
 ) -> HttpResponse {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
 
-    request_certificate(pool, req, acl, body).await
+    request_certificate(pool, req, acl, activity_log, body).await
 }
 
 /// Background task to request certificate via ACME.
+#[allow(clippy::too_many_arguments)]
 async fn request_certificate_impl(
     pool: &DbPool,
     domain: &str,
@@ -230,25 +266,23 @@ async fn request_certificate_impl(
     api_token: &str,
     acme_email: &str,
     directory_url: &str,
+    log: Option<&ActivityLog>,
+    op_id: &str,
 ) -> anyhow::Result<()> {
     use crate::acme::AcmeManager;
     use crate::cloudflare::CloudflareClient;
     use std::sync::Arc;
 
-    // Create Cloudflare client
     let cloudflare = Arc::new(CloudflareClient::new(api_token.to_string())?);
 
-    // Create ACME manager
     let acme = AcmeManager::new(
         directory_url.to_string(),
         acme_email.to_string(),
         cloudflare,
     );
 
-    // Request certificate
-    let (private_key, certificate) = acme.order_certificate(domain, wildcard).await?;
+    let (private_key, certificate) = acme.order_certificate(domain, wildcard, log, op_id).await?;
 
-    // Parse certificate to get expiry
     let expires_at = parse_certificate_expiry(&certificate)?;
 
     db::store_certificate(pool, domain, &private_key, &certificate, expires_at)
@@ -295,11 +329,114 @@ async fn certificate_status(
     }
 }
 
+// --- Activity Stream ---
+
+async fn activity_stream(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
+) -> HttpResponse {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    let rx = activity_log.subscribe();
+
+    let stream = futures::stream::unfold(rx, |mut rx| async {
+        match rx.recv().await {
+            Ok(entry) => {
+                let json = serde_json::to_string(&entry).unwrap_or_default();
+                Some((
+                    Ok::<_, actix_web::Error>(actix_web::web::Bytes::from(format!(
+                        "data: {json}\n\n"
+                    ))),
+                    rx,
+                ))
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                Some((Ok(actix_web::web::Bytes::from(": lagged\n\n")), rx))
+            }
+            Err(_) => None,
+        }
+    });
+
+    HttpResponse::Ok()
+        .insert_header(("Content-Type", "text/event-stream"))
+        .insert_header(("Cache-Control", "no-cache"))
+        .insert_header(("X-Accel-Buffering", "no"))
+        .streaming(stream)
+}
+
+// --- Cloudflare Test Connection ---
+
+#[derive(Debug, Deserialize)]
+struct CloudflareTestRequest {
+    api_token: String,
+}
+
+async fn test_cloudflare_connection(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
+    body: web::Json<CloudflareTestRequest>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    activity_log.info(
+        "cf-test",
+        "Test Connection",
+        "Testing Cloudflare API token...",
+    );
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            activity_log.error("cf-test", "Test Connection", &e.to_string());
+            return HttpResponse::Ok()
+                .json(serde_json::json!({"ok": false, "error": e.to_string()}));
+        }
+    };
+
+    let result = client
+        .get("https://api.cloudflare.com/client/v4/user/tokens/verify")
+        .header("Authorization", format!("Bearer {}", body.api_token))
+        .send()
+        .await;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            activity_log.success(
+                "cf-test",
+                "Test Connection",
+                "Cloudflare API token is valid!",
+            );
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
+        }
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let msg = format!("Cloudflare API returned HTTP {}", status);
+            activity_log.error("cf-test", "Test Connection", &msg);
+            HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": msg}))
+        }
+        Err(e) => {
+            let msg = format!("Connection failed: {}", e);
+            activity_log.error("cf-test", "Test Connection", &msg);
+            HttpResponse::Ok().json(serde_json::json!({"ok": false, "error": msg}))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn update_setting(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
     sinkhole_ipv4: web::Data<Arc<RwLock<Ipv4Addr>>>,
     sinkhole_ipv6: web::Data<Arc<RwLock<Ipv6Addr>>>,
     forwarder: web::Data<Arc<RwLock<ParallelForwarder>>>,
@@ -317,12 +454,22 @@ async fn update_setting(
             _ => false,
         };
         if !valid {
+            activity_log.warning(
+                "settings",
+                "Save Settings",
+                &format!("Invalid {}: {}", body.key, body.value),
+            );
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": format!("invalid {}: {}", body.key, body.value)
             }));
         }
         db::set_setting(&pool, &body.key, &body.value);
         let reason = format!("{} changed to {}", body.key, body.value);
+        activity_log.info(
+            "settings",
+            "Save Settings",
+            &format!("Setting saved: {} = {}", body.key, body.value),
+        );
         schedule_restart(&reason, Duration::from_secs(1));
         return HttpResponse::Ok().json(serde_json::json!({
             "ok": true,
@@ -331,6 +478,11 @@ async fn update_setting(
     }
 
     db::set_setting(&pool, &body.key, &body.value);
+    activity_log.info(
+        "settings",
+        "Save Settings",
+        &format!("Setting saved: {} = {}", body.key, body.value),
+    );
     // Hot-reload the setting in memory
     match body.key.as_str() {
         "sinkhole_ipv4" => {
@@ -839,12 +991,22 @@ async fn live_queries(
 
 // --- Restart ---
 
-async fn restart_server(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Responder {
+async fn restart_server(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    activity_log: web::Data<ActivityLog>,
+) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    activity_log.info("restart", "Restart Server", "Server restart requested");
     tracing::info!("Restart requested via API, exiting in 1s...");
     schedule_restart("restart requested via API", Duration::from_secs(1));
+    activity_log.warning(
+        "restart",
+        "Restart Server",
+        "Server restarting in 1 second...",
+    );
     HttpResponse::Ok().json(serde_json::json!({"status": "restarting"}))
 }
 
@@ -1222,6 +1384,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sync/verify", web::post().to(verify_sync_connection))
             .route("/acme/request", web::post().to(request_certificate))
             .route("/acme/renew", web::post().to(renew_certificate))
-            .route("/acme/status", web::get().to(certificate_status)),
+            .route("/acme/status", web::get().to(certificate_status))
+            .route("/activity/stream", web::get().to(activity_stream))
+            .route(
+                "/cloudflare/test",
+                web::post().to(test_cloudflare_connection),
+            ),
     );
 }
