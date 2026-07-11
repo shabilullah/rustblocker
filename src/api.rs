@@ -421,10 +421,16 @@ async fn certificate_status(
     // Get domain from settings
     let domain = db::get_setting(&pool, "domain");
     let acme_error = db::get_setting(&pool, "acme_error").unwrap_or_default();
+    let renewal_status = serde_json::json!({
+        "auto_renewal_enabled": domain.is_some(),
+        "auto_renewal_threshold_days": crate::renewal::AUTO_RENEWAL_THRESHOLD_DAYS,
+        "auto_renewal_interval_hours": crate::renewal::AUTO_RENEWAL_INTERVAL_HOURS,
+    });
 
     match domain {
         Some(domain) => match db::get_certificate_status(&pool, &domain) {
             Some(mut status) => {
+                merge_status_object(&mut status, &renewal_status);
                 if !acme_error.is_empty() {
                     status["acme_error"] = serde_json::json!(acme_error);
                 }
@@ -432,6 +438,7 @@ async fn certificate_status(
             }
             None => {
                 let mut resp = serde_json::json!({"has_certificate": false});
+                merge_status_object(&mut resp, &renewal_status);
                 if !acme_error.is_empty() {
                     resp["acme_error"] = serde_json::json!(acme_error);
                 }
@@ -440,8 +447,19 @@ async fn certificate_status(
         },
         None => HttpResponse::Ok().json(serde_json::json!({
             "has_certificate": false,
-            "error": "No domain configured"
+            "error": "No domain configured",
+            "auto_renewal_enabled": false,
+            "auto_renewal_threshold_days": crate::renewal::AUTO_RENEWAL_THRESHOLD_DAYS,
+            "auto_renewal_interval_hours": crate::renewal::AUTO_RENEWAL_INTERVAL_HOURS,
         })),
+    }
+}
+
+fn merge_status_object(target: &mut serde_json::Value, source: &serde_json::Value) {
+    if let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 

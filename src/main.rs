@@ -524,18 +524,27 @@ async fn run_server(cli: Cli) -> Result<()> {
     });
 
     // Check for expiring certificates on startup
-    if has_https_config {
-        if let Err(e) = rustblocker::renewal::check_expiring_on_startup(&pool, 30).await {
+    if !cli.force_http && db::get_setting(&pool, "domain").is_some() {
+        if let Err(e) = rustblocker::renewal::check_expiring_on_startup(
+            &pool,
+            rustblocker::renewal::AUTO_RENEWAL_THRESHOLD_DAYS,
+        )
+        .await
+        {
             warn!("Failed to check expiring certificates: {}", e);
         }
 
         let renewal_pool = pool.clone();
         let _renewal_handle = rustblocker::renewal::spawn_renewal_task(
             renewal_pool,
-            24, // Check every 24 hours
-            30, // Renew if expiring within 30 days
+            rustblocker::renewal::AUTO_RENEWAL_INTERVAL_HOURS,
+            rustblocker::renewal::AUTO_RENEWAL_THRESHOLD_DAYS,
         );
-        info!("Certificate auto-renewal enabled (checks every 24 hours)");
+        info!(
+            "Certificate auto-renewal enabled (checks every {} hours, renews within {} days)",
+            rustblocker::renewal::AUTO_RENEWAL_INTERVAL_HOURS,
+            rustblocker::renewal::AUTO_RENEWAL_THRESHOLD_DAYS
+        );
     }
     // Sync slave: read config from DB (CLI args override DB values).
     {

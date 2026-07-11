@@ -8,8 +8,11 @@ use crate::acme::AcmeManager;
 use crate::cloudflare::CloudflareClient;
 use crate::db::{self, DbPool};
 
+pub const AUTO_RENEWAL_INTERVAL_HOURS: u64 = 24;
+pub const AUTO_RENEWAL_THRESHOLD_DAYS: i64 = 7;
+
 /// Spawn a background task that checks for expiring certificates and renews them.
-/// Runs every 24 hours and renews certificates expiring within 30 days.
+/// Runs periodically and renews certificates expiring within the configured threshold.
 pub fn spawn_renewal_task(
     pool: DbPool,
     renewal_interval_hours: u64,

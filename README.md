@@ -23,7 +23,7 @@ A DNS blocker written in Rust — similar to Pi-hole but simpler. It intercepts 
 - **Security headers** — CSP, X-Frame-Options, X-Content-Type-Options, Referrer-Policy
 - **Replica sync** — configure a second RustBlocker as a replica; it polls a master and pulls only changed categories (hash-diffed, efficient for large blocklists)
 - **HTTPS with ACME** — automatic Let's Encrypt certificate acquisition via DNS-01 challenge (Cloudflare)
-- **Auto-renewal** — background scheduler renews certificates 30 days before expiry
+- **Auto-renewal** — background scheduler renews certificates 7 days before expiry
 - **Activity log** — real-time progress streaming for all operations (ACME, settings, restart) via SSE
 
 ## Quick Start
@@ -323,7 +323,7 @@ CLI flags take precedence over the stored DB config. `--sync-master` alone also 
 
 ## HTTPS & ACME Certificate Management
 
-RustBlocker supports automatic HTTPS via Let's Encrypt using the ACME protocol with Cloudflare DNS-01 challenges. Certificates are stored in the SQLite database and auto-renewed 30 days before expiry.
+RustBlocker supports automatic HTTPS via Let's Encrypt using the ACME protocol with Cloudflare DNS-01 challenges. Certificates are stored in the SQLite database and auto-renewed 7 days before expiry.
 
 ### Prerequisites
 
@@ -389,7 +389,7 @@ By default, RustBlocker loads the certificate from the database and binds both H
 
 ### Auto-renewal
 
-A background task checks every 24 hours for certificates expiring within 30 days and automatically renews them via ACME. On startup, RustBlocker also checks and warns about soon-expiring certificates.
+A background task checks every 24 hours for certificates expiring within 7 days and automatically renews them via ACME. On startup, RustBlocker also checks and warns about soon-expiring certificates. The HTTPS tab shows whether auto-renewal is enabled and displays the active check interval and renewal threshold.
 
 ### Activity Log
 
@@ -624,7 +624,7 @@ HTTPS (automatic when a valid certificate exists)
      ├─ ACME client (instant-acme) → Let's Encrypt
      ├─ Cloudflare DNS-01 challenge (api.rs / cloudflare.rs)
      ├─ TLS via rustls (tls.rs) → bind_rustls_0_23
-     └─ Auto-renewal (renewal.rs) → every 24h, 30-day threshold
+     └─ Auto-renewal (renewal.rs) → every 24h, 7-day threshold
 
 Replica Sync (sync.rs — slave side)
      │

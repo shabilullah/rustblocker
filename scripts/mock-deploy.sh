@@ -233,61 +233,85 @@ fi
 # Step: Request certificate
 if [ -n "${DOMAIN:-}" ]; then
     BEFORE_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
-
-    step
-    RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/acme/request" \
-        -H "Content-Type: application/json" \
-        -d "{\"domain\":\"$DOMAIN\",\"wildcard\":${WILDCARD:-false}}")
-    OP_ID=$(echo "$RESP" | grep -o '"op_id":"[^"]*"' | cut -d'"' -f4)
-    if [ -n "$OP_ID" ]; then
-        ok "$STEP" "acme-request" "accepted op_id=$OP_ID"
-    else
-        fail "$STEP" "acme-request" "request rejected"
-        exit 1
-    fi
-
-    # Step: Poll for certificate (default max 30 attempts = 300s)
-    step
-    ok "$STEP" "acme-poll" "polling for certificate (op_id=$OP_ID)..."
+    BEFORE_CERT_STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status" 2>/dev/null || true)
+    BEFORE_CERT_RENEWED=$(echo "$BEFORE_CERT_STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
+    BEFORE_CERT_DAYS=$(echo "$BEFORE_CERT_STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
+    RENEWAL_THRESHOLD=$(echo "$BEFORE_CERT_STATUS" | grep -o '"auto_renewal_threshold_days":[0-9]*' | cut -d: -f2)
+    RENEWAL_THRESHOLD="${RENEWAL_THRESHOLD:-7}"
     GOT_CERT=false
     POLL_FAILED=false
-    for i in $(seq 1 "$ACME_POLL_ATTEMPTS"); do
-        sleep 10
-        STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status")
-        if echo "$STATUS" | grep -q '"has_certificate":true'; then
-            DAYS=$(echo "$STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
-            ok "$STEP" "acme-poll" "certificate obtained (${DAYS:-?}d remaining) after $((i*10))s"
-            GOT_CERT=true
-            break
+    EXPECT_RESTART=true
+
+    if echo "$BEFORE_CERT_STATUS" | grep -q '"has_certificate":true' \
+        && [ -n "$BEFORE_CERT_DAYS" ] \
+        && [ "$BEFORE_CERT_DAYS" -gt "$RENEWAL_THRESHOLD" ] \
+        && [ "${FORCE_ACME:-false}" != "true" ]; then
+        step
+        skip "$STEP" "acme-request" "valid certificate already present (${BEFORE_CERT_DAYS}d remaining); set FORCE_ACME=true to request a fresh cert"
+        GOT_CERT=true
+        EXPECT_RESTART=false
+    else
+        step
+        RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/acme/request" \
+            -H "Content-Type: application/json" \
+            -d "{\"domain\":\"$DOMAIN\",\"wildcard\":${WILDCARD:-false}}")
+        OP_ID=$(echo "$RESP" | grep -o '"op_id":"[^"]*"' | cut -d'"' -f4)
+        if [ -n "$OP_ID" ]; then
+            ok "$STEP" "acme-request" "accepted op_id=$OP_ID"
+        else
+            fail "$STEP" "acme-request" "request rejected"
+            exit 1
         fi
-        if echo "$STATUS" | grep -q '"acme_error":"'; then
-            ERR=$(echo "$STATUS" | sed -n 's/.*"acme_error":"\([^"]*\)".*/\1/p' | head -1)
-            fail "$STEP" "acme-poll" "${ERR:-ACME request failed}"
-            POLL_FAILED=true
-            break
+
+        # Step: Poll for certificate (default max 30 attempts = 300s)
+        step
+        ok "$STEP" "acme-poll" "polling for certificate (op_id=$OP_ID)..."
+        for i in $(seq 1 "$ACME_POLL_ATTEMPTS"); do
+            sleep 10
+            STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status")
+            if echo "$STATUS" | grep -q '"has_certificate":true'; then
+                CURRENT_RENEWED=$(echo "$STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
+                if [ -z "$BEFORE_CERT_RENEWED" ] || { [ -n "$CURRENT_RENEWED" ] && [ "$CURRENT_RENEWED" != "$BEFORE_CERT_RENEWED" ]; }; then
+                    DAYS=$(echo "$STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
+                    ok "$STEP" "acme-poll" "certificate obtained (${DAYS:-?}d remaining) after $((i*10))s"
+                    GOT_CERT=true
+                    break
+                fi
+            fi
+            if echo "$STATUS" | grep -q '"acme_error":"'; then
+                ERR=$(echo "$STATUS" | sed -n 's/.*"acme_error":"\([^"]*\)".*/\1/p' | head -1)
+                fail "$STEP" "acme-poll" "${ERR:-ACME request failed}"
+                POLL_FAILED=true
+                break
+            fi
+            # Log intermediate poll as info in detail
+            ok "$STEP" "acme-poll" "still waiting ($((i*10))s)..." >&2
+        done
+        if [ "$GOT_CERT" != true ] && [ "$POLL_FAILED" != true ]; then
+            fail "$STEP" "acme-poll" "timeout after $((ACME_POLL_ATTEMPTS*10))s — check Activity Log in web UI"
+            "${SSH[@]}" "$REMOTE" "tail -n 120 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
         fi
-        # Log intermediate poll as info in detail
-        ok "$STEP" "acme-poll" "still waiting ($((i*10))s)..." >&2
-    done
-    if [ "$GOT_CERT" != true ] && [ "$POLL_FAILED" != true ]; then
-        fail "$STEP" "acme-poll" "timeout after $((ACME_POLL_ATTEMPTS*10))s — check Activity Log in web UI"
-        "${SSH[@]}" "$REMOTE" "tail -n 120 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
     fi
     if [ "$GOT_CERT" = true ]; then
-        step
-        RESTARTED=false
-        AFTER_CERT_PID=""
-        for i in $(seq 1 20); do
-            sleep 1
-            AFTER_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
-            if [ -n "$BEFORE_CERT_PID" ] && [ -n "$AFTER_CERT_PID" ] && [ "$BEFORE_CERT_PID" != "$AFTER_CERT_PID" ]; then
-                RESTARTED=true; break
+        if [ "$EXPECT_RESTART" = true ]; then
+            step
+            RESTARTED=false
+            AFTER_CERT_PID=""
+            for i in $(seq 1 20); do
+                sleep 1
+                AFTER_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
+                if [ -n "$BEFORE_CERT_PID" ] && [ -n "$AFTER_CERT_PID" ] && [ "$BEFORE_CERT_PID" != "$AFTER_CERT_PID" ]; then
+                    RESTARTED=true; break
+                fi
+            done
+            if [ "$RESTARTED" = true ]; then
+                ok "$STEP" "https" "automatic restart observed (${BEFORE_CERT_PID} -> ${AFTER_CERT_PID})"
+            else
+                fail "$STEP" "https" "automatic restart was not observed"
             fi
-        done
-        if [ "$RESTARTED" = true ]; then
-            ok "$STEP" "https" "automatic restart observed (${BEFORE_CERT_PID} -> ${AFTER_CERT_PID})"
         else
-            fail "$STEP" "https" "automatic restart was not observed"
+            step
+            skip "$STEP" "https" "automatic restart not required for existing valid certificate"
         fi
 
         step
@@ -300,9 +324,13 @@ if [ -n "${DOMAIN:-}" ]; then
             fi
         done
         if [ "$HTTPS_OK" = true ]; then
-            ok "$STEP" "https" "HTTPS health check passed after automatic restart (after $((i*2))s)"
+            if [ "$EXPECT_RESTART" = true ]; then
+                ok "$STEP" "https" "HTTPS health check passed after automatic restart (after $((i*2))s)"
+            else
+                ok "$STEP" "https" "HTTPS health check passed (after $((i*2))s)"
+            fi
         else
-            fail "$STEP" "https" "HTTPS health check failed after automatic restart"
+            fail "$STEP" "https" "HTTPS health check failed"
             "${SSH[@]}" "$REMOTE" "rc-service rustblocker status 2>/dev/null || systemctl status rustblocker --no-pager 2>/dev/null || true; tail -n 80 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
         fi
     fi

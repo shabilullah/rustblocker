@@ -391,8 +391,10 @@
 
     async function loadCertificateStatus() {
         const container = document.getElementById('cert-status-container');
+        const renewalContainer = document.getElementById('cert-renewal-container');
         try {
             const status = await fetch(API + '/acme/status').then(r => r.json());
+            renderRenewalStatus(status);
             
             if (!status.has_certificate) {
                 container.innerHTML = '<p class="text-sm text-yellow-400">No certificate found. Configure settings below and request a certificate.</p>';
@@ -417,7 +419,31 @@
             `;
         } catch (e) {
             container.innerHTML = `<p class="text-sm text-red-400">Error loading certificate status: ${e.message}</p>`;
+            if (renewalContainer) {
+                renewalContainer.innerHTML = '<p class="text-sm text-red-400">Error loading renewal policy.</p>';
+            }
         }
+    }
+
+    function renderRenewalStatus(status) {
+        const renewalEl = document.getElementById('cert-renewal-container');
+        if (!renewalEl) return;
+
+        const enabled = status.auto_renewal_enabled === true;
+        const thresholdDays = status.auto_renewal_threshold_days ?? 7;
+        const intervalHours = status.auto_renewal_interval_hours ?? 24;
+        const badgeClass = enabled ? 'bg-emerald-900 text-emerald-300 border-emerald-700' : 'bg-gray-700 text-gray-300 border-gray-600';
+        const label = enabled ? 'Enabled' : 'Waiting for domain';
+
+        renewalEl.innerHTML = `
+            <div class="flex flex-wrap items-center justify-between gap-3 text-sm">
+                <div>
+                    <div class="text-gray-300 font-medium">Auto-renewal</div>
+                    <div class="text-xs text-gray-400 mt-1">Checks every ${intervalHours}h and renews when ${thresholdDays} days or less remain.</div>
+                </div>
+                <span class="border ${badgeClass} rounded px-2 py-1 text-xs font-semibold">${label}</span>
+            </div>
+        `;
     }
 
     async function loadHTTPSSettings() {
