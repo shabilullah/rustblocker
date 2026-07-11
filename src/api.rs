@@ -135,6 +135,166 @@ async fn get_settings(
     HttpResponse::Ok().json(settings)
 }
 
+// --- ACME endpoints ---
+
+#[derive(Debug, Deserialize)]
+struct CertificateRequest {
+    domain: String,
+    wildcard: Option<bool>,
+}
+
+async fn request_certificate(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<CertificateRequest>,
+) -> HttpResponse {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    // Get Cloudflare API token from settings
+    let api_token = match db::get_setting(&pool, "cloudflare_api_token") {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "Cloudflare API token not configured"
+            }));
+        }
+    };
+
+    // Get ACME email from settings
+    let acme_email = match db::get_setting(&pool, "acme_email") {
+        Some(email) if !email.is_empty() => email,
+        _ => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "ACME email not configured"
+            }));
+        }
+    };
+
+    // Get directory URL (default to production)
+    let directory_url = db::get_setting(&pool, "acme_directory_url")
+        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+
+    let domain = body.domain.clone();
+    let domain_for_response = domain.clone();
+    let wildcard = body.wildcard.unwrap_or(false);
+
+    // Spawn certificate request in background
+    let pool_clone = pool.clone();
+    tokio::spawn(async move {
+        match request_certificate_impl(
+            &pool_clone,
+            &domain,
+            wildcard,
+            &api_token,
+            &acme_email,
+            &directory_url,
+        )
+        .await
+        {
+            Ok(_) => {
+                tracing::info!("Certificate successfully obtained for: {}", domain);
+            }
+            Err(e) => {
+                tracing::error!("Failed to obtain certificate for {}: {}", domain, e);
+            }
+        }
+    });
+
+    HttpResponse::Accepted().json(serde_json::json!({
+        "message": "Certificate request started",
+        "domain": domain_for_response
+    }))
+}
+
+async fn renew_certificate(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    body: web::Json<CertificateRequest>,
+) -> HttpResponse {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    request_certificate(pool, req, acl, body).await
+}
+
+/// Background task to request certificate via ACME.
+async fn request_certificate_impl(
+    pool: &DbPool,
+    domain: &str,
+    wildcard: bool,
+    api_token: &str,
+    acme_email: &str,
+    directory_url: &str,
+) -> anyhow::Result<()> {
+    use crate::acme::AcmeManager;
+    use crate::cloudflare::CloudflareClient;
+    use std::sync::Arc;
+
+    // Create Cloudflare client
+    let cloudflare = Arc::new(CloudflareClient::new(api_token.to_string())?);
+
+    // Create ACME manager
+    let acme = AcmeManager::new(
+        directory_url.to_string(),
+        acme_email.to_string(),
+        cloudflare,
+    );
+
+    // Request certificate
+    let (private_key, certificate) = acme.order_certificate(domain, wildcard).await?;
+
+    // Parse certificate to get expiry
+    let expires_at = parse_certificate_expiry(&certificate)?;
+
+    db::store_certificate(pool, domain, &private_key, &certificate, expires_at)
+        .map_err(|e| anyhow::anyhow!("Database error: {}", e))?;
+
+    Ok(())
+}
+
+/// Parse certificate expiry from PEM.
+fn parse_certificate_expiry(cert_pem: &[u8]) -> anyhow::Result<i64> {
+    use x509_parser::prelude::*;
+
+    let pem_parsed =
+        ::pem::parse(cert_pem).map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
+    let cert = X509Certificate::from_der(pem_parsed.contents())?.1;
+
+    // Convert ASN1Time to Unix timestamp
+    let not_after = cert.validity().not_after.timestamp();
+
+    Ok(not_after)
+}
+
+async fn certificate_status(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+
+    // Get domain from settings
+    let domain = db::get_setting(&pool, "domain");
+
+    match domain {
+        Some(domain) => match db::get_certificate_status(&pool, &domain) {
+            Some(status) => HttpResponse::Ok().json(status),
+            None => HttpResponse::Ok().json(serde_json::json!({"has_certificate": false})),
+        },
+        None => HttpResponse::Ok().json(serde_json::json!({
+            "has_certificate": false,
+            "error": "No domain configured"
+        })),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn update_setting(
     pool: web::Data<DbPool>,
@@ -1059,6 +1219,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sync/config", web::get().to(get_sync_config))
             .route("/sync/config", web::put().to(put_sync_config))
             .route("/sync/status", web::get().to(get_sync_status))
-            .route("/sync/verify", web::post().to(verify_sync_connection)),
+            .route("/sync/verify", web::post().to(verify_sync_connection))
+            .route("/acme/request", web::post().to(request_certificate))
+            .route("/acme/renew", web::post().to(renew_certificate))
+            .route("/acme/status", web::get().to(certificate_status)),
     );
 }

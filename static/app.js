@@ -29,6 +29,7 @@
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
             case 'settings': loadSettings(); loadSyncConfig(); autoCheckUpdate(); return;
+            case 'https': return loadHTTPSTab();
             case 'stats': return loadStats();
         }
     }
@@ -381,6 +382,165 @@
         await fetch(API + '/rewrites/' + id, {method: 'DELETE'});
         loadRewrites();
     }
+
+    // --- HTTPS ---
+
+    async function loadHTTPSTab() {
+        await Promise.all([loadCertificateStatus(), loadHTTPSSettings()]);
+    }
+
+    async function loadCertificateStatus() {
+        const container = document.getElementById('cert-status-container');
+        try {
+            const status = await fetch(API + '/acme/status').then(r => r.json());
+            
+            if (!status.has_certificate) {
+                container.innerHTML = '<p class="text-sm text-yellow-400">No certificate found. Configure settings below and request a certificate.</p>';
+                return;
+            }
+
+            const daysRemaining = status.days_remaining;
+            const color = daysRemaining > 30 ? 'text-green-400' : daysRemaining > 15 ? 'text-yellow-400' : 'text-red-400';
+            
+            const issuedDate = new Date(status.issued_at * 1000).toLocaleDateString();
+            const expiresDate = new Date(status.expires_at * 1000).toLocaleDateString();
+            const renewedDate = status.last_renewed ? new Date(status.last_renewed * 1000).toLocaleDateString() : 'Never';
+            
+            container.innerHTML = `
+                <div class="space-y-2 text-sm">
+                    <div><span class="text-gray-400">Domain:</span> <span class="font-mono">${status.domain}</span></div>
+                    <div><span class="text-gray-400">Issued:</span> ${issuedDate}</div>
+                    <div><span class="text-gray-400">Expires:</span> ${expiresDate}</div>
+                    <div><span class="text-gray-400">Days Remaining:</span> <span class="${color} font-semibold">${daysRemaining} days</span></div>
+                    <div><span class="text-gray-400">Last Renewed:</span> ${renewedDate}</div>
+                </div>
+            `;
+        } catch (e) {
+            container.innerHTML = `<p class="text-sm text-red-400">Error loading certificate status: ${e.message}</p>`;
+        }
+    }
+
+    async function loadHTTPSSettings() {
+        try {
+            const settings = await fetch(API + '/settings').then(r => r.json());
+            document.getElementById('https-domain').value = settings.domain || '';
+            document.getElementById('https-email').value = settings.acme_email || '';
+            document.getElementById('https-wildcard').checked = settings.wildcard_cert === 'true';
+        } catch (e) {
+            console.error('Failed to load HTTPS settings:', e);
+        }
+    }
+
+    document.getElementById('save-https-settings').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const email = document.getElementById('https-email').value.trim();
+        const token = document.getElementById('https-cloudflare-token').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+
+        if (!domain || !email) {
+            alert('Domain and email are required');
+            return;
+        }
+
+        try {
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'domain', value: domain})
+            });
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'acme_email', value: email})
+            });
+            if (token) {
+                await fetch(API + '/settings', {
+                    method: 'PUT',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({key: 'cloudflare_api_token', value: token})
+                });
+            }
+            await fetch(API + '/settings', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key: 'wildcard_cert', value: wildcard ? 'true' : 'false'})
+            });
+            alert('Settings saved successfully');
+            document.getElementById('https-cloudflare-token').value = '';
+        } catch (e) {
+            alert('Failed to save settings: ' + e.message);
+        }
+    });
+
+    document.getElementById('request-cert-btn').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+        const statusDiv = document.getElementById('cert-action-status');
+
+        if (!domain) {
+            statusDiv.innerHTML = '<p class="text-red-400">Please set domain in settings first</p>';
+            return;
+        }
+
+        statusDiv.innerHTML = '<p class="text-blue-400">Requesting certificate... This may take 1-2 minutes.</p>';
+        document.getElementById('request-cert-btn').disabled = true;
+
+        try {
+            const response = await fetch(API + '/acme/request', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({domain, wildcard})
+            });
+            const result = await response.json();
+            
+            if (response.ok) {
+                statusDiv.innerHTML = '<p class="text-green-400">Certificate request started in background. Check status in a few minutes.</p>';
+                setTimeout(() => loadCertificateStatus(), 60000);
+            } else {
+                statusDiv.innerHTML = `<p class="text-red-400">Error: ${result.error || 'Request failed'}</p>`;
+            }
+        } catch (e) {
+            statusDiv.innerHTML = `<p class="text-red-400">Request failed: ${e.message}</p>`;
+        } finally {
+            document.getElementById('request-cert-btn').disabled = false;
+        }
+    });
+
+    document.getElementById('renew-cert-btn').addEventListener('click', async () => {
+        const domain = document.getElementById('https-domain').value.trim();
+        const wildcard = document.getElementById('https-wildcard').checked;
+        const statusDiv = document.getElementById('cert-action-status');
+
+        if (!domain) {
+            statusDiv.innerHTML = '<p class="text-red-400">Please set domain in settings first</p>';
+            return;
+        }
+
+        if (!confirm('Force certificate renewal?')) return;
+
+        statusDiv.innerHTML = '<p class="text-blue-400">Renewing certificate... This may take 1-2 minutes.</p>';
+        document.getElementById('renew-cert-btn').disabled = true;
+
+        try {
+            const response = await fetch(API + '/acme/renew', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({domain, wildcard})
+            });
+            const result = await response.json();
+            
+            if (response.ok) {
+                statusDiv.innerHTML = '<p class="text-green-400">Certificate renewal started in background. Check status in a few minutes.</p>';
+                setTimeout(() => loadCertificateStatus(), 60000);
+            } else {
+                statusDiv.innerHTML = `<p class="text-red-400">Error: ${result.error || 'Renewal failed'}</p>`;
+            }
+        } catch (e) {
+            statusDiv.innerHTML = `<p class="text-red-400">Renewal failed: ${e.message}</p>`;
+        } finally {
+            document.getElementById('renew-cert-btn').disabled = false;
+        }
+    });
 
     // --- Settings ---
 
