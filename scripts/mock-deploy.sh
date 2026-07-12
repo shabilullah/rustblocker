@@ -232,6 +232,34 @@ else
 fi
 
 step
+ORIGINAL_FORWARD_STRATEGY=$(echo "$SETTINGS" | sed -n 's/.*"forward_strategy":"\([^"]*\)".*/\1/p' | head -1)
+ORIGINAL_FORWARD_STRATEGY="${ORIGINAL_FORWARD_STRATEGY:-adaptive}"
+HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"forward_strategy","value":"parallel"}')
+SETTINGS_PARALLEL=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/settings")
+HTTP_CODE_ADAPTIVE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"forward_strategy","value":"adaptive"}')
+SETTINGS_ADAPTIVE=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/settings")
+if [ "$ORIGINAL_FORWARD_STRATEGY" != "adaptive" ]; then
+    "${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X PUT "$BASE_URL/api/settings" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\":\"forward_strategy\",\"value\":\"$ORIGINAL_FORWARD_STRATEGY\"}" >/dev/null || true
+fi
+if [ "$HTTP_CODE" = "200" ] \
+    && [ "$HTTP_CODE_ADAPTIVE" = "200" ] \
+    && echo "$SETTINGS_PARALLEL" | grep -q '"forward_strategy":"parallel"' \
+    && echo "$SETTINGS_ADAPTIVE" | grep -q '"forward_strategy":"adaptive"'; then
+    ok "$STEP" "forward-strategy" "settings API switched parallel/adaptive and restored ${ORIGINAL_FORWARD_STRATEGY}"
+else
+    fail "$STEP" "forward-strategy" "forward strategy setting did not round-trip (parallel HTTP $HTTP_CODE, adaptive HTTP $HTTP_CODE_ADAPTIVE)"
+fi
+
+step
 VERSION_JSON=$("${CURL[@]}" "$BASE_URL/api/version")
 DEPLOYED_BUILD=$(echo "$VERSION_JSON" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p' | head -1)
 if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ]; then

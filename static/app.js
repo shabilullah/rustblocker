@@ -968,6 +968,10 @@
             {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
             {key: 'log_level', label: 'Log Level'},
             {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
+            {key: 'forward_strategy', label: 'Forward Strategy', type: 'select', options: [
+                {value: 'adaptive', label: 'Adaptive'},
+                {value: 'parallel', label: 'Parallel'}
+            ]},
             {key: 'allowed_networks', label: 'Allowed Networks (CIDR, comma-separated)'},
             {key: 'stats_retention_days', label: 'Stats Retention (days, 0 = forever)'},
         ];
@@ -977,6 +981,17 @@
                     <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
                     <textarea id="setting-${f.key}" rows="2" placeholder="192.168.0.0/24, 10.0.0.0/22 (empty = allow all)"
                         class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">${data[f.key] || ''}</textarea>
+                </div>`;
+            }
+            if (f.type === 'select') {
+                const current = data[f.key] || f.options[0].value;
+                const options = f.options.map(option =>
+                    `<option value="${option.value}"${current === option.value ? ' selected' : ''}>${option.label}</option>`
+                ).join('');
+                return `<div>
+                    <label class="block text-sm text-gray-400 mb-1">${f.label}</label>
+                    <select id="setting-${f.key}"
+                        class="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none focus:border-emerald-500">${options}</select>
                 </div>`;
             }
             return `<div>
@@ -989,7 +1004,7 @@
     }
 
     async function saveSettings() {
-        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'allowed_networks', 'stats_retention_days'];
+        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'forward_strategy', 'allowed_networks', 'stats_retention_days'];
         const restartKeys = ['listen_address', 'listen_port', 'log_level'];
         let needsRestart = false;
         let restartPending = false;

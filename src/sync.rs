@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::config::{RewriteRule, UpstreamConfig};
 use crate::db::{self, DbPool};
-use crate::forwarder::ParallelForwarder;
+use crate::forwarder::{ForwardStrategy, ParallelForwarder};
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore, RewriteMap};
 
 #[derive(Debug, Deserialize)]
@@ -281,7 +281,7 @@ fn apply_snapshot_blocking(
     forwarder: &Arc<RwLock<ParallelForwarder>>,
 ) {
     match category {
-        "settings" => apply_settings(data, pool),
+        "settings" => apply_settings(data, pool, forwarder),
         "upstreams" => apply_upstreams(data, pool, forwarder),
         "rewrites" => apply_rewrites(data, pool, rewrites),
         "sources" => apply_sources(data, pool),
@@ -291,7 +291,11 @@ fn apply_snapshot_blocking(
     }
 }
 
-fn apply_settings(data: &serde_json::Value, pool: &DbPool) {
+fn apply_settings(
+    data: &serde_json::Value,
+    pool: &DbPool,
+    forwarder: &Arc<RwLock<ParallelForwarder>>,
+) {
     let obj = match data.as_object() {
         Some(o) => o,
         None => {
@@ -326,6 +330,36 @@ fn apply_settings(data: &serde_json::Value, pool: &DbPool) {
         if let Some(v) = val.as_str() {
             db::set_setting(pool, key, v);
         }
+    }
+
+    reload_forwarder_from_db(pool, forwarder, "settings apply");
+}
+
+fn forward_strategy_from_db(pool: &DbPool) -> ForwardStrategy {
+    db::get_setting(pool, "forward_strategy")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default()
+}
+
+fn reload_forwarder_from_db(
+    pool: &DbPool,
+    forwarder: &Arc<RwLock<ParallelForwarder>>,
+    reason: &str,
+) {
+    let timeout_secs: u64 = db::get_setting(pool, "upstream_timeout_secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let strategy = forward_strategy_from_db(pool);
+    let configs: Vec<UpstreamConfig> = db::get_upstreams(pool)
+        .iter()
+        .map(|u| UpstreamConfig {
+            address: u.address.clone(),
+            port: Some(u.port as u16),
+        })
+        .collect();
+
+    if let Err(e) = forwarder.write().reload(&configs, timeout_secs, strategy) {
+        warn!("Sync: forwarder reload failed after {}: {}", reason, e);
     }
 }
 
@@ -379,7 +413,8 @@ fn apply_upstreams(
             port: Some(u.port as u16),
         })
         .collect();
-    if let Err(e) = forwarder.write().reload(&configs, timeout_secs) {
+    let strategy = forward_strategy_from_db(pool);
+    if let Err(e) = forwarder.write().reload(&configs, timeout_secs, strategy) {
         warn!("Sync: forwarder reload failed: {}", e);
     }
 }

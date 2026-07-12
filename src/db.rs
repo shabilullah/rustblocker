@@ -120,6 +120,7 @@ pub fn seed_defaults(pool: &DbPool) {
         ("sinkhole_ipv6", "::"),
         ("log_level", "info"),
         ("upstream_timeout_secs", "5"),
+        ("forward_strategy", "adaptive"),
         ("allowed_networks", ""),
         ("stats_retention_days", "30"),
     ];

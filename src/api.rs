@@ -12,7 +12,7 @@ use crate::activity::ActivityLog;
 use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret};
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbPool};
-use crate::forwarder::ParallelForwarder;
+use crate::forwarder::{ForwardStrategy, ParallelForwarder};
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
 use crate::sync::SharedSyncState;
@@ -614,6 +614,32 @@ async fn update_setting(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    // Forwarding strategy changes apply immediately to new forwarded queries.
+    if body.key == "forward_strategy" {
+        match body.value.parse::<ForwardStrategy>() {
+            Ok(strategy) => {
+                db::set_setting(&pool, &body.key, strategy.as_str());
+                forwarder.write().set_strategy(strategy);
+                activity_log.info(
+                    "settings",
+                    "Save Settings",
+                    &format!("Setting saved: {} = {}", body.key, strategy.as_str()),
+                );
+                tracing::info!("Forward strategy reloaded: {}", strategy.as_str());
+                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
+            }
+            Err(_) => {
+                activity_log.warning(
+                    "settings",
+                    "Save Settings",
+                    &format!("Invalid forward strategy: {}", body.value),
+                );
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": "invalid forward_strategy"}));
+            }
+        }
+    }
+
     // Listening socket settings can only take effect after a restart.
     if body.key == "listen_address" || body.key == "listen_port" {
         let valid = match body.key.as_str() {
@@ -755,7 +781,10 @@ fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
     let timeout_secs: u64 = db::get_setting(pool, "upstream_timeout_secs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    if let Err(e) = forwarder.write().reload(&upstreams, timeout_secs) {
+    let strategy = db::get_setting(pool, "forward_strategy")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default();
+    if let Err(e) = forwarder.write().reload(&upstreams, timeout_secs, strategy) {
         warn!("Failed to reload forwarder: {}", e);
     }
 }

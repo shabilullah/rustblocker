@@ -14,7 +14,7 @@ use rustblocker::acl;
 use rustblocker::api;
 use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
-use rustblocker::forwarder::ParallelForwarder;
+use rustblocker::forwarder::{ForwardStrategy, ParallelForwarder};
 use rustblocker::handler::DnsBlockerHandler;
 use rustblocker::lists::{
     AllowlistStore, BlocklistStore, DomainStore, RewriteMap, normalize_domain,
@@ -227,6 +227,9 @@ async fn run_server(cli: Cli) -> Result<()> {
     let upstream_timeout: u64 = get_setting_string(&pool, "upstream_timeout_secs")
         .parse()
         .unwrap_or(5);
+    let forward_strategy: ForwardStrategy = get_setting_string(&pool, "forward_strategy")
+        .parse()
+        .unwrap_or_default();
 
     let dns_port = cli.dns_port.unwrap_or(db_dns_port);
     let web_port = cli.web_port.unwrap_or(dns_port + 1);
@@ -269,7 +272,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         .collect();
 
     let forwarder = Arc::new(RwLock::new(
-        ParallelForwarder::new(&upstreams, upstream_timeout)
+        ParallelForwarder::new_with_strategy(&upstreams, upstream_timeout, forward_strategy)
             .context("Failed to create upstream forwarder")?,
     ));
 
