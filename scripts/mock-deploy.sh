@@ -26,6 +26,12 @@ ok()   { printf '{"step":%s,"name":"%s","status":"ok","detail":"%s"}\n' "$1" "$2
 fail() { printf '{"step":%s,"name":"%s","status":"fail","detail":"%s"}\n' "$1" "$2" "$3"; FAILED=1; }
 skip() { printf '{"step":%s,"name":"%s","status":"skip","detail":"%s"}\n' "$1" "$2" "$3"; }
 shell_quote() { printf "'%s'" "$(printf "%s" "$1" | sed "s/'/'\\\\''/g")"; }
+enabled() {
+    case "${1:-false}" in
+        true|TRUE|1|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 FAILED=0
 STEP=0
 step() { STEP=$((STEP+1)); }
@@ -43,6 +49,7 @@ BINARY_NAME="rustblocker"
 REMOTE_INSTALL_DIR="/usr/local/lib/rustblocker"
 WEB_PORT="${WEB_PORT:-54}"
 BASE_URL="http://${SSH_HOST}:${WEB_PORT}"
+ENABLE_CLOUDFLARE_HTTPS="${ENABLE_CLOUDFLARE_HTTPS:-false}"
 
 # SSH setup: prefer sshpass, fall back to SSH_ASKPASS (askpass.sh)
 export SSHPASS="$SSH_PASSWORD"
@@ -67,6 +74,13 @@ else
 fi
 REMOTE="${SSH_USER}@${SSH_HOST}"
 CURL=(curl -s --connect-timeout 5 --max-time "$TIMEOUT")
+
+remote_dns_a() {
+    local domain="$1"
+    local quoted_domain
+    quoted_domain=$(shell_quote "$domain")
+    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup \"\$domain\" 127.0.0.1 | awk '/^Address: / { print \$2 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
+}
 
 remote_root() {
     local command="$1"
@@ -192,150 +206,215 @@ else
     fail "$STEP" "settings" "could not read settings"
 fi
 
-# Step: Configure HTTPS settings (only if provided)
-for pair in "domain=${DOMAIN:-}" "acme_email=${ACME_EMAIL:-}" "cloudflare_api_token=${CF_TOKEN:-}" "wildcard_cert=${WILDCARD:-false}"; do
-    key="${pair%%=*}"
-    value="${pair#*=}"
-    if [ -z "$value" ]; then
-        step; skip "$STEP" "configure" "$key not set"
-        continue
-    fi
-    step
-    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
-        -X PUT "$BASE_URL/api/settings" \
-        -H "Content-Type: application/json" \
-        -d "{\"key\":\"$key\",\"value\":\"$value\"}")
-    if [ "$HTTP_CODE" = "200" ]; then
-        masked="${value}"
-        [ ${#masked} -gt 20 ] && masked="${value:0:4}...${value: -4}"
-        ok "$STEP" "configure" "$key = $masked"
-    else
-        fail "$STEP" "configure" "$key -> HTTP $HTTP_CODE"
-    fi
-done
+# Step: Verify wildcard blocklist matching through the deployed DNS handler.
+SINKHOLE_IPV4=$(echo "$SETTINGS" | sed -n 's/.*"sinkhole_ipv4":"\([^"]*\)".*/\1/p' | head -1)
+SINKHOLE_IPV4="${SINKHOLE_IPV4:-0.0.0.0}"
+WILDCARD_BASE="mock-wildcard-$(date +%s)-$$.rustblocker.test"
+WILDCARD_ENTRY="*.${WILDCARD_BASE}"
+WILDCARD_SUBDOMAIN="sub.${WILDCARD_BASE}"
+WILDCARD_RESPONSE_FILE=$(mktemp)
 
-# Step: Test Cloudflare connection
-if [ -n "${CF_TOKEN:-}" ]; then
-    step
-    RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/cloudflare/test" \
-        -H "Content-Type: application/json" \
-        -d "{\"api_token\":\"$CF_TOKEN\"}")
-    if echo "$RESP" | grep -q '"ok":true'; then
-        ok "$STEP" "cf-test" "token valid"
-    else
-        ERR=$(echo "$RESP" | grep -o '"error":"[^"]*"' | head -1 | cut -d'"' -f4)
-        fail "$STEP" "cf-test" "${ERR:-invalid token}"
-    fi
+step
+HTTP_CODE=$("${CURL[@]}" -o "$WILDCARD_RESPONSE_FILE" -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/blocklist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$WILDCARD_ENTRY\"}")
+WILDCARD_RESPONSE=$(cat "$WILDCARD_RESPONSE_FILE")
+rm -f "$WILDCARD_RESPONSE_FILE"
+WILDCARD_BLOCK_ID=$(echo "$WILDCARD_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+if [ "$HTTP_CODE" = "201" ] && [ -n "$WILDCARD_BLOCK_ID" ]; then
+    ok "$STEP" "dns-wildcard" "added temporary blocklist entry $WILDCARD_ENTRY (id=$WILDCARD_BLOCK_ID)"
 else
-    step; skip "$STEP" "cf-test" "CF_TOKEN not set"
+    fail "$STEP" "dns-wildcard" "failed to add $WILDCARD_ENTRY (HTTP $HTTP_CODE)"
 fi
 
-# Step: Request certificate
-if [ -n "${DOMAIN:-}" ]; then
-    BEFORE_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
-    BEFORE_CERT_STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status" 2>/dev/null || true)
-    BEFORE_CERT_RENEWED=$(echo "$BEFORE_CERT_STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
-    BEFORE_CERT_DAYS=$(echo "$BEFORE_CERT_STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
-    RENEWAL_THRESHOLD=$(echo "$BEFORE_CERT_STATUS" | grep -o '"auto_renewal_threshold_days":[0-9]*' | cut -d: -f2)
-    RENEWAL_THRESHOLD="${RENEWAL_THRESHOLD:-7}"
-    GOT_CERT=false
-    POLL_FAILED=false
-    EXPECT_RESTART=true
-
-    if echo "$BEFORE_CERT_STATUS" | grep -q '"has_certificate":true' \
-        && [ -n "$BEFORE_CERT_DAYS" ] \
-        && [ "$BEFORE_CERT_DAYS" -gt "$RENEWAL_THRESHOLD" ] \
-        && [ "${FORCE_ACME:-false}" != "true" ]; then
-        step
-        skip "$STEP" "acme-request" "valid certificate already present (${BEFORE_CERT_DAYS}d remaining); set FORCE_ACME=true to request a fresh cert"
-        GOT_CERT=true
-        EXPECT_RESTART=false
+step
+if DNS_SUBDOMAIN=$(remote_dns_a "$WILDCARD_SUBDOMAIN" 2>/dev/null); then
+    if echo "$DNS_SUBDOMAIN" | grep -Fxq "__NO_DNS_TOOL__"; then
+        fail "$STEP" "dns-wildcard" "remote host has no dig/drill/nslookup for DNS smoke test"
+    elif echo "$DNS_SUBDOMAIN" | grep -Fxq "$SINKHOLE_IPV4"; then
+        ok "$STEP" "dns-wildcard" "$WILDCARD_SUBDOMAIN resolved to sinkhole $SINKHOLE_IPV4"
     else
-        step
-        RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/acme/request" \
-            -H "Content-Type: application/json" \
-            -d "{\"domain\":\"$DOMAIN\",\"wildcard\":${WILDCARD:-false}}")
-        OP_ID=$(echo "$RESP" | grep -o '"op_id":"[^"]*"' | cut -d'"' -f4)
-        if [ -n "$OP_ID" ]; then
-            ok "$STEP" "acme-request" "accepted op_id=$OP_ID"
-        else
-            fail "$STEP" "acme-request" "request rejected"
-            exit 1
-        fi
-
-        # Step: Poll for certificate (default max 30 attempts = 300s)
-        step
-        ok "$STEP" "acme-poll" "polling for certificate (op_id=$OP_ID)..."
-        for i in $(seq 1 "$ACME_POLL_ATTEMPTS"); do
-            sleep 10
-            STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status")
-            if echo "$STATUS" | grep -q '"has_certificate":true'; then
-                CURRENT_RENEWED=$(echo "$STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
-                if [ -z "$BEFORE_CERT_RENEWED" ] || { [ -n "$CURRENT_RENEWED" ] && [ "$CURRENT_RENEWED" != "$BEFORE_CERT_RENEWED" ]; }; then
-                    DAYS=$(echo "$STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
-                    ok "$STEP" "acme-poll" "certificate obtained (${DAYS:-?}d remaining) after $((i*10))s"
-                    GOT_CERT=true
-                    break
-                fi
-            fi
-            if echo "$STATUS" | grep -q '"acme_error":"'; then
-                ERR=$(echo "$STATUS" | sed -n 's/.*"acme_error":"\([^"]*\)".*/\1/p' | head -1)
-                fail "$STEP" "acme-poll" "${ERR:-ACME request failed}"
-                POLL_FAILED=true
-                break
-            fi
-            # Log intermediate poll as info in detail
-            ok "$STEP" "acme-poll" "still waiting ($((i*10))s)..." >&2
-        done
-        if [ "$GOT_CERT" != true ] && [ "$POLL_FAILED" != true ]; then
-            fail "$STEP" "acme-poll" "timeout after $((ACME_POLL_ATTEMPTS*10))s — check Activity Log in web UI"
-            "${SSH[@]}" "$REMOTE" "tail -n 120 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
-        fi
-    fi
-    if [ "$GOT_CERT" = true ]; then
-        if [ "$EXPECT_RESTART" = true ]; then
-            step
-            RESTARTED=false
-            AFTER_CERT_PID=""
-            for i in $(seq 1 20); do
-                sleep 1
-                AFTER_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
-                if [ -n "$BEFORE_CERT_PID" ] && [ -n "$AFTER_CERT_PID" ] && [ "$BEFORE_CERT_PID" != "$AFTER_CERT_PID" ]; then
-                    RESTARTED=true; break
-                fi
-            done
-            if [ "$RESTARTED" = true ]; then
-                ok "$STEP" "https" "automatic restart observed (${BEFORE_CERT_PID} -> ${AFTER_CERT_PID})"
-            else
-                fail "$STEP" "https" "automatic restart was not observed"
-            fi
-        else
-            step
-            skip "$STEP" "https" "automatic restart not required for existing valid certificate"
-        fi
-
-        step
-        HTTPS_URL="https://${DOMAIN}/api/health"
-        HTTPS_OK=false
-        for i in $(seq 1 20); do
-            sleep 2
-            if "${CURL[@]}" -k -o /dev/null -w "%{http_code}" "$HTTPS_URL" 2>/dev/null | grep -q '200'; then
-                HTTPS_OK=true; break
-            fi
-        done
-        if [ "$HTTPS_OK" = true ]; then
-            if [ "$EXPECT_RESTART" = true ]; then
-                ok "$STEP" "https" "HTTPS health check passed after automatic restart (after $((i*2))s)"
-            else
-                ok "$STEP" "https" "HTTPS health check passed (after $((i*2))s)"
-            fi
-        else
-            fail "$STEP" "https" "HTTPS health check failed"
-            "${SSH[@]}" "$REMOTE" "rc-service rustblocker status 2>/dev/null || systemctl status rustblocker --no-pager 2>/dev/null || true; tail -n 80 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
-        fi
+        fail "$STEP" "dns-wildcard" "$WILDCARD_SUBDOMAIN did not resolve to $SINKHOLE_IPV4; output: ${DNS_SUBDOMAIN:-empty}"
     fi
 else
-    step; skip "$STEP" "acme" "DOMAIN not set"
+    fail "$STEP" "dns-wildcard" "DNS query failed for $WILDCARD_SUBDOMAIN"
+fi
+
+step
+if DNS_BARE=$(remote_dns_a "$WILDCARD_BASE" 2>/dev/null); then
+    if echo "$DNS_BARE" | grep -Fxq "$SINKHOLE_IPV4"; then
+        fail "$STEP" "dns-wildcard" "bare wildcard base $WILDCARD_BASE incorrectly resolved to sinkhole $SINKHOLE_IPV4"
+    else
+        ok "$STEP" "dns-wildcard" "bare wildcard base $WILDCARD_BASE was not sinkholed"
+    fi
+else
+    ok "$STEP" "dns-wildcard" "bare wildcard base $WILDCARD_BASE was not sinkholed (query returned no A answer)"
+fi
+
+step
+if [ -n "${WILDCARD_BLOCK_ID:-}" ]; then
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/blocklist/$WILDCARD_BLOCK_ID")
+    if [ "$HTTP_CODE" = "200" ]; then
+        ok "$STEP" "dns-wildcard" "removed temporary blocklist entry id=$WILDCARD_BLOCK_ID"
+    else
+        fail "$STEP" "dns-wildcard" "failed to remove temporary blocklist entry id=$WILDCARD_BLOCK_ID (HTTP $HTTP_CODE)"
+    fi
+else
+    skip "$STEP" "dns-wildcard" "cleanup skipped because temporary entry was not created"
+fi
+
+# Optional Cloudflare + HTTPS integration checks. Disabled by default because
+# they require a real domain, ACME account, and Cloudflare token permissions.
+if enabled "$ENABLE_CLOUDFLARE_HTTPS"; then
+    # Step: Configure HTTPS settings (only if provided)
+    for pair in "domain=${DOMAIN:-}" "acme_email=${ACME_EMAIL:-}" "cloudflare_api_token=${CF_TOKEN:-}" "wildcard_cert=${WILDCARD:-false}"; do
+        key="${pair%%=*}"
+        value="${pair#*=}"
+        if [ -z "$value" ]; then
+            step; skip "$STEP" "configure" "$key not set"
+            continue
+        fi
+        step
+        HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+            -X PUT "$BASE_URL/api/settings" \
+            -H "Content-Type: application/json" \
+            -d "{\"key\":\"$key\",\"value\":\"$value\"}")
+        if [ "$HTTP_CODE" = "200" ]; then
+            masked="${value}"
+            [ ${#masked} -gt 20 ] && masked="${value:0:4}...${value: -4}"
+            ok "$STEP" "configure" "$key = $masked"
+        else
+            fail "$STEP" "configure" "$key -> HTTP $HTTP_CODE"
+        fi
+    done
+
+    # Step: Test Cloudflare connection
+    if [ -n "${CF_TOKEN:-}" ]; then
+        step
+        RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/cloudflare/test" \
+            -H "Content-Type: application/json" \
+            -d "{\"api_token\":\"$CF_TOKEN\"}")
+        if echo "$RESP" | grep -q '"ok":true'; then
+            ok "$STEP" "cf-test" "token valid"
+        else
+            ERR=$(echo "$RESP" | grep -o '"error":"[^"]*"' | head -1 | cut -d'"' -f4)
+            fail "$STEP" "cf-test" "${ERR:-invalid token}"
+        fi
+    else
+        step; skip "$STEP" "cf-test" "CF_TOKEN not set"
+    fi
+
+    # Step: Request certificate
+    if [ -n "${DOMAIN:-}" ]; then
+        BEFORE_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
+        BEFORE_CERT_STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status" 2>/dev/null || true)
+        BEFORE_CERT_RENEWED=$(echo "$BEFORE_CERT_STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
+        BEFORE_CERT_DAYS=$(echo "$BEFORE_CERT_STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
+        RENEWAL_THRESHOLD=$(echo "$BEFORE_CERT_STATUS" | grep -o '"auto_renewal_threshold_days":[0-9]*' | cut -d: -f2)
+        RENEWAL_THRESHOLD="${RENEWAL_THRESHOLD:-7}"
+        GOT_CERT=false
+        POLL_FAILED=false
+        EXPECT_RESTART=true
+
+        if echo "$BEFORE_CERT_STATUS" | grep -q '"has_certificate":true' \
+            && [ -n "$BEFORE_CERT_DAYS" ] \
+            && [ "$BEFORE_CERT_DAYS" -gt "$RENEWAL_THRESHOLD" ] \
+            && [ "${FORCE_ACME:-false}" != "true" ]; then
+            step
+            skip "$STEP" "acme-request" "valid certificate already present (${BEFORE_CERT_DAYS}d remaining); set FORCE_ACME=true to request a fresh cert"
+            GOT_CERT=true
+            EXPECT_RESTART=false
+        else
+            step
+            RESP=$("${CURL[@]}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/acme/request" \
+                -H "Content-Type: application/json" \
+                -d "{\"domain\":\"$DOMAIN\",\"wildcard\":${WILDCARD:-false}}")
+            OP_ID=$(echo "$RESP" | grep -o '"op_id":"[^"]*"' | cut -d'"' -f4)
+            if [ -n "$OP_ID" ]; then
+                ok "$STEP" "acme-request" "accepted op_id=$OP_ID"
+            else
+                fail "$STEP" "acme-request" "request rejected"
+                exit 1
+            fi
+
+            # Step: Poll for certificate (default max 30 attempts = 300s)
+            step
+            ok "$STEP" "acme-poll" "polling for certificate (op_id=$OP_ID)..."
+            for i in $(seq 1 "$ACME_POLL_ATTEMPTS"); do
+                sleep 10
+                STATUS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/acme/status")
+                if echo "$STATUS" | grep -q '"has_certificate":true'; then
+                    CURRENT_RENEWED=$(echo "$STATUS" | grep -o '"last_renewed":[0-9]*' | cut -d: -f2)
+                    if [ -z "$BEFORE_CERT_RENEWED" ] || { [ -n "$CURRENT_RENEWED" ] && [ "$CURRENT_RENEWED" != "$BEFORE_CERT_RENEWED" ]; }; then
+                        DAYS=$(echo "$STATUS" | grep -o '"days_remaining":[0-9]*' | cut -d: -f2)
+                        ok "$STEP" "acme-poll" "certificate obtained (${DAYS:-?}d remaining) after $((i*10))s"
+                        GOT_CERT=true
+                        break
+                    fi
+                fi
+                if echo "$STATUS" | grep -q '"acme_error":"'; then
+                    ERR=$(echo "$STATUS" | sed -n 's/.*"acme_error":"\([^"]*\)".*/\1/p' | head -1)
+                    fail "$STEP" "acme-poll" "${ERR:-ACME request failed}"
+                    POLL_FAILED=true
+                    break
+                fi
+                # Log intermediate poll as info in detail
+                ok "$STEP" "acme-poll" "still waiting ($((i*10))s)..." >&2
+            done
+            if [ "$GOT_CERT" != true ] && [ "$POLL_FAILED" != true ]; then
+                fail "$STEP" "acme-poll" "timeout after $((ACME_POLL_ATTEMPTS*10))s — check Activity Log in web UI"
+                "${SSH[@]}" "$REMOTE" "tail -n 120 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
+            fi
+        fi
+        if [ "$GOT_CERT" = true ]; then
+            if [ "$EXPECT_RESTART" = true ]; then
+                step
+                RESTARTED=false
+                AFTER_CERT_PID=""
+                for i in $(seq 1 20); do
+                    sleep 1
+                    AFTER_CERT_PID=$("${SSH[@]}" "$REMOTE" "pgrep -f '/usr/local/lib/rustblocker/rustblocker' | head -1" 2>/dev/null || true)
+                    if [ -n "$BEFORE_CERT_PID" ] && [ -n "$AFTER_CERT_PID" ] && [ "$BEFORE_CERT_PID" != "$AFTER_CERT_PID" ]; then
+                        RESTARTED=true; break
+                    fi
+                done
+                if [ "$RESTARTED" = true ]; then
+                    ok "$STEP" "https" "automatic restart observed (${BEFORE_CERT_PID} -> ${AFTER_CERT_PID})"
+                else
+                    fail "$STEP" "https" "automatic restart was not observed"
+                fi
+            else
+                step
+                skip "$STEP" "https" "automatic restart not required for existing valid certificate"
+            fi
+
+            step
+            HTTPS_URL="https://${DOMAIN}/api/health"
+            HTTPS_OK=false
+            for i in $(seq 1 20); do
+                sleep 2
+                if "${CURL[@]}" -k -o /dev/null -w "%{http_code}" "$HTTPS_URL" 2>/dev/null | grep -q '200'; then
+                    HTTPS_OK=true; break
+                fi
+            done
+            if [ "$HTTPS_OK" = true ]; then
+                if [ "$EXPECT_RESTART" = true ]; then
+                    ok "$STEP" "https" "HTTPS health check passed after automatic restart (after $((i*2))s)"
+                else
+                    ok "$STEP" "https" "HTTPS health check passed (after $((i*2))s)"
+                fi
+            else
+                fail "$STEP" "https" "HTTPS health check failed"
+                "${SSH[@]}" "$REMOTE" "rc-service rustblocker status 2>/dev/null || systemctl status rustblocker --no-pager 2>/dev/null || true; tail -n 80 /var/log/rustblocker.log 2>/dev/null || true" >&2 || true
+            fi
+        fi
+    else
+        step; skip "$STEP" "acme" "DOMAIN not set"
+    fi
+else
+    step; skip "$STEP" "cloudflare-https" "disabled; set ENABLE_CLOUDFLARE_HTTPS=true in .deployenv to run Cloudflare, ACME, and HTTPS checks"
 fi
 
 # --- Summary ---
