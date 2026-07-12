@@ -406,6 +406,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                     actix_web::web::get().to(|| async {
                         actix_web::HttpResponse::Ok()
                             .content_type("text/html; charset=utf-8")
+                            .insert_header(("Cache-Control", "no-cache"))
                             .body(
                                 include_str!("../static/index.html")
                                     .replace("{VERSION}", env!("CARGO_PKG_VERSION")),
@@ -417,7 +418,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                     actix_web::web::get().to(|| async {
                         actix_web::HttpResponse::Ok()
                             .content_type("text/css; charset=utf-8")
-                            .insert_header(("Cache-Control", "public, max-age=3600"))
+                            .insert_header(("Cache-Control", "no-cache"))
                             .body(include_str!("../static/tailwind.min.css"))
                     }),
                 )
@@ -426,7 +427,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                     actix_web::web::get().to(|| async {
                         actix_web::HttpResponse::Ok()
                             .content_type("application/javascript; charset=utf-8")
-                            .insert_header(("Cache-Control", "public, max-age=3600"))
+                            .insert_header(("Cache-Control", "no-cache"))
                             .body(include_str!("../static/app.js"))
                     }),
                 )

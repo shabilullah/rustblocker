@@ -3,6 +3,56 @@
     const PAGE_SIZE = 50;
     const state = { blocklist: {offset:0, search:''}, allowlist: {offset:0, search:''} };
 
+    class ApiResponseError extends Error {
+        constructor(message) {
+            super(message);
+            this.name = 'ApiResponseError';
+        }
+    }
+
+    window.addEventListener('unhandledrejection', event => {
+        if (event.reason instanceof ApiResponseError) {
+            event.preventDefault();
+            console.warn(event.reason.message);
+        }
+    });
+
+    async function fetchJson(url, label) {
+        const response = await fetch(url);
+        return responseJson(response, label);
+    }
+
+    async function responseJson(response, label, options = {}) {
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+            const text = await response.text().catch(() => '');
+            if (options.fallbackOnError) return {};
+            const status = response.ok ? '' : ` HTTP ${response.status}`;
+            throw new ApiResponseError(`${label} returned${status} ${contentType || 'non-JSON'}${summarizeNonJson(text)}`);
+        }
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (e) {
+            if (options.fallbackOnError) return {};
+            throw new ApiResponseError(`${label} returned invalid JSON: ${e.message}`);
+        }
+
+        if (!response.ok && !options.allowError) {
+            throw new ApiResponseError(data.error || `${label} returned HTTP ${response.status}`);
+        }
+
+        return data;
+    }
+
+    function summarizeNonJson(text) {
+        const trimmed = text.trim();
+        if (!trimmed) return '';
+        if (trimmed.startsWith('<')) return ' (received an HTML page instead of API JSON)';
+        return `: ${trimmed.slice(0, 120)}`;
+    }
+
     // Tab switching
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -28,7 +78,7 @@
             case 'blocklist': return loadDomainList('blocklist');
             case 'allowlist': return loadDomainList('allowlist');
             case 'rewrites': return loadRewrites();
-            case 'settings': loadSettings(); loadSyncConfig(); autoCheckUpdate(); return;
+            case 'settings': loadSettings(); loadSyncConfig(); renderUpdateIdle(); return;
             case 'https': return loadHTTPSTab();
             case 'stats': return loadStats();
         }
@@ -36,36 +86,45 @@
 
     // --- Dashboard ---
 
+    const dashboardChart = {
+        samples: [],
+        maxSamples: 40,
+        previous: [],
+        animationFrame: null,
+        animationStart: 0,
+        animationDuration: 700,
+    };
+
     async function loadDashboard() {
         const [blocklist, allowlist, rewrites, upstreams] = await Promise.all([
-            fetch(API + '/blocklist?limit=0').then(r => r.json()),
-            fetch(API + '/allowlist?limit=0').then(r => r.json()),
-            fetch(API + '/rewrites').then(r => r.json()),
-            fetch(API + '/upstreams').then(r => r.json()),
+            fetchJson(API + '/blocklist?limit=0', 'Blocklist API'),
+            fetchJson(API + '/allowlist?limit=0', 'Allowlist API'),
+            fetchJson(API + '/rewrites', 'Rewrites API'),
+            fetchJson(API + '/upstreams', 'Upstreams API'),
         ]);
-        document.getElementById('stat-blocked').textContent = blocklist.total;
-        document.getElementById('stat-allowed').textContent = allowlist.total;
-        document.getElementById('stat-rewrites').textContent = rewrites.length;
-        document.getElementById('stat-upstreams').textContent = upstreams.length;
+        updateStatNumber('stat-blocked', blocklist.total);
+        updateStatNumber('stat-allowed', allowlist.total);
+        updateStatNumber('stat-rewrites', rewrites.length);
+        updateStatNumber('stat-upstreams', upstreams.length);
         await refreshDashboardStats();
         await refreshHeaderVersion();
-        autoCheckUpdate();
     }
 
     async function refreshHeaderVersion() {
         try {
-            const v = await fetch(API + '/version').then(r => r.json());
+            const v = await fetchJson(API + '/version', 'Version API');
             document.getElementById('version').textContent = 'v' + v.version + ' (' + v.target + ')';
         } catch {}
     }
 
     async function refreshDashboardStats() {
-        const stats = await fetch(API + '/stats?limit=10').then(r => r.json());
-        document.getElementById('stat-total-queries').textContent = stats.total_queries.toLocaleString();
-        document.getElementById('stat-q-blocked').textContent = stats.blocked.toLocaleString();
-        document.getElementById('stat-q-allowed').textContent = stats.allowed.toLocaleString();
-        document.getElementById('stat-q-rewritten').textContent = stats.rewritten.toLocaleString();
-        document.getElementById('stat-q-forwarded').textContent = stats.forwarded.toLocaleString();
+        const stats = await fetchJson(API + '/stats?limit=10', 'Stats API');
+        updateStatNumber('stat-total-queries', stats.total_queries);
+        updateStatNumber('stat-q-blocked', stats.blocked);
+        updateStatNumber('stat-q-allowed', stats.allowed);
+        updateStatNumber('stat-q-rewritten', stats.rewritten);
+        updateStatNumber('stat-q-forwarded', stats.forwarded);
+        updateDashboardChart(stats);
 
         const clientsDiv = document.getElementById('stats-top-clients');
         clientsDiv.innerHTML = stats.top_clients.length
@@ -100,10 +159,131 @@
             : '<div class="text-gray-500 text-xs">No upstream queries yet</div>';
     }
 
+    function updateStatNumber(id, value) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const formatted = Number(value || 0).toLocaleString();
+        if (el.textContent === formatted) return;
+        el.textContent = formatted;
+        el.classList.remove('stat-value-updated');
+        // Force reflow so repeated updates restart the animation.
+        void el.offsetWidth;
+        el.classList.add('stat-value-updated');
+    }
+
+    function updateDashboardChart(stats) {
+        const sample = {
+            ts: Date.now(),
+            total: Number(stats.total_queries || 0),
+            blocked: Number(stats.blocked || 0),
+            forwarded: Number(stats.forwarded || 0),
+        };
+        dashboardChart.previous = dashboardChart.samples.map(s => ({...s}));
+        dashboardChart.samples.push(sample);
+        while (dashboardChart.samples.length > dashboardChart.maxSamples) {
+            dashboardChart.samples.shift();
+            dashboardChart.previous.shift();
+        }
+        animateDashboardChart();
+    }
+
+    function animateDashboardChart() {
+        if (dashboardChart.animationFrame) cancelAnimationFrame(dashboardChart.animationFrame);
+        dashboardChart.animationStart = performance.now();
+        const tick = (now) => {
+            const t = Math.min(1, (now - dashboardChart.animationStart) / dashboardChart.animationDuration);
+            const eased = 1 - Math.pow(1 - t, 3);
+            drawDashboardChart(eased);
+            if (t < 1) {
+                dashboardChart.animationFrame = requestAnimationFrame(tick);
+            } else {
+                dashboardChart.animationFrame = null;
+            }
+        };
+        dashboardChart.animationFrame = requestAnimationFrame(tick);
+    }
+
+    function drawDashboardChart(progress) {
+        const canvas = document.getElementById('dashboard-query-chart');
+        const empty = document.getElementById('dashboard-chart-empty');
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const width = Math.max(1, Math.floor(rect.width * dpr));
+        const height = Math.max(1, Math.floor(rect.height * dpr));
+        if (canvas.width !== width || canvas.height !== height) {
+            canvas.width = width;
+            canvas.height = height;
+        }
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, rect.width, rect.height);
+
+        const samples = dashboardChart.samples;
+        if (empty) empty.classList.toggle('hidden', samples.length > 1);
+        drawChartGrid(ctx, rect.width, rect.height);
+        if (samples.length < 2) return;
+
+        const previous = alignPreviousSamples(samples);
+        const animated = samples.map((sample, index) => ({
+            ts: sample.ts,
+            total: lerp(previous[index].total, sample.total, progress),
+            blocked: lerp(previous[index].blocked, sample.blocked, progress),
+            forwarded: lerp(previous[index].forwarded, sample.forwarded, progress),
+        }));
+        const maxValue = Math.max(1, ...animated.flatMap(s => [s.total, s.blocked, s.forwarded]));
+        drawChartLine(ctx, animated, 'total', '#34d399', maxValue, rect.width, rect.height);
+        drawChartLine(ctx, animated, 'blocked', '#f87171', maxValue, rect.width, rect.height);
+        drawChartLine(ctx, animated, 'forwarded', '#facc15', maxValue, rect.width, rect.height);
+    }
+
+    function alignPreviousSamples(samples) {
+        if (!dashboardChart.previous.length) return samples.map(s => ({...s}));
+        return samples.map((sample, index) => {
+            const offset = dashboardChart.previous.length - samples.length;
+            return dashboardChart.previous[index + offset] || dashboardChart.previous[dashboardChart.previous.length - 1] || sample;
+        });
+    }
+
+    function drawChartGrid(ctx, width, height) {
+        ctx.strokeStyle = 'rgba(51, 65, 85, 0.55)';
+        ctx.lineWidth = 1;
+        for (let i = 1; i < 4; i++) {
+            const y = (height / 4) * i;
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(width, y);
+            ctx.stroke();
+        }
+    }
+
+    function drawChartLine(ctx, samples, key, color, maxValue, width, height) {
+        const padX = 8;
+        const padY = 14;
+        const innerW = Math.max(1, width - padX * 2);
+        const innerH = Math.max(1, height - padY * 2);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        samples.forEach((sample, index) => {
+            const x = padX + (innerW * index) / Math.max(1, samples.length - 1);
+            const y = padY + innerH - (innerH * sample[key]) / maxValue;
+            if (index === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+    }
+
+    function lerp(from, to, progress) {
+        return from + (to - from) * progress;
+    }
+
     // --- Upstreams ---
 
     async function loadUpstreams() {
-        const data = await fetch(API + '/upstreams').then(r => r.json());
+        const data = await fetchJson(API + '/upstreams', 'Upstreams API');
         document.getElementById('upstream-count').textContent = data.length + ' servers';
         const list = document.getElementById('upstream-list');
         if (!data.length) {
@@ -140,7 +320,7 @@
     // --- Sources ---
 
     async function loadSources() {
-        const data = await fetch(API + '/sources').then(r => r.json());
+        const data = await fetchJson(API + '/sources', 'Sources API');
         document.getElementById('source-count').textContent = data.length + ' source(s)';
         const list = document.getElementById('source-list');
         if (!data.length) {
@@ -179,7 +359,7 @@
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({url, list_type, update_interval_hours: interval})
         });
-        const result = await resp.json();
+        const result = await responseJson(resp, 'Add source API', {allowError: true});
         btn.disabled = false;
         btn.innerHTML = 'Add Source';
         status.innerHTML = '';
@@ -200,7 +380,7 @@
         const status = document.getElementById('source-status');
         if (status) { status.innerHTML = '<span class="spinner spinner-lg"></span> Refreshing all sources...'; status.className = 'text-sm text-emerald-400 mb-2'; }
         const resp = await fetch(API + '/sources/refresh', {method: 'POST'});
-        const result = await resp.json();
+        const result = await responseJson(resp, 'Refresh sources API');
         if (btn) { btn.disabled = false; btn.innerHTML = 'Refresh All Now'; }
         if (status) { status.innerHTML = ''; status.className = 'text-sm mb-2'; }
         showSourceStatus(`Refreshed ${result.refreshed} source(s)`, true);
@@ -222,7 +402,7 @@
         const params = new URLSearchParams({limit: PAGE_SIZE, offset: s.offset});
         if (s.search) params.set('search', s.search);
         const resp = await fetch(API + '/' + type + '?' + params);
-        const data = await resp.json();
+        const data = await responseJson(resp, `${type} API`);
         const domains = data.domains || [];
         const total = data.total || 0;
 
@@ -288,7 +468,7 @@
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({content})
         });
-        const result = await resp.json();
+        const result = await responseJson(resp, `Import ${type} file API`, {allowError: true});
         status.innerHTML = '';
         status.className = 'text-sm mb-2';
         showStatus(type, 'Imported ' + (result.imported || 0) + ' domains');
@@ -312,7 +492,7 @@
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({url})
         });
-        const result = await resp.json();
+        const result = await responseJson(resp, `Import ${type} URL API`, {allowError: true});
         btn.disabled = false;
         btn.innerHTML = 'Import URL';
         status.innerHTML = '';
@@ -348,7 +528,7 @@
     // --- Rewrites ---
 
     async function loadRewrites() {
-        const data = await fetch(API + '/rewrites').then(r => r.json());
+        const data = await fetchJson(API + '/rewrites', 'Rewrites API');
         const list = document.getElementById('rewrites-list');
         if (!data.length) {
             list.innerHTML = '<div class="p-4 text-gray-500 text-sm">No rewrites</div>';
@@ -393,7 +573,7 @@
         const container = document.getElementById('cert-status-container');
         const renewalContainer = document.getElementById('cert-renewal-container');
         try {
-            const status = await fetch(API + '/acme/status').then(r => r.json());
+            const status = await fetchJson(API + '/acme/status', 'Certificate status API');
             renderRenewalStatus(status);
             
             if (!status.has_certificate) {
@@ -418,7 +598,11 @@
                 </div>
             `;
         } catch (e) {
-            container.innerHTML = `<p class="text-sm text-red-400">Error loading certificate status: ${e.message}</p>`;
+            container.innerHTML = '';
+            const message = document.createElement('p');
+            message.className = 'text-sm text-red-400';
+            message.textContent = 'Error loading certificate status: ' + e.message;
+            container.appendChild(message);
             if (renewalContainer) {
                 renewalContainer.innerHTML = '<p class="text-sm text-red-400">Error loading renewal policy.</p>';
             }
@@ -448,12 +632,12 @@
 
     async function loadHTTPSSettings() {
         try {
-            const settings = await fetch(API + '/settings').then(r => r.json());
+            const settings = await fetchJson(API + '/settings', 'Settings API');
             document.getElementById('https-domain').value = settings.domain || '';
             document.getElementById('https-email').value = settings.acme_email || '';
             document.getElementById('https-wildcard').checked = settings.wildcard_cert === 'true';
         } catch (e) {
-            console.error('Failed to load HTTPS settings:', e);
+            console.warn('Failed to load HTTPS settings:', e);
         }
     }
 
@@ -517,7 +701,7 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({domain, wildcard})
             });
-            const result = await response.json();
+            const result = await responseJson(response, 'Certificate request API', {allowError: true});
             
             if (response.ok) {
                 statusDiv.innerHTML = '<p class="text-green-400">Certificate request started in background. Check status in a few minutes.</p>';
@@ -553,7 +737,7 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({domain, wildcard})
             });
-            const result = await response.json();
+            const result = await responseJson(response, 'Certificate renewal API', {allowError: true});
             
             if (response.ok) {
                 statusDiv.innerHTML = '<p class="text-green-400">Certificate renewal started in background. Check status in a few minutes.</p>';
@@ -571,9 +755,32 @@
 
     // --- Activity Log ---
 
-    const activityState = { entries: [], maxEntries: 200, expanded: false, unread: 0 };
+    const activityState = { entries: [], maxEntries: 200, expanded: true, unread: 0, hidden: false };
     let activitySSE = null;
+    let activityReconnectTimer = null;
     let certRestartWatchActive = false;
+
+    function loadActivityVisibility() {
+        activityState.hidden = localStorage.getItem('activityHidden') === 'true';
+        applyActivityVisibility();
+    }
+
+    function setActivityHidden(hidden) {
+        activityState.hidden = hidden;
+        localStorage.setItem('activityHidden', hidden ? 'true' : 'false');
+        applyActivityVisibility();
+    }
+
+    function applyActivityVisibility() {
+        const panel = document.getElementById('activity-panel');
+        const showBtn = document.getElementById('activity-show-btn');
+        const main = document.getElementById('main-content');
+        if (!panel || !showBtn || !main) return;
+
+        panel.classList.toggle('activity-hidden', activityState.hidden);
+        showBtn.classList.toggle('hidden', !activityState.hidden);
+        main.classList.toggle('lg:mr-80', !activityState.hidden);
+    }
 
     function connectActivitySSE() {
         if (activitySSE) return;
@@ -591,18 +798,25 @@
         activitySSE.onerror = () => {
             activitySSE.close();
             activitySSE = null;
-            setTimeout(connectActivitySSE, 2000);
+            activityReconnectTimer = setTimeout(connectActivitySSE, 2000);
         };
+    }
+
+    function disconnectActivitySSE() {
+        if (activityReconnectTimer) {
+            clearTimeout(activityReconnectTimer);
+            activityReconnectTimer = null;
+        }
+        if (activitySSE) {
+            activitySSE.close();
+            activitySSE = null;
+        }
     }
 
     function addActivityEntry(entry) {
         activityState.entries.push(entry);
         if (activityState.entries.length > activityState.maxEntries) {
             activityState.entries.shift();
-        }
-        if (!activityState.expanded) {
-            activityState.unread++;
-            updateActivityBadge();
         }
         renderActivityEntry(entry);
         maybeHandleCertificateRestart(entry);
@@ -678,7 +892,8 @@
         div.setAttribute('data-op-id', entry.op_id);
         div.innerHTML = `<span class="text-gray-500 shrink-0">${time}</span><span class="${color} shrink-0 font-medium">${entry.op}</span><span class="text-gray-300">${entry.message}</span>`;
         container.appendChild(div);
-        container.scrollTop = container.scrollHeight;
+        const scrollContainer = document.getElementById('activity-body');
+        scrollContainer.scrollTop = scrollContainer.scrollHeight;
     }
 
     function updateActivityBadge() {
@@ -691,23 +906,7 @@
         }
     }
 
-    document.getElementById('activity-toggle').addEventListener('click', () => {
-        activityState.expanded = !activityState.expanded;
-        const body = document.getElementById('activity-body');
-        const chevron = document.getElementById('activity-chevron');
-        if (activityState.expanded) {
-            body.classList.remove('hidden');
-            chevron.style.transform = 'rotate(180deg)';
-            activityState.unread = 0;
-            updateActivityBadge();
-        } else {
-            body.classList.add('hidden');
-            chevron.style.transform = '';
-        }
-    });
-
-    connectActivitySSE();
-
+    loadActivityVisibility();
     // --- Cloudflare Test Connection ---
 
     document.getElementById('test-cloudflare-btn').addEventListener('click', async () => {
@@ -727,7 +926,7 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({api_token: token})
             });
-            const result = await resp.json();
+            const result = await responseJson(resp, 'Cloudflare test API', {allowError: true});
             if (result.ok) {
                 resultSpan.textContent = '✓ Token valid!';
                 resultSpan.className = 'ml-2 text-xs text-emerald-400';
@@ -748,9 +947,9 @@
 
     // Expand activity panel when cert request starts
     function expandActivity() {
-        if (!activityState.expanded) {
-            document.getElementById('activity-toggle').click();
-        }
+        activityState.expanded = true;
+        activityState.unread = 0;
+        updateActivityBadge();
     }
 
     origRequestBtn.addEventListener('click', () => setTimeout(expandActivity, 200));
@@ -759,7 +958,7 @@
     // --- Settings ---
 
     async function loadSettings() {
-        const data = await fetch(API + '/settings').then(r => r.json());
+        const data = await fetchJson(API + '/settings', 'Settings API');
         const form = document.getElementById('settings-form');
         const fields = [
             {key: 'listen_address', label: 'Listen Address'},
@@ -806,7 +1005,7 @@
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({key, value: el.value})
                     });
-                    const data = await resp.json().catch(() => ({}));
+                    const data = await responseJson(resp, 'Save setting API', {allowError: true, fallbackOnError: true});
                     if (data.restart_pending) restartPending = true;
                 } catch {}
             }
@@ -830,7 +1029,7 @@
 
     async function loadSyncConfig() {
         try {
-            const data = await fetch(API + '/sync/config').then(r => r.json());
+            const data = await fetchJson(API + '/sync/config', 'Sync config API');
             document.getElementById('sync-enabled').checked = !!data.enabled;
             document.getElementById('sync-master-url').value = data.master_url || '';
             document.getElementById('sync-interval').value = data.interval_secs || 30;
@@ -870,7 +1069,7 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({enabled, master_url, password, interval_secs})
             });
-            const data = await resp.json().catch(() => ({}));
+            const data = await responseJson(resp, 'Save sync config API', {allowError: true, fallbackOnError: true});
             if (!resp.ok) {
                 status.textContent = data.error || 'Failed to save.';
                 status.className = 'text-sm text-red-400';
@@ -921,7 +1120,7 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({master_url: masterUrl, password: password || null})
             });
-            const data = await resp.json().catch(() => ({}));
+            const data = await responseJson(resp, 'Verify sync API', {allowError: true, fallbackOnError: true});
             if (resp.ok && data.ok) {
                 status.textContent = 'Connection successful.';
                 status.className = 'text-sm text-emerald-400';
@@ -979,7 +1178,7 @@
 
     async function updateSyncStatus() {
         try {
-            const data = await fetch(API + '/sync/status').then(r => r.json());
+            const data = await fetchJson(API + '/sync/status', 'Sync status API');
             renderSyncUI(data);
         } catch { /* silent — network error, don't flash error state */ }
     }
@@ -1069,7 +1268,9 @@
     }
 
     async function checkForUpdates() {
-        await autoCheckUpdate();
+        updatePollStopped = false;
+        await autoCheckUpdate({manual: true});
+        startUpdatePoll({delay: UPDATE_POLL_INTERVAL_MS});
     }
 
     function applyUpdateFromHeader() {
@@ -1077,40 +1278,91 @@
         applyUpdate();
     }
 
-    async function autoCheckUpdate() {
+    function renderUpdateIdle() {
         const status = document.getElementById('update-status');
         const btn = document.getElementById('update-apply-btn');
         const notes = document.getElementById('update-notes');
         if (!status) return;
-        status.textContent = 'Checking for updates...';
+        status.textContent = updatePollStopped
+            ? 'Automatic update checks stopped after a failed request. Use the refresh icon to try again.'
+            : 'Automatic update checks are enabled. Use the refresh icon to check now.';
         status.className = 'text-sm text-gray-400';
-        btn.classList.add('hidden');
-        notes.classList.add('hidden');
-        setHeaderRefreshSpinning(true);
+        btn?.classList.add('hidden');
+        notes?.classList.add('hidden');
+    }
+
+    function startUpdatePoll(options = {}) {
+        if (updatePollTimer || updatePollStopped) return;
+        const delay = options.delay ?? 10000;
+        updatePollTimer = setTimeout(async () => {
+            updatePollTimer = null;
+            const ok = await autoCheckUpdate({manual: false});
+            if (ok && !window._updateInfo) startUpdatePoll({delay: UPDATE_POLL_INTERVAL_MS});
+        }, delay);
+    }
+
+    function stopUpdatePoll() {
+        if (updatePollTimer) {
+            clearTimeout(updatePollTimer);
+            updatePollTimer = null;
+        }
+    }
+
+    async function autoCheckUpdate(options = {}) {
+        const manual = options.manual !== false;
+        const settingsVisible = !document.getElementById('tab-settings')?.classList.contains('hidden');
+        const status = document.getElementById('update-status');
+        const btn = document.getElementById('update-apply-btn');
+        const notes = document.getElementById('update-notes');
+        if (manual && status) {
+            status.textContent = 'Checking for updates...';
+            status.className = 'text-sm text-gray-400';
+        }
+        if (manual) {
+            btn?.classList.add('hidden');
+            notes?.classList.add('hidden');
+        }
+        if (manual) setHeaderRefreshSpinning(true);
         try {
             const r = await fetch(API + '/update/check');
-            const data = await r.json();
+            const data = await responseJson(r, 'Update check API');
             if (data.update_available) {
                 window._updateInfo = data;
-                status.textContent = 'Update available: ' + data.version;
-                status.className = 'text-sm text-emerald-400';
-                notes.textContent = data.notes ? data.notes.substring(0, 500) : '';
-                notes.classList.remove('hidden');
-                btn.classList.remove('hidden');
+                if (status) {
+                    status.textContent = 'Update available: ' + data.version;
+                    status.className = 'text-sm text-emerald-400';
+                }
+                if (notes) {
+                    notes.textContent = data.notes ? data.notes.substring(0, 500) : '';
+                    notes.classList.remove('hidden');
+                }
+                btn?.classList.remove('hidden');
                 renderHeaderUpdate(true, data);
+                return true;
             } else {
                 window._updateInfo = null;
-                status.textContent = 'Up to date (' + data.current_version + ')';
-                status.className = 'text-sm text-gray-400';
+                if ((manual || settingsVisible) && status) {
+                    status.textContent = 'Up to date (' + data.current_version + ')';
+                    status.className = 'text-sm text-gray-400';
+                }
                 renderHeaderUpdate(false);
+                return true;
             }
-        } catch {
-            status.textContent = 'Update check failed';
-            status.className = 'text-sm text-red-400';
+        } catch (e) {
+            updatePollStopped = true;
+            stopUpdatePoll();
+            if (manual && status) {
+                status.textContent = 'Update check failed: ' + (e.message || 'Network error');
+                status.className = 'text-sm text-red-400';
+            } else if (settingsVisible && status) {
+                status.textContent = 'Automatic update checks stopped after a failed request. Use the refresh icon to try again.';
+                status.className = 'text-sm text-amber-400';
+            }
             window._updateInfo = null;
             renderHeaderUpdate(false);
+            return false;
         } finally {
-            setHeaderRefreshSpinning(false);
+            if (manual) setHeaderRefreshSpinning(false);
         }
     }
 
@@ -1152,7 +1404,7 @@
         setHeaderUpdating();
         try {
             const r = await fetch(API + '/update/apply', { method: 'POST' });
-            const data = await r.json();
+            const data = await responseJson(r, 'Apply update API', {allowError: true});
             if (data.status === 'updated') {
                 status.textContent = 'Updated to ' + data.version + '. Restarting...';
                 status.className = 'text-sm text-emerald-400';
@@ -1173,7 +1425,6 @@
     async function checkHealth() {
         try {
             const r = await fetch(API + '/health');
-            await r.json();
             document.getElementById('status').textContent = 'Online';
             document.getElementById('status').className = 'text-sm text-green-400';
         } catch {
@@ -1190,6 +1441,9 @@
     let eventSource = null;
     let reconnectTimer = null;
     let dashboardInterval = null;
+    let updatePollTimer = null;
+    let updatePollStopped = false;
+    const UPDATE_POLL_INTERVAL_MS = 10000;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
     function renderQueryRow(q) {
         const now = new Date();
@@ -1266,7 +1520,7 @@
 
     async function loadStats() {
         // Load historical page from DB.
-        const queries = await fetch(API + `/stats/queries?limit=${STATS_PAGE}&offset=${statsOffset}`).then(r => r.json());
+        const queries = await fetchJson(API + `/stats/queries?limit=${STATS_PAGE}&offset=${statsOffset}`, 'Query log API');
         const tbody = document.getElementById('stats-query-log');
         tbody.innerHTML = queries.length
             ? queries.map(q => renderQueryRow(q)).join('')
@@ -1316,7 +1570,9 @@
     function showLogin() {
         stopDashboardPoll();
         stopSyncStatusPoll();
+        stopUpdatePoll();
         disconnectSSE();
+        disconnectActivitySSE();
         document.getElementById('app-content').classList.add('hidden');
         document.getElementById('login-screen').classList.remove('hidden');
         document.getElementById('login-password').value = '';
@@ -1327,12 +1583,14 @@
         document.getElementById('login-screen').classList.add('hidden');
         document.getElementById('app-content').classList.remove('hidden');
         startSyncStatusPoll();
+        connectActivitySSE();
+        startUpdatePoll();
     }
 
     async function init() {
         try {
             const resp = await fetch(API + '/auth/check');
-            const data = await resp.json();
+            const data = await responseJson(resp, 'Auth check API');
             if (data.authenticated) {
                 showApp();
                 checkHealth();
@@ -1397,7 +1655,7 @@
             document.getElementById('new-password').value = '';
             document.getElementById('confirm-password').value = '';
         } else {
-            const data = await resp.json().catch(() => ({}));
+            const data = await responseJson(resp, 'Change password API', {allowError: true, fallbackOnError: true});
             status.textContent = data.error || 'Failed to change password';
             status.className = 'text-sm text-red-400';
         }
@@ -1418,6 +1676,7 @@
 function attachListeners() {
     document.getElementById('login-form')?.addEventListener('submit', submitLogin);
     document.getElementById('logout-btn')?.addEventListener('click', logout);
+    document.getElementById('logout-btn-mobile')?.addEventListener('click', logout);
     document.getElementById('header-update-btn')?.addEventListener('click', applyUpdateFromHeader);
     document.getElementById('header-refresh-btn')?.addEventListener('click', checkForUpdates);
     document.getElementById('add-upstream-btn')?.addEventListener('click', addUpstream);
@@ -1444,6 +1703,8 @@ function attachListeners() {
     document.getElementById('clear-stats-btn')?.addEventListener('click', clearStats);
     document.getElementById('stats-prev')?.addEventListener('click', statsPrevPage);
     document.getElementById('stats-next')?.addEventListener('click', statsNextPage);
+    document.getElementById('activity-hide-btn')?.addEventListener('click', () => setActivityHidden(true));
+    document.getElementById('activity-show-btn')?.addEventListener('click', () => setActivityHidden(false));
 
     document.querySelectorAll('.import-file-input').forEach(input => {
         input.addEventListener('change', () => importFile(input.dataset.type, input));
