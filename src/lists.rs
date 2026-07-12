@@ -135,16 +135,15 @@ impl DomainStore {
 
     /// Check if a normalized domain matches this store.
     pub fn matches(&self, domain: &str) -> bool {
-        // Exact match
         if self.exact.contains(domain) {
             return true;
         }
-        // Wildcard match: "sub.example.com" matches wildcard "example.com"
-        for wildcard in &self.wildcards {
-            if domain.ends_with(wildcard)
-                && domain.len() > wildcard.len()
-                && domain.as_bytes()[domain.len() - wildcard.len() - 1] == b'.'
-            {
+
+        // Wildcard match: "sub.example.com" matches wildcard "example.com".
+        // Walk parent suffixes from the queried domain so lookup cost scales
+        // with label depth instead of the number of wildcard entries.
+        for (idx, byte) in domain.bytes().enumerate() {
+            if byte == b'.' && self.wildcards.contains(&domain[idx + 1..]) {
                 return true;
             }
         }
@@ -231,6 +230,19 @@ mod tests {
         store.wildcards.insert("example.com".to_string());
         // Should NOT match "notexample.com" (missing the dot separator)
         assert!(!store.matches("notexample.com"));
+    }
+
+    #[test]
+    fn test_wildcard_match_uses_parent_suffixes() {
+        let mut store = DomainStore::default();
+        for i in 0..1000 {
+            store.wildcards.insert(format!("irrelevant-{i}.test"));
+        }
+        store.wildcards.insert("example.com".to_string());
+
+        assert!(store.matches("sub.sub.example.com"));
+        assert!(!store.matches("example.com"));
+        assert!(!store.matches("example.com.evil.test"));
     }
 
     #[test]
