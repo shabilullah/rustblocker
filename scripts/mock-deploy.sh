@@ -52,8 +52,20 @@ BASE_URL="http://${SSH_HOST}:${WEB_PORT}"
 ENABLE_CLOUDFLARE_HTTPS="${ENABLE_CLOUDFLARE_HTTPS:-false}"
 DB_CONCURRENCY_REQUESTS="${DB_CONCURRENCY_REQUESTS:-16}"
 STATS_CONCURRENCY_REQUESTS="${STATS_CONCURRENCY_REQUESTS:-8}"
+DNS_BURST_REQUESTS="${DNS_BURST_REQUESTS:-96}"
+DNS_BURST_MAX_MS="${DNS_BURST_MAX_MS:-8000}"
+DNS_BURST_MAX_FAILURES="${DNS_BURST_MAX_FAILURES:-0}"
+HOT_RELOAD_DNS_REQUESTS="${HOT_RELOAD_DNS_REQUESTS:-60}"
+FORWARD_PROBE_DOMAIN="${FORWARD_PROBE_DOMAIN:-example.com}"
+MEMORY_IMPORT_LOOPS="${MEMORY_IMPORT_LOOPS:-3}"
+MEMORY_IMPORT_DOMAINS="${MEMORY_IMPORT_DOMAINS:-100}"
+MEMORY_RSS_MAX_KB="${MEMORY_RSS_MAX_KB:-262144}"
+MEMORY_RSS_GROWTH_MAX_KB="${MEMORY_RSS_GROWTH_MAX_KB:-65536}"
+PROCESS_FD_MAX="${PROCESS_FD_MAX:-1024}"
+PROCESS_THREADS_MAX="${PROCESS_THREADS_MAX:-128}"
 GIT_REV=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "nogit")
 MOCK_BUILD_ID="${MOCK_BUILD_ID:-mock-$(date +%Y%m%d%H%M%S)-${GIT_REV}}"
+RUN_TAG="mock-$(date +%s)-$$"
 
 # SSH setup: prefer sshpass, fall back to SSH_ASKPASS (askpass.sh)
 export SSHPASS="$SSH_PASSWORD"
@@ -111,6 +123,14 @@ json_number() {
     sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p" | head -1
 }
 
+json_ids() {
+    grep -o '"id":[0-9]*' | cut -d: -f2
+}
+
+has_ipv4_answer() {
+    grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+}
+
 remote_root() {
     local command="$1"
     local quoted_command quoted_password
@@ -121,6 +141,41 @@ remote_root() {
 
 ensure_remote_service_defaults() {
     remote_root "if [ -f /etc/init.d/rustblocker ]; then sed -i 's#command_args=\"--dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db --https --https-port 443\"#command_args=\"--dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db\"#' /etc/init.d/rustblocker; elif [ -f /etc/systemd/system/rustblocker.service ]; then sed -i 's#ExecStart=/usr/local/bin/rustblocker --dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db --https --https-port 443#ExecStart=/usr/local/bin/rustblocker --dns-port 53 --db-path /var/lib/rustblocker/rustblocker.db#' /etc/systemd/system/rustblocker.service; systemctl daemon-reload 2>/dev/null || true; fi"
+}
+
+remote_resource_snapshot() {
+    local command
+    command='pid=$(pidof rustblocker 2>/dev/null | awk "{print \$1}"); [ -n "$pid" ] || pid=$(pgrep -x rustblocker 2>/dev/null | head -1); [ -n "$pid" ] || exit 1; rss=$(awk "/^VmRSS:/ {print \$2}" /proc/$pid/status 2>/dev/null); threads=$(awk "/^Threads:/ {print \$2}" /proc/$pid/status 2>/dev/null); fds=$(ls /proc/$pid/fd 2>/dev/null | wc -l); printf "%s %s %s %s\n" "$pid" "${rss:-0}" "${threads:-0}" "${fds:-0}"'
+    RESOURCE_SNAPSHOT=$(remote_root "$command" 2>/dev/null) || return 1
+    RESOURCE_PID=$(echo "$RESOURCE_SNAPSHOT" | awk '{print $1}')
+    RESOURCE_RSS_KB=$(echo "$RESOURCE_SNAPSHOT" | awk '{print $2}')
+    RESOURCE_THREADS=$(echo "$RESOURCE_SNAPSHOT" | awk '{print $3}')
+    RESOURCE_FDS=$(echo "$RESOURCE_SNAPSHOT" | awk '{print $4}')
+}
+
+check_resource_snapshot() {
+    local label="$1"
+    local base_rss="${2:-}"
+    if ! remote_resource_snapshot; then
+        fail "$STEP" "$label" "could not read rustblocker process resources"
+        return
+    fi
+    local growth=0
+    if [ -n "$base_rss" ]; then
+        growth=$((RESOURCE_RSS_KB - base_rss))
+        [ "$growth" -lt 0 ] && growth=0
+    fi
+    if [ "$RESOURCE_RSS_KB" -gt "$MEMORY_RSS_MAX_KB" ]; then
+        fail "$STEP" "$label" "RSS ${RESOURCE_RSS_KB}KB exceeded max ${MEMORY_RSS_MAX_KB}KB (pid=$RESOURCE_PID, threads=$RESOURCE_THREADS, fds=$RESOURCE_FDS)"
+    elif [ -n "$base_rss" ] && [ "$growth" -gt "$MEMORY_RSS_GROWTH_MAX_KB" ]; then
+        fail "$STEP" "$label" "RSS grew ${growth}KB from baseline ${base_rss}KB, max growth ${MEMORY_RSS_GROWTH_MAX_KB}KB (rss=${RESOURCE_RSS_KB}KB)"
+    elif [ "$RESOURCE_FDS" -gt "$PROCESS_FD_MAX" ]; then
+        fail "$STEP" "$label" "open FDs ${RESOURCE_FDS} exceeded max ${PROCESS_FD_MAX} (pid=$RESOURCE_PID, rss=${RESOURCE_RSS_KB}KB)"
+    elif [ "$RESOURCE_THREADS" -gt "$PROCESS_THREADS_MAX" ]; then
+        fail "$STEP" "$label" "threads ${RESOURCE_THREADS} exceeded max ${PROCESS_THREADS_MAX} (pid=$RESOURCE_PID, rss=${RESOURCE_RSS_KB}KB)"
+    else
+        ok "$STEP" "$label" "pid=$RESOURCE_PID rss=${RESOURCE_RSS_KB}KB growth=${growth}KB threads=$RESOURCE_THREADS fds=$RESOURCE_FDS"
+    fi
 }
 
 REMOTE_ARCH=$("${SSH[@]}" "$REMOTE" "uname -m" 2>/dev/null || true)
@@ -237,6 +292,15 @@ else
 fi
 
 step
+RESOURCE_BASE_RSS_KB=0
+if remote_resource_snapshot; then
+    RESOURCE_BASE_RSS_KB="$RESOURCE_RSS_KB"
+    check_resource_snapshot "resource-baseline"
+else
+    fail "$STEP" "resource-baseline" "could not read rustblocker process resources"
+fi
+
+step
 ORIGINAL_FORWARD_STRATEGY=$(echo "$SETTINGS" | sed -n 's/.*"forward_strategy":"\([^"]*\)".*/\1/p' | head -1)
 ORIGINAL_FORWARD_STRATEGY="${ORIGINAL_FORWARD_STRATEGY:-adaptive}"
 HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
@@ -262,6 +326,32 @@ if [ "$HTTP_CODE" = "200" ] \
     ok "$STEP" "forward-strategy" "settings API switched parallel/adaptive and restored ${ORIGINAL_FORWARD_STRATEGY}"
 else
     fail "$STEP" "forward-strategy" "forward strategy setting did not round-trip (parallel HTTP $HTTP_CODE, adaptive HTTP $HTTP_CODE_ADAPTIVE)"
+fi
+
+step
+HTTP_CODE_PARALLEL=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"forward_strategy","value":"parallel"}')
+PARALLEL_DNS=$(target_dns_a "$FORWARD_PROBE_DOMAIN" 2>/dev/null || true)
+HTTP_CODE_ADAPTIVE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"forward_strategy","value":"adaptive"}')
+ADAPTIVE_DNS=$(target_dns_a "$FORWARD_PROBE_DOMAIN" 2>/dev/null || true)
+if [ "$ORIGINAL_FORWARD_STRATEGY" != "adaptive" ]; then
+    "${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X PUT "$BASE_URL/api/settings" \
+        -H "Content-Type: application/json" \
+        -d "{\"key\":\"forward_strategy\",\"value\":\"$ORIGINAL_FORWARD_STRATEGY\"}" >/dev/null || true
+fi
+if [ "$HTTP_CODE_PARALLEL" = "200" ] \
+    && [ "$HTTP_CODE_ADAPTIVE" = "200" ] \
+    && printf '%s\n' "$PARALLEL_DNS" | has_ipv4_answer \
+    && printf '%s\n' "$ADAPTIVE_DNS" | has_ipv4_answer; then
+    ok "$STEP" "forward-strategy-dns" "parallel/adaptive both resolved $FORWARD_PROBE_DOMAIN"
+else
+    fail "$STEP" "forward-strategy-dns" "parallel/adaptive DNS probe failed for $FORWARD_PROBE_DOMAIN (parallel HTTP $HTTP_CODE_PARALLEL: ${PARALLEL_DNS:-empty}; adaptive HTTP $HTTP_CODE_ADAPTIVE: ${ADAPTIVE_DNS:-empty})"
 fi
 
 step
@@ -678,6 +768,233 @@ if [ -n "${WILDCARD_BLOCK_ID:-}" ]; then
 else
     skip "$STEP" "dns-wildcard" "cleanup skipped because temporary entry was not created"
 fi
+
+step
+check_resource_snapshot "resource-after-functional" "$RESOURCE_BASE_RSS_KB"
+
+# Step: Run a concurrent DNS burst over local hot-path actions.
+BURST_BASE="${RUN_TAG}-burst.rustblocker.test"
+BURST_EXACT="exact.${BURST_BASE}"
+BURST_WILDCARD_BASE="wild.${BURST_BASE}"
+BURST_WILDCARD_ENTRY="*.${BURST_WILDCARD_BASE}"
+BURST_WILDCARD_SUBDOMAIN="sub.${BURST_WILDCARD_BASE}"
+BURST_REWRITE="rewrite.${BURST_BASE}"
+BURST_REWRITE_IPV4="192.0.2.124"
+BURST_EXACT_ID=""
+BURST_WILDCARD_ID=""
+BURST_REWRITE_ID=""
+
+step
+BURST_EXACT_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/blocklist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$BURST_EXACT\"}")
+BURST_EXACT_HTTP=$(printf '%s\n' "$BURST_EXACT_RESPONSE" | tail -1)
+BURST_EXACT_BODY=$(printf '%s\n' "$BURST_EXACT_RESPONSE" | sed '$d')
+BURST_EXACT_ID=$(printf '%s\n' "$BURST_EXACT_BODY" | json_ids | head -1)
+BURST_WILDCARD_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/blocklist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$BURST_WILDCARD_ENTRY\"}")
+BURST_WILDCARD_HTTP=$(printf '%s\n' "$BURST_WILDCARD_RESPONSE" | tail -1)
+BURST_WILDCARD_BODY=$(printf '%s\n' "$BURST_WILDCARD_RESPONSE" | sed '$d')
+BURST_WILDCARD_ID=$(printf '%s\n' "$BURST_WILDCARD_BODY" | json_ids | head -1)
+BURST_REWRITE_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/rewrites" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$BURST_REWRITE\",\"ipv4\":\"$BURST_REWRITE_IPV4\",\"ipv6\":null}")
+BURST_REWRITE_HTTP=$(printf '%s\n' "$BURST_REWRITE_RESPONSE" | tail -1)
+BURST_REWRITE_BODY=$(printf '%s\n' "$BURST_REWRITE_RESPONSE" | sed '$d')
+BURST_REWRITE_ID=$(printf '%s\n' "$BURST_REWRITE_BODY" | json_ids | head -1)
+if [ "$BURST_EXACT_HTTP" = "201" ] && [ -n "$BURST_EXACT_ID" ] \
+    && [ "$BURST_WILDCARD_HTTP" = "201" ] && [ -n "$BURST_WILDCARD_ID" ] \
+    && [ "$BURST_REWRITE_HTTP" = "201" ] && [ -n "$BURST_REWRITE_ID" ]; then
+    ok "$STEP" "dns-burst-setup" "created exact, wildcard, and rewrite entries for $BURST_BASE"
+else
+    fail "$STEP" "dns-burst-setup" "failed to prepare DNS burst entries (exact HTTP $BURST_EXACT_HTTP id=${BURST_EXACT_ID:-missing}; wildcard HTTP $BURST_WILDCARD_HTTP id=${BURST_WILDCARD_ID:-missing}; rewrite HTTP $BURST_REWRITE_HTTP id=${BURST_REWRITE_ID:-missing})"
+fi
+
+step
+if [ -n "${BURST_EXACT_ID:-}" ] && [ -n "${BURST_WILDCARD_ID:-}" ] && [ -n "${BURST_REWRITE_ID:-}" ]; then
+    BURST_FAILURES_FILE=$(mktemp)
+    BURST_STARTED_MS=$(now_ms)
+    BURST_PIDS=()
+    for i in $(seq 1 "$DNS_BURST_REQUESTS"); do
+        case $((i % 3)) in
+            0) BURST_DOMAIN="$BURST_EXACT"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
+            1) BURST_DOMAIN="$BURST_WILDCARD_SUBDOMAIN"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
+            *) BURST_DOMAIN="$BURST_REWRITE"; BURST_EXPECT="$BURST_REWRITE_IPV4" ;;
+        esac
+        (
+            BURST_DNS=$(target_dns_a "$BURST_DOMAIN" 2>/dev/null || true)
+            if ! printf '%s\n' "$BURST_DNS" | grep -Fxq "$BURST_EXPECT"; then
+                printf '%s expected=%s got=%s\n' "$BURST_DOMAIN" "$BURST_EXPECT" "${BURST_DNS:-empty}" >> "$BURST_FAILURES_FILE"
+            fi
+        ) &
+        BURST_PIDS+=("$!")
+    done
+    for pid in "${BURST_PIDS[@]}"; do
+        wait "$pid" || true
+    done
+    BURST_ELAPSED_MS=$(( $(now_ms) - BURST_STARTED_MS ))
+    BURST_FAILURES=$(wc -l < "$BURST_FAILURES_FILE" 2>/dev/null || echo 0)
+    BURST_SAMPLE=$(head -1 "$BURST_FAILURES_FILE" 2>/dev/null || true)
+    rm -f "$BURST_FAILURES_FILE"
+    if [ "$BURST_FAILURES" -le "$DNS_BURST_MAX_FAILURES" ] && [ "$BURST_ELAPSED_MS" -le "$DNS_BURST_MAX_MS" ]; then
+        ok "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries completed in ${BURST_ELAPSED_MS}ms with ${BURST_FAILURES} failures"
+    else
+        fail "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries had ${BURST_FAILURES} failures in ${BURST_ELAPSED_MS}ms (max failures ${DNS_BURST_MAX_FAILURES}, max ${DNS_BURST_MAX_MS}ms, sample: ${BURST_SAMPLE:-none})"
+    fi
+else
+    skip "$STEP" "dns-burst" "burst skipped because setup failed"
+fi
+
+step
+BURST_CLEANUP_OK=true
+for pair in "blocklist:$BURST_EXACT_ID" "blocklist:$BURST_WILDCARD_ID" "rewrites:$BURST_REWRITE_ID"; do
+    kind="${pair%%:*}"
+    id="${pair#*:}"
+    [ -z "$id" ] && continue
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/$kind/$id")
+    [ "$HTTP_CODE" = "200" ] || BURST_CLEANUP_OK=false
+done
+if [ "$BURST_CLEANUP_OK" = true ]; then
+    ok "$STEP" "dns-burst-cleanup" "removed DNS burst entries"
+else
+    fail "$STEP" "dns-burst-cleanup" "failed to remove one or more DNS burst entries"
+fi
+
+# Step: Prove DNS and API hot-reload remain responsive under concurrent queries.
+HOT_RELOAD_DOMAIN="${RUN_TAG}-hot-reload.rustblocker.test"
+HOT_RELOAD_ID=""
+
+step
+HOT_RELOAD_DNS_LOG=$(mktemp)
+(
+    for _ in $(seq 1 "$HOT_RELOAD_DNS_REQUESTS"); do
+        target_dns_a "$HOT_RELOAD_DOMAIN" >> "$HOT_RELOAD_DNS_LOG" 2>/dev/null || true
+        sleep 0.02
+    done
+) &
+HOT_RELOAD_PID=$!
+sleep 0.2
+HOT_RELOAD_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/blocklist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$HOT_RELOAD_DOMAIN\"}")
+HOT_RELOAD_HTTP=$(printf '%s\n' "$HOT_RELOAD_RESPONSE" | tail -1)
+HOT_RELOAD_BODY=$(printf '%s\n' "$HOT_RELOAD_RESPONSE" | sed '$d')
+HOT_RELOAD_ID=$(printf '%s\n' "$HOT_RELOAD_BODY" | json_ids | head -1)
+HOT_RELOAD_BLOCKED_DNS=$(target_dns_a "$HOT_RELOAD_DOMAIN" 2>/dev/null || true)
+if [ "$HOT_RELOAD_HTTP" = "201" ] && [ -n "$HOT_RELOAD_ID" ] \
+    && printf '%s\n' "$HOT_RELOAD_BLOCKED_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+    ok "$STEP" "hot-reload-under-load" "blocklist add hot-reloaded while ${HOT_RELOAD_DNS_REQUESTS} DNS probes were active"
+else
+    fail "$STEP" "hot-reload-under-load" "blocklist add did not hot-reload under DNS load (HTTP $HOT_RELOAD_HTTP, id=${HOT_RELOAD_ID:-missing}, dns=${HOT_RELOAD_BLOCKED_DNS:-empty})"
+fi
+
+step
+if [ -n "${HOT_RELOAD_ID:-}" ]; then
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/blocklist/$HOT_RELOAD_ID")
+    HOT_RELOAD_AFTER_DELETE_DNS=$(target_dns_a "$HOT_RELOAD_DOMAIN" 2>/dev/null || true)
+    wait "$HOT_RELOAD_PID" || true
+    HOT_RELOAD_BACKGROUND_COUNT=$(wc -l < "$HOT_RELOAD_DNS_LOG" 2>/dev/null || echo 0)
+    rm -f "$HOT_RELOAD_DNS_LOG"
+    if [ "$HTTP_CODE" = "200" ] && ! printf '%s\n' "$HOT_RELOAD_AFTER_DELETE_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+        ok "$STEP" "hot-reload-under-load" "blocklist delete hot-reloaded after ${HOT_RELOAD_BACKGROUND_COUNT} background DNS probes"
+    else
+        fail "$STEP" "hot-reload-under-load" "blocklist delete did not hot-reload (HTTP $HTTP_CODE, dns=${HOT_RELOAD_AFTER_DELETE_DNS:-empty})"
+    fi
+else
+    wait "$HOT_RELOAD_PID" || true
+    rm -f "$HOT_RELOAD_DNS_LOG"
+    skip "$STEP" "hot-reload-under-load" "delete skipped because temporary entry was not created"
+fi
+
+# Step: Repeated imports must not cause unbounded RSS growth or stale entries.
+step
+MEMORY_BASE_RSS_KB="$RESOURCE_BASE_RSS_KB"
+if remote_resource_snapshot; then
+    MEMORY_BASE_RSS_KB="$RESOURCE_RSS_KB"
+fi
+MEMORY_IMPORT_OK=true
+MEMORY_IMPORTED_TOTAL=0
+MEMORY_CLEANED_TOTAL=0
+for loop in $(seq 1 "$MEMORY_IMPORT_LOOPS"); do
+    MEMORY_BASE="${RUN_TAG}-mem-${loop}.rustblocker.test"
+    MEMORY_CONTENT=""
+    for i in $(seq 1 "$MEMORY_IMPORT_DOMAINS"); do
+        MEMORY_CONTENT="${MEMORY_CONTENT}0.0.0.0 mem-${i}.${MEMORY_BASE}\\n"
+    done
+    MEMORY_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+        -X POST "$BASE_URL/api/blocklist/import" \
+        -H "Content-Type: application/json" \
+        -d "{\"content\":\"$MEMORY_CONTENT\"}")
+    MEMORY_HTTP=$(printf '%s\n' "$MEMORY_RESPONSE" | tail -1)
+    MEMORY_BODY=$(printf '%s\n' "$MEMORY_RESPONSE" | sed '$d')
+    MEMORY_IMPORTED=$(printf '%s\n' "$MEMORY_BODY" | json_number "imported")
+    if [ "$MEMORY_HTTP" != "200" ] || [ "${MEMORY_IMPORTED:-0}" -lt "$MEMORY_IMPORT_DOMAINS" ]; then
+        MEMORY_IMPORT_OK=false
+    fi
+    MEMORY_IMPORTED_TOTAL=$((MEMORY_IMPORTED_TOTAL + ${MEMORY_IMPORTED:-0}))
+    MEMORY_SEARCH_LIMIT=$((MEMORY_IMPORT_DOMAINS + 25))
+    MEMORY_LOOP_CLEAN=false
+    for _ in $(seq 1 20); do
+        MEMORY_SEARCH=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$MEMORY_BASE&limit=$MEMORY_SEARCH_LIMIT")
+        if printf '%s\n' "$MEMORY_SEARCH" | grep -q '"domains":\[\]'; then
+            MEMORY_LOOP_CLEAN=true
+            break
+        fi
+        MEMORY_IDS=$(printf '%s\n' "$MEMORY_SEARCH" | json_ids || true)
+        if [ -z "$MEMORY_IDS" ]; then
+            MEMORY_IMPORT_OK=false
+            break
+        fi
+        for id in $MEMORY_IDS; do
+            HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -X DELETE "$BASE_URL/api/blocklist/$id")
+            if [ "$HTTP_CODE" = "200" ]; then
+                MEMORY_CLEANED_TOTAL=$((MEMORY_CLEANED_TOTAL + 1))
+            fi
+        done
+        sleep 0.1
+    done
+    if [ "$MEMORY_LOOP_CLEAN" != true ]; then
+        MEMORY_IMPORT_OK=false
+    fi
+done
+sleep 2
+if [ "$MEMORY_IMPORT_OK" = true ]; then
+    ok "$STEP" "import-memory-loop" "${MEMORY_IMPORT_LOOPS} imports inserted ${MEMORY_IMPORTED_TOTAL} entries; prefix cleanup verified (${MEMORY_CLEANED_TOTAL} delete confirmations)"
+else
+    fail "$STEP" "import-memory-loop" "repeated import cleanup incomplete (inserted ${MEMORY_IMPORTED_TOTAL}, ${MEMORY_CLEANED_TOTAL} delete confirmations)"
+fi
+
+step
+check_resource_snapshot "resource-after-import-loop" "$MEMORY_BASE_RSS_KB"
+
+step
+CLEANUP_LEAKS=0
+for endpoint in blocklist allowlist; do
+    CLEANUP_JSON=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/$endpoint?search=$RUN_TAG&limit=5")
+    if ! printf '%s\n' "$CLEANUP_JSON" | grep -q '"domains":\[\]'; then
+        CLEANUP_LEAKS=$((CLEANUP_LEAKS + 1))
+    fi
+done
+REWRITE_CLEANUP_JSON=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/rewrites")
+if printf '%s\n' "$REWRITE_CLEANUP_JSON" | grep -q "$RUN_TAG"; then
+    CLEANUP_LEAKS=$((CLEANUP_LEAKS + 1))
+fi
+if [ "$CLEANUP_LEAKS" -eq 0 ]; then
+    ok "$STEP" "cleanup-audit" "no temporary entries remain for $RUN_TAG"
+else
+    fail "$STEP" "cleanup-audit" "found temporary entries remaining for $RUN_TAG"
+fi
+
+step
+check_resource_snapshot "resource-final" "$RESOURCE_BASE_RSS_KB"
 
 # Optional Cloudflare + HTTPS integration checks. Disabled by default because
 # they require a real domain, ACME account, and Cloudflare token permissions.
