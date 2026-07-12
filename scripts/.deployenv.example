@@ -42,6 +42,34 @@ MEMORY_RSS_GROWTH_MAX_KB=65536
 PROCESS_FD_MAX=1024
 PROCESS_THREADS_MAX=128
 
+# Optional blocklist capacity stress mode. This grows a temporary blocklist by
+# tiers until DNS latency/resource thresholds reject a tier, writes the last
+# accepted tier to STRESS_BASELINE_FILE, then cleans the prefix and restarts
+# rustblocker. The default "auto" mode reads last_accepted_domains from
+# STRESS_BASELINE_FILE and tests the next doubled value. Large tiers should use
+# remote sqlite3 cleanup; without sqlite3, the script falls back to API cleanup
+# only up to STRESS_API_CLEANUP_MAX_DOMAINS.
+REMOTE_DB_PATH=/var/lib/rustblocker/rustblocker.db
+MOCK_STRESS_BLOCKLIST=false
+STRESS_INSTALL_SQLITE3=true
+STRESS_BLOCKLIST_TIERS=auto
+STRESS_AUTO_START_DOMAINS=10000
+STRESS_AUTO_MULTIPLIER=2
+STRESS_AUTO_PASSES=1
+STRESS_AUTO_MAX_DOMAINS=0
+# To override auto mode, provide an explicit ladder, for example:
+# STRESS_BLOCKLIST_TIERS="10000 25000 50000 100000"
+STRESS_BLOCKLIST_BATCH=1000
+STRESS_DNS_SAMPLES=120
+STRESS_DNS_P95_MAX_MS=250
+STRESS_DNS_MAX_MS=1000
+STRESS_DNS_MAX_FAILURES=0
+STRESS_RSS_GROWTH_MAX_KB=131072
+STRESS_BASELINE_MIN_DOMAINS=0
+STRESS_BASELINE_FILE=target/mock-blocklist-stress-baseline.json
+STRESS_API_CLEANUP_MAX_DOMAINS=10000
+STRESS_API_CLEANUP_PAGE_SIZE=250
+
 # Cloudflare + HTTPS / ACME integration checks are disabled by default.
 # Set ENABLE_CLOUDFLARE_HTTPS=true only when the values below are configured
 # and the Cloudflare token has the DNS permissions required for ACME.

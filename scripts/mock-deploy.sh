@@ -63,6 +63,26 @@ MEMORY_RSS_MAX_KB="${MEMORY_RSS_MAX_KB:-262144}"
 MEMORY_RSS_GROWTH_MAX_KB="${MEMORY_RSS_GROWTH_MAX_KB:-65536}"
 PROCESS_FD_MAX="${PROCESS_FD_MAX:-1024}"
 PROCESS_THREADS_MAX="${PROCESS_THREADS_MAX:-128}"
+REMOTE_DB_PATH="${REMOTE_DB_PATH:-/var/lib/rustblocker/rustblocker.db}"
+MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
+STRESS_INSTALL_SQLITE3="${STRESS_INSTALL_SQLITE3:-true}"
+STRESS_BLOCKLIST_TIERS="${STRESS_BLOCKLIST_TIERS:-auto}"
+STRESS_AUTO_START_DOMAINS="${STRESS_AUTO_START_DOMAINS:-10000}"
+STRESS_AUTO_MULTIPLIER="${STRESS_AUTO_MULTIPLIER:-2}"
+STRESS_AUTO_PASSES="${STRESS_AUTO_PASSES:-1}"
+STRESS_AUTO_MAX_DOMAINS="${STRESS_AUTO_MAX_DOMAINS:-0}"
+STRESS_BLOCKLIST_BATCH="${STRESS_BLOCKLIST_BATCH:-1000}"
+STRESS_DNS_SAMPLES="${STRESS_DNS_SAMPLES:-120}"
+STRESS_DNS_P95_MAX_MS="${STRESS_DNS_P95_MAX_MS:-250}"
+STRESS_DNS_MAX_MS="${STRESS_DNS_MAX_MS:-1000}"
+STRESS_DNS_MAX_FAILURES="${STRESS_DNS_MAX_FAILURES:-0}"
+STRESS_RSS_GROWTH_MAX_KB="${STRESS_RSS_GROWTH_MAX_KB:-131072}"
+STRESS_BASELINE_MIN_DOMAINS="${STRESS_BASELINE_MIN_DOMAINS:-0}"
+STRESS_BASELINE_FILE="${STRESS_BASELINE_FILE:-target/mock-blocklist-stress-baseline.json}"
+STRESS_API_CLEANUP_MAX_DOMAINS="${STRESS_API_CLEANUP_MAX_DOMAINS:-10000}"
+STRESS_API_CLEANUP_PAGE_SIZE="${STRESS_API_CLEANUP_PAGE_SIZE:-250}"
+STRESS_CLEANUP_METHOD="unknown"
+STRESS_RESOLVED_TIERS="$STRESS_BLOCKLIST_TIERS"
 GIT_REV=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "nogit")
 MOCK_BUILD_ID="${MOCK_BUILD_ID:-mock-$(date +%Y%m%d%H%M%S)-${GIT_REV}}"
 RUN_TAG="mock-$(date +%s)-$$"
@@ -131,6 +151,29 @@ has_ipv4_answer() {
     grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
 }
 
+api_cleanup_blocklist_prefix() {
+    local prefix="$1"
+    local page_size="${2:-250}"
+    local max_passes="${3:-40}"
+    local cleanup_json cleanup_ids id http_code
+    API_CLEANUP_DELETED=0
+    for _ in $(seq 1 "$max_passes"); do
+        cleanup_json=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$prefix&limit=$page_size")
+        if printf '%s\n' "$cleanup_json" | grep -q '"domains":\[\]'; then
+            return 0
+        fi
+        cleanup_ids=$(printf '%s\n' "$cleanup_json" | json_ids || true)
+        [ -z "$cleanup_ids" ] && return 1
+        for id in $cleanup_ids; do
+            http_code=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -X DELETE "$BASE_URL/api/blocklist/$id")
+            [ "$http_code" = "200" ] || return 1
+            API_CLEANUP_DELETED=$((API_CLEANUP_DELETED + 1))
+        done
+    done
+    return 1
+}
+
 remote_root() {
     local command="$1"
     local quoted_command quoted_password
@@ -176,6 +219,230 @@ check_resource_snapshot() {
     else
         ok "$STEP" "$label" "pid=$RESOURCE_PID rss=${RESOURCE_RSS_KB}KB growth=${growth}KB threads=$RESOURCE_THREADS fds=$RESOURCE_FDS"
     fi
+}
+
+wait_for_health() {
+    local attempts="${1:-10}"
+    local delay="${2:-2}"
+    local i
+    for i in $(seq 1 "$attempts"); do
+        if "${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null | grep -q '200'; then
+            return 0
+        fi
+        sleep "$delay"
+    done
+    return 1
+}
+
+restart_remote_service() {
+    remote_root "systemctl restart rustblocker 2>/dev/null || rc-service rustblocker restart 2>/dev/null"
+}
+
+stress_cleanup_blocklist() {
+    local prefix="$1"
+    local quoted_db quoted_prefix
+    if [ "$STRESS_CLEANUP_METHOD" = "sqlite" ]; then
+        quoted_db=$(shell_quote "$REMOTE_DB_PATH")
+        quoted_prefix=$(shell_quote "%$prefix%")
+        if remote_root "sqlite3 $quoted_db \"DELETE FROM blocklist_domains WHERE domain LIKE $quoted_prefix;\""; then
+            if restart_remote_service && wait_for_health 15 2; then
+                return 0
+            fi
+        fi
+        return 1
+    fi
+
+    local deleted_total=0
+    local cleanup_json cleanup_ids id http_code
+    for _ in $(seq 1 200); do
+        cleanup_json=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$prefix&limit=$STRESS_API_CLEANUP_PAGE_SIZE")
+        if printf '%s\n' "$cleanup_json" | grep -q '"domains":\[\]'; then
+            if restart_remote_service && wait_for_health 15 2; then
+                return 0
+            fi
+            return 1
+        fi
+        cleanup_ids=$(printf '%s\n' "$cleanup_json" | json_ids || true)
+        [ -z "$cleanup_ids" ] && return 1
+        for id in $cleanup_ids; do
+            http_code=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -X DELETE "$BASE_URL/api/blocklist/$id")
+            [ "$http_code" = "200" ] || return 1
+            deleted_total=$((deleted_total + 1))
+            if [ "$deleted_total" -gt "$STRESS_API_CLEANUP_MAX_DOMAINS" ]; then
+                return 1
+            fi
+        done
+    done
+    return 1
+}
+
+stress_max_tier() {
+    local max=0 tier
+    for tier in $STRESS_RESOLVED_TIERS; do
+        [ "$tier" -gt "$max" ] && max="$tier"
+    done
+    printf '%s\n' "$max"
+}
+
+stress_baseline_last_accepted() {
+    if [ -f "$STRESS_BASELINE_FILE" ]; then
+        sed -n 's/.*"last_accepted_domains":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$STRESS_BASELINE_FILE" | head -1
+    fi
+}
+
+stress_resolve_tiers() {
+    local current next pass tiers max
+    if [ "$STRESS_BLOCKLIST_TIERS" != "auto" ]; then
+        STRESS_RESOLVED_TIERS="$STRESS_BLOCKLIST_TIERS"
+        return
+    fi
+
+    current=$(stress_baseline_last_accepted)
+    current="${current:-0}"
+    tiers=""
+    max="$STRESS_AUTO_MAX_DOMAINS"
+    for pass in $(seq 1 "$STRESS_AUTO_PASSES"); do
+        if [ "$current" -gt 0 ]; then
+            next=$((current * STRESS_AUTO_MULTIPLIER))
+        else
+            next="$STRESS_AUTO_START_DOMAINS"
+        fi
+        if [ "$max" -gt 0 ] && [ "$next" -gt "$max" ]; then
+            next="$max"
+        fi
+        if [ "$next" -le "$current" ]; then
+            break
+        fi
+        tiers="${tiers}${tiers:+ }$next"
+        current="$next"
+    done
+    STRESS_RESOLVED_TIERS="${tiers:-$STRESS_AUTO_START_DOMAINS}"
+}
+
+stress_install_sqlite3() {
+    remote_root "if command -v sqlite3 >/dev/null 2>&1; then exit 0; elif command -v apk >/dev/null 2>&1; then apk add --no-cache sqlite; elif command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y sqlite3; elif command -v dnf >/dev/null 2>&1; then dnf install -y sqlite; elif command -v yum >/dev/null 2>&1; then yum install -y sqlite; else exit 2; fi; command -v sqlite3 >/dev/null 2>&1"
+}
+
+stress_select_cleanup_method() {
+    local max_tier
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1; then
+        STRESS_CLEANUP_METHOD="sqlite"
+        return 0
+    fi
+    if enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1; then
+        STRESS_CLEANUP_METHOD="sqlite"
+        return 0
+    fi
+    max_tier=$(stress_max_tier)
+    if [ "$max_tier" -le "$STRESS_API_CLEANUP_MAX_DOMAINS" ]; then
+        STRESS_CLEANUP_METHOD="api"
+        return 0
+    fi
+    STRESS_CLEANUP_METHOD="none"
+    return 1
+}
+
+stress_import_blocklist_batch() {
+    local base="$1"
+    local start="$2"
+    local count="$3"
+    local payload_file response_file http_code body imported i
+    payload_file=$(mktemp)
+    response_file=$(mktemp)
+    printf '{"content":"' > "$payload_file"
+    for i in $(seq "$start" $((start + count - 1))); do
+        printf '0.0.0.0 stress-%s.%s\\n' "$i" "$base" >> "$payload_file"
+    done
+    printf '"}' >> "$payload_file"
+    http_code=$("${CURL[@]}" -o "$response_file" -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X POST "$BASE_URL/api/blocklist/import" \
+        -H "Content-Type: application/json" \
+        --data-binary "@$payload_file")
+    body=$(cat "$response_file")
+    rm -f "$payload_file" "$response_file"
+    imported=$(printf '%s\n' "$body" | json_number "imported")
+    if [ "$http_code" = "200" ] && [ "${imported:-0}" -ge "$count" ]; then
+        STRESS_IMPORTED_BATCH="$imported"
+        return 0
+    fi
+    STRESS_IMPORTED_BATCH="${imported:-0}"
+    STRESS_IMPORT_ERROR="HTTP $http_code response: ${body:-empty}"
+    return 1
+}
+
+stress_ensure_blocklist_size() {
+    local base="$1"
+    local expected="$2"
+    local search total
+    search=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$base&limit=1")
+    total=$(printf '%s\n' "$search" | json_number "total")
+    [ "${total:-0}" -ge "$expected" ]
+}
+
+stress_measure_dns_latency() {
+    local base="$1"
+    local domain_count="$2"
+    local samples="$3"
+    local latencies_file failures_file sorted_file sample_count i index domain start_ms end_ms elapsed answer failures
+    latencies_file=$(mktemp)
+    failures_file=$(mktemp)
+    sorted_file=$(mktemp)
+    sample_count="$samples"
+    [ "$sample_count" -gt "$domain_count" ] && sample_count="$domain_count"
+    [ "$sample_count" -lt 1 ] && sample_count=1
+    for i in $(seq 1 "$sample_count"); do
+        index=$(( ((i - 1) * domain_count / sample_count) + 1 ))
+        domain="stress-${index}.${base}"
+        start_ms=$(now_ms)
+        answer=$(target_dns_a "$domain" 2>/dev/null || true)
+        end_ms=$(now_ms)
+        elapsed=$((end_ms - start_ms))
+        printf '%s\n' "$elapsed" >> "$latencies_file"
+        if ! printf '%s\n' "$answer" | grep -Fxq "$SINKHOLE_IPV4"; then
+            printf '%s expected=%s got=%s\n' "$domain" "$SINKHOLE_IPV4" "${answer:-empty}" >> "$failures_file"
+        fi
+    done
+    sort -n "$latencies_file" > "$sorted_file"
+    failures=$(wc -l < "$failures_file" 2>/dev/null || echo 0)
+    STRESS_DNS_SAMPLE_COUNT="$sample_count"
+    STRESS_DNS_FAILURES="$failures"
+    STRESS_DNS_MIN_MS=$(head -1 "$sorted_file" 2>/dev/null || echo 0)
+    STRESS_DNS_MAX_OBSERVED_MS=$(tail -1 "$sorted_file" 2>/dev/null || echo 0)
+    STRESS_DNS_AVG_MS=$(awk '{sum += $1; count += 1} END {if (count > 0) printf "%d", sum / count; else print 0}' "$latencies_file")
+    STRESS_DNS_P95_MS=$(awk -v total="$sample_count" 'BEGIN {idx = int((total * 95 + 99) / 100); if (idx < 1) idx = 1} NR == idx {print; found=1} END {if (!found) print 0}' "$sorted_file")
+    STRESS_DNS_FAILURE_SAMPLE=$(head -1 "$failures_file" 2>/dev/null || true)
+    rm -f "$latencies_file" "$failures_file" "$sorted_file"
+}
+
+write_stress_baseline() {
+    local status="$1"
+    local last_ok="$2"
+    local first_bad="$3"
+    local rss_growth="$4"
+    local dir
+    dir=$(dirname "$STRESS_BASELINE_FILE")
+    mkdir -p "$dir"
+    cat > "$STRESS_BASELINE_FILE" <<EOF
+{
+  "status": "$status",
+  "git_rev": "$GIT_REV",
+  "target": "$SSH_HOST",
+  "tier_mode": "$STRESS_BLOCKLIST_TIERS",
+  "tiers": "$STRESS_RESOLVED_TIERS",
+  "last_accepted_domains": $last_ok,
+  "first_rejected_domains": $first_bad,
+  "dns_samples": ${STRESS_DNS_SAMPLE_COUNT:-0},
+  "dns_p95_ms": ${STRESS_DNS_P95_MS:-0},
+  "dns_max_ms": ${STRESS_DNS_MAX_OBSERVED_MS:-0},
+  "dns_failures": ${STRESS_DNS_FAILURES:-0},
+  "rss_growth_kb": $rss_growth,
+  "rss_kb": ${RESOURCE_RSS_KB:-0},
+  "threads": ${RESOURCE_THREADS:-0},
+  "fds": ${RESOURCE_FDS:-0},
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
 }
 
 REMOTE_ARCH=$("${SSH[@]}" "$REMOTE" "uname -m" 2>/dev/null || true)
@@ -656,20 +923,10 @@ fi
 rm -f "$LIVE_QUERY_OUT"
 
 step
-CLEANUP_JSON=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$IMPORT_BASE&limit=20")
-CLEANUP_IDS=$(echo "$CLEANUP_JSON" | grep -o '"id":[0-9]*' | cut -d: -f2 || true)
-CLEANUP_COUNT=0
-for id in $CLEANUP_IDS; do
-    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
-        -X DELETE "$BASE_URL/api/blocklist/$id")
-    if [ "$HTTP_CODE" = "200" ]; then
-        CLEANUP_COUNT=$((CLEANUP_COUNT + 1))
-    fi
-done
-if [ "$CLEANUP_COUNT" -ge 2 ]; then
-    ok "$STEP" "import-hot-reload" "removed $CLEANUP_COUNT temporary imported entries"
+if api_cleanup_blocklist_prefix "$IMPORT_BASE" 250 20; then
+    ok "$STEP" "import-hot-reload" "removed temporary imported entries for $IMPORT_BASE (${API_CLEANUP_DELETED} delete confirmations)"
 else
-    fail "$STEP" "import-hot-reload" "cleanup removed $CLEANUP_COUNT temporary imported entries"
+    fail "$STEP" "import-hot-reload" "failed to remove temporary imported entries for $IMPORT_BASE (${API_CLEANUP_DELETED} delete confirmations)"
 fi
 
 # Step: Verify rewrite IPs are applied from the parsed runtime map.
@@ -816,6 +1073,23 @@ fi
 
 step
 if [ -n "${BURST_EXACT_ID:-}" ] && [ -n "${BURST_WILDCARD_ID:-}" ] && [ -n "${BURST_REWRITE_ID:-}" ]; then
+    BURST_READY=false
+    for _ in $(seq 1 10); do
+        BURST_EXACT_READY=$(target_dns_a "$BURST_EXACT" 2>/dev/null || true)
+        BURST_WILDCARD_READY=$(target_dns_a "$BURST_WILDCARD_SUBDOMAIN" 2>/dev/null || true)
+        BURST_REWRITE_READY=$(target_dns_a "$BURST_REWRITE" 2>/dev/null || true)
+        if printf '%s\n' "$BURST_EXACT_READY" | grep -Fxq "$SINKHOLE_IPV4" \
+            && printf '%s\n' "$BURST_WILDCARD_READY" | grep -Fxq "$SINKHOLE_IPV4" \
+            && printf '%s\n' "$BURST_REWRITE_READY" | grep -Fxq "$BURST_REWRITE_IPV4"; then
+            BURST_READY=true
+            break
+        fi
+        sleep 0.2
+    done
+
+    if [ "$BURST_READY" != true ]; then
+        fail "$STEP" "dns-burst" "burst entries were not visible before concurrent test (exact=${BURST_EXACT_READY:-empty}, wildcard=${BURST_WILDCARD_READY:-empty}, rewrite=${BURST_REWRITE_READY:-empty})"
+    else
     BURST_FAILURES_FILE=$(mktemp)
     BURST_STARTED_MS=$(now_ms)
     BURST_PIDS=()
@@ -845,20 +1119,27 @@ if [ -n "${BURST_EXACT_ID:-}" ] && [ -n "${BURST_WILDCARD_ID:-}" ] && [ -n "${BU
     else
         fail "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries had ${BURST_FAILURES} failures in ${BURST_ELAPSED_MS}ms (max failures ${DNS_BURST_MAX_FAILURES}, max ${DNS_BURST_MAX_MS}ms, sample: ${BURST_SAMPLE:-none})"
     fi
+    fi
 else
     skip "$STEP" "dns-burst" "burst skipped because setup failed"
 fi
 
 step
 BURST_CLEANUP_OK=true
-for pair in "blocklist:$BURST_EXACT_ID" "blocklist:$BURST_WILDCARD_ID" "rewrites:$BURST_REWRITE_ID"; do
-    kind="${pair%%:*}"
-    id="${pair#*:}"
-    [ -z "$id" ] && continue
+if ! api_cleanup_blocklist_prefix "$BURST_BASE" 250 10; then
+    BURST_CLEANUP_OK=false
+fi
+if [ -n "${BURST_REWRITE_ID:-}" ]; then
     HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
-        -X DELETE "$BASE_URL/api/$kind/$id")
-    [ "$HTTP_CODE" = "200" ] || BURST_CLEANUP_OK=false
-done
+        -X DELETE "$BASE_URL/api/rewrites/$BURST_REWRITE_ID")
+    [ "$HTTP_CODE" = "200" ] || true
+fi
+BURST_BLOCKLIST_LEFT=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$BURST_BASE&limit=1")
+BURST_REWRITE_LEFT=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/rewrites")
+if ! printf '%s\n' "$BURST_BLOCKLIST_LEFT" | grep -q '"domains":\[\]' \
+    || printf '%s\n' "$BURST_REWRITE_LEFT" | grep -q "$BURST_BASE"; then
+    BURST_CLEANUP_OK=false
+fi
 if [ "$BURST_CLEANUP_OK" = true ]; then
     ok "$STEP" "dns-burst-cleanup" "removed DNS burst entries"
 else
@@ -995,6 +1276,161 @@ fi
 
 step
 check_resource_snapshot "resource-final" "$RESOURCE_BASE_RSS_KB"
+
+# Optional blocklist capacity stress. This intentionally grows the deployed
+# blocklist until DNS latency/resource thresholds reject a tier, then records
+# the last accepted tier and force-cleans the temporary prefix from SQLite.
+if enabled "$MOCK_STRESS_BLOCKLIST"; then
+    stress_resolve_tiers
+    STRESS_BASE="${RUN_TAG}-blocklist-stress.rustblocker.test"
+    STRESS_TOTAL=0
+    STRESS_LAST_OK=0
+    STRESS_FIRST_BAD=0
+    STRESS_STATUS="not_started"
+    STRESS_BASE_RSS_KB="$RESOURCE_BASE_RSS_KB"
+    STRESS_LAST_OK_RSS_GROWTH=0
+    STRESS_LAST_OK_P95=0
+    STRESS_LAST_OK_MAX=0
+    STRESS_LAST_OK_FAILURES=0
+    STRESS_LAST_OK_SAMPLES=0
+    STRESS_LAST_OK_RSS_KB=0
+    STRESS_LAST_OK_THREADS=0
+    STRESS_LAST_OK_FDS=0
+
+    step
+    if stress_select_cleanup_method; then
+        ok "$STEP" "blocklist-stress-prereq" "cleanup method=$STRESS_CLEANUP_METHOD (api cap=$STRESS_API_CLEANUP_MAX_DOMAINS, db=$REMOTE_DB_PATH)"
+    else
+        fail "$STEP" "blocklist-stress-prereq" "no safe cleanup method: install sqlite3 on target or keep max tier <= STRESS_API_CLEANUP_MAX_DOMAINS ($STRESS_API_CLEANUP_MAX_DOMAINS)"
+        STRESS_STATUS="cleanup_unavailable"
+    fi
+
+    step
+    if [ "$STRESS_STATUS" != "cleanup_unavailable" ] && remote_resource_snapshot; then
+        STRESS_BASE_RSS_KB="$RESOURCE_RSS_KB"
+        ok "$STEP" "blocklist-stress-baseline" "base=$STRESS_BASE rss=${STRESS_BASE_RSS_KB}KB tiers=$STRESS_RESOLVED_TIERS"
+        STRESS_STATUS="running"
+    elif [ "$STRESS_STATUS" != "cleanup_unavailable" ]; then
+        fail "$STEP" "blocklist-stress-baseline" "could not read process resources before stress"
+        STRESS_STATUS="resource_failed"
+    else
+        skip "$STEP" "blocklist-stress-baseline" "skipped because stress prerequisite failed"
+    fi
+
+    if [ "$STRESS_STATUS" = "running" ]; then
+        for tier in $STRESS_RESOLVED_TIERS; do
+            step
+            if [ "$tier" -le "$STRESS_TOTAL" ]; then
+                skip "$STEP" "blocklist-stress-tier" "tier $tier already covered by prior imports"
+                continue
+            fi
+
+            TIER_STARTED_MS=$(now_ms)
+            TIER_IMPORT_OK=true
+            while [ "$STRESS_TOTAL" -lt "$tier" ]; do
+                remaining=$((tier - STRESS_TOTAL))
+                batch="$STRESS_BLOCKLIST_BATCH"
+                [ "$batch" -gt "$remaining" ] && batch="$remaining"
+                if stress_import_blocklist_batch "$STRESS_BASE" $((STRESS_TOTAL + 1)) "$batch"; then
+                    STRESS_TOTAL=$((STRESS_TOTAL + STRESS_IMPORTED_BATCH))
+                else
+                    TIER_IMPORT_OK=false
+                    break
+                fi
+            done
+            TIER_IMPORT_MS=$(( $(now_ms) - TIER_STARTED_MS ))
+
+            if [ "$TIER_IMPORT_OK" != true ]; then
+                STRESS_FIRST_BAD="$tier"
+                STRESS_STATUS="import_failed"
+                fail "$STEP" "blocklist-stress-tier" "tier $tier import failed after ${TIER_IMPORT_MS}ms (${STRESS_IMPORT_ERROR:-unknown error})"
+                break
+            fi
+
+            if ! stress_ensure_blocklist_size "$STRESS_BASE" "$tier"; then
+                STRESS_FIRST_BAD="$tier"
+                STRESS_STATUS="api_size_failed"
+                fail "$STEP" "blocklist-stress-tier" "tier $tier imported but API search did not report expected size"
+                break
+            fi
+
+            stress_measure_dns_latency "$STRESS_BASE" "$tier" "$STRESS_DNS_SAMPLES"
+            if ! remote_resource_snapshot; then
+                STRESS_FIRST_BAD="$tier"
+                STRESS_STATUS="resource_failed"
+                fail "$STEP" "blocklist-stress-tier" "tier $tier could not read process resources"
+                break
+            fi
+            STRESS_RSS_GROWTH=$((RESOURCE_RSS_KB - STRESS_BASE_RSS_KB))
+            [ "$STRESS_RSS_GROWTH" -lt 0 ] && STRESS_RSS_GROWTH=0
+
+            if [ "$STRESS_DNS_FAILURES" -gt "$STRESS_DNS_MAX_FAILURES" ] \
+                || [ "$STRESS_DNS_P95_MS" -gt "$STRESS_DNS_P95_MAX_MS" ] \
+                || [ "$STRESS_DNS_MAX_OBSERVED_MS" -gt "$STRESS_DNS_MAX_MS" ] \
+                || [ "$STRESS_RSS_GROWTH" -gt "$STRESS_RSS_GROWTH_MAX_KB" ]; then
+                STRESS_FIRST_BAD="$tier"
+                STRESS_STATUS="limit_reached"
+                ok "$STEP" "blocklist-stress-limit" "tier $tier rejected (p95=${STRESS_DNS_P95_MS}ms max=${STRESS_DNS_MAX_OBSERVED_MS}ms failures=$STRESS_DNS_FAILURES rss_growth=${STRESS_RSS_GROWTH}KB sample=${STRESS_DNS_FAILURE_SAMPLE:-none})"
+                break
+            fi
+
+            STRESS_LAST_OK="$tier"
+            STRESS_LAST_OK_RSS_GROWTH="$STRESS_RSS_GROWTH"
+            STRESS_LAST_OK_P95="$STRESS_DNS_P95_MS"
+            STRESS_LAST_OK_MAX="$STRESS_DNS_MAX_OBSERVED_MS"
+            STRESS_LAST_OK_FAILURES="$STRESS_DNS_FAILURES"
+            STRESS_LAST_OK_SAMPLES="$STRESS_DNS_SAMPLE_COUNT"
+            STRESS_LAST_OK_RSS_KB="$RESOURCE_RSS_KB"
+            STRESS_LAST_OK_THREADS="$RESOURCE_THREADS"
+            STRESS_LAST_OK_FDS="$RESOURCE_FDS"
+            STRESS_STATUS="passed"
+            ok "$STEP" "blocklist-stress-tier" "tier $tier accepted: import=${TIER_IMPORT_MS}ms dns_samples=${STRESS_DNS_SAMPLE_COUNT} p95=${STRESS_DNS_P95_MS}ms max=${STRESS_DNS_MAX_OBSERVED_MS}ms avg=${STRESS_DNS_AVG_MS}ms rss=${RESOURCE_RSS_KB}KB growth=${STRESS_RSS_GROWTH}KB"
+        done
+    fi
+
+    step
+    if [ "$STRESS_TOTAL" -gt 0 ]; then
+        if stress_cleanup_blocklist "$STRESS_BASE"; then
+            STRESS_LEFTOVER=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$STRESS_BASE&limit=1")
+            STRESS_RECOVERY_DNS=$(target_dns_a "stress-1.$STRESS_BASE" 2>/dev/null || true)
+            if printf '%s\n' "$STRESS_LEFTOVER" | grep -q '"domains":\[\]' \
+                && ! printf '%s\n' "$STRESS_RECOVERY_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+                ok "$STEP" "blocklist-stress-recovery" "removed stress prefix and restarted service"
+            else
+                fail "$STEP" "blocklist-stress-recovery" "stress prefix cleanup did not fully recover runtime state (search=${STRESS_LEFTOVER:-empty}, dns=${STRESS_RECOVERY_DNS:-empty})"
+            fi
+        else
+            fail "$STEP" "blocklist-stress-recovery" "failed to force-clean stress prefix $STRESS_BASE"
+        fi
+    else
+        skip "$STEP" "blocklist-stress-recovery" "no stress entries were imported"
+    fi
+
+    step
+    if [ "$STRESS_LAST_OK" -gt 0 ]; then
+        STRESS_DNS_SAMPLE_COUNT="$STRESS_LAST_OK_SAMPLES"
+        STRESS_DNS_P95_MS="$STRESS_LAST_OK_P95"
+        STRESS_DNS_MAX_OBSERVED_MS="$STRESS_LAST_OK_MAX"
+        STRESS_DNS_FAILURES="$STRESS_LAST_OK_FAILURES"
+        RESOURCE_RSS_KB="$STRESS_LAST_OK_RSS_KB"
+        RESOURCE_THREADS="$STRESS_LAST_OK_THREADS"
+        RESOURCE_FDS="$STRESS_LAST_OK_FDS"
+        write_stress_baseline "$STRESS_STATUS" "$STRESS_LAST_OK" "$STRESS_FIRST_BAD" "$STRESS_LAST_OK_RSS_GROWTH"
+        if [ "$STRESS_LAST_OK" -lt "$STRESS_BASELINE_MIN_DOMAINS" ]; then
+            fail "$STEP" "blocklist-stress-baseline" "last accepted tier $STRESS_LAST_OK below required baseline $STRESS_BASELINE_MIN_DOMAINS; wrote $STRESS_BASELINE_FILE"
+        else
+            ok "$STEP" "blocklist-stress-baseline" "baseline recorded at $STRESS_LAST_OK domains (first rejected=$STRESS_FIRST_BAD, file=$STRESS_BASELINE_FILE)"
+        fi
+    elif [ "$STRESS_STATUS" = "cleanup_unavailable" ]; then
+        skip "$STEP" "blocklist-stress-baseline" "baseline not written because stress prerequisite failed"
+    else
+        write_stress_baseline "$STRESS_STATUS" 0 "$STRESS_FIRST_BAD" 0
+        fail "$STEP" "blocklist-stress-baseline" "no acceptable stress tier found; wrote $STRESS_BASELINE_FILE"
+    fi
+else
+    step
+    skip "$STEP" "blocklist-stress" "disabled; set MOCK_STRESS_BLOCKLIST=true to discover blocklist capacity baseline"
+fi
 
 # Optional Cloudflare + HTTPS integration checks. Disabled by default because
 # they require a real domain, ACME account, and Cloudflare token permissions.
