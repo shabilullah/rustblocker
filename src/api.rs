@@ -848,18 +848,18 @@ async fn delete_blocklist_domain(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    let domains = db::get_domains(&pool, "blocklist_domains");
-    let domain = domains
-        .iter()
-        .find(|d| d.id == id)
-        .map(|d| d.domain.clone());
-    if db::delete_domain(&pool, "blocklist_domains", id) {
-        if let Some(ref d) = domain {
-            remove_domain(&mut blocklist.write(), d);
+    let pool = pool.get_ref().clone();
+    let domain =
+        match db_blocking(move || db::delete_domain_by_id(&pool, "blocklist_domains", id)).await {
+            Ok(domain) => domain,
+            Err(resp) => return resp,
+        };
+    match domain {
+        Some(domain) => {
+            remove_domain(&mut blocklist.write(), &domain);
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
         }
-        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
     }
 }
 
@@ -954,18 +954,18 @@ async fn delete_allowlist_domain(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    let domains = db::get_domains(&pool, "allowlist_domains");
-    let domain = domains
-        .iter()
-        .find(|d| d.id == id)
-        .map(|d| d.domain.clone());
-    if db::delete_domain(&pool, "allowlist_domains", id) {
-        if let Some(ref d) = domain {
-            remove_domain(&mut allowlist.write(), d);
+    let pool = pool.get_ref().clone();
+    let domain =
+        match db_blocking(move || db::delete_domain_by_id(&pool, "allowlist_domains", id)).await {
+            Ok(domain) => domain,
+            Err(resp) => return resp,
+        };
+    match domain {
+        Some(domain) => {
+            remove_domain(&mut allowlist.write(), &domain);
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
         }
-        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
     }
 }
 
@@ -1051,15 +1051,17 @@ async fn delete_rewrite(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    let all = db::get_rewrites(&pool);
-    let domain = all.iter().find(|r| r.id == id).map(|r| r.domain.clone());
-    if db::delete_rewrite(&pool, id) {
-        if let Some(ref d) = domain {
-            rewrites.write().remove(d);
+    let pool = pool.get_ref().clone();
+    let rewrite = match db_blocking(move || db::delete_rewrite_by_id(&pool, id)).await {
+        Ok(rewrite) => rewrite,
+        Err(resp) => return resp,
+    };
+    match rewrite {
+        Some(rewrite) => {
+            rewrites.write().remove(&rewrite.domain);
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
         }
-        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
     }
 }
 

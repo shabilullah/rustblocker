@@ -486,11 +486,34 @@ pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
     conn.last_insert_rowid()
 }
 
+pub fn get_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<DbDomain> {
+    let conn = pool.get().ok()?;
+    let sql = format!("SELECT id, domain FROM {} WHERE id = ?1", table);
+    conn.query_row(&sql, params![id], |row| {
+        Ok(DbDomain {
+            id: row.get(0)?,
+            domain: row.get(1)?,
+        })
+    })
+    .ok()
+}
+
 pub fn delete_domain(pool: &DbPool, table: &str, id: i64) -> bool {
     let conn = pool.get().expect("failed to get DB connection");
     let sql = format!("DELETE FROM {} WHERE id = ?1", table);
     let rows = conn.execute(&sql, params![id]).unwrap();
     rows > 0
+}
+
+pub fn delete_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<String> {
+    let conn = pool.get().ok()?;
+    let select_sql = format!("SELECT domain FROM {} WHERE id = ?1", table);
+    let domain: String = conn
+        .query_row(&select_sql, params![id], |row| row.get(0))
+        .ok()?;
+    let delete_sql = format!("DELETE FROM {} WHERE id = ?1", table);
+    let rows = conn.execute(&delete_sql, params![id]).ok()?;
+    if rows > 0 { Some(domain) } else { None }
 }
 
 pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
@@ -548,6 +571,23 @@ pub fn get_rewrites(pool: &DbPool) -> Vec<DbRewrite> {
     .collect()
 }
 
+pub fn get_rewrite_by_id(pool: &DbPool, id: i64) -> Option<DbRewrite> {
+    let conn = pool.get().ok()?;
+    conn.query_row(
+        "SELECT id, domain, ipv4, ipv6 FROM rewrites WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(DbRewrite {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                ipv4: row.get(2)?,
+                ipv6: row.get(3)?,
+            })
+        },
+    )
+    .ok()
+}
+
 pub fn add_rewrite(pool: &DbPool, domain: &str, ipv4: Option<&str>, ipv6: Option<&str>) -> i64 {
     let conn = pool.get().expect("failed to get DB connection");
     let normalized = domain.to_lowercase();
@@ -566,6 +606,28 @@ pub fn delete_rewrite(pool: &DbPool, id: i64) -> bool {
         .execute("DELETE FROM rewrites WHERE id = ?1", params![id])
         .unwrap();
     rows > 0
+}
+
+pub fn delete_rewrite_by_id(pool: &DbPool, id: i64) -> Option<DbRewrite> {
+    let conn = pool.get().ok()?;
+    let rewrite = conn
+        .query_row(
+            "SELECT id, domain, ipv4, ipv6 FROM rewrites WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(DbRewrite {
+                    id: row.get(0)?,
+                    domain: row.get(1)?,
+                    ipv4: row.get(2)?,
+                    ipv6: row.get(3)?,
+                })
+            },
+        )
+        .ok()?;
+    let rows = conn
+        .execute("DELETE FROM rewrites WHERE id = ?1", params![id])
+        .ok()?;
+    if rows > 0 { Some(rewrite) } else { None }
 }
 
 // --- Sources (blocklist/allowlist URLs with auto-update) ---
@@ -892,5 +954,49 @@ pub fn sync_snapshot(pool: &DbPool, category: &str) -> Option<serde_json::Value>
             Some(serde_json::to_value(domains).unwrap_or_default())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_DB: AtomicU64 = AtomicU64::new(0);
+
+    fn test_pool() -> DbPool {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_millis();
+        let id = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rustblocker-db-test-{millis}-{id}.db"));
+        create_pool(path).expect("failed to create test database pool")
+    }
+
+    #[test]
+    fn delete_domain_by_id_returns_deleted_domain() {
+        let pool = test_pool();
+        let id = add_domain(&pool, "blocklist_domains", "Delete-Me.Example.");
+
+        let deleted = delete_domain_by_id(&pool, "blocklist_domains", id);
+
+        assert_eq!(deleted.as_deref(), Some("delete-me.example"));
+        assert!(get_domain_by_id(&pool, "blocklist_domains", id).is_none());
+        assert!(delete_domain_by_id(&pool, "blocklist_domains", id).is_none());
+    }
+
+    #[test]
+    fn delete_rewrite_by_id_returns_deleted_rewrite() {
+        let pool = test_pool();
+        let id = add_rewrite(&pool, "Rewrite-Me.Example.", Some("192.0.2.77"), None);
+
+        let deleted = delete_rewrite_by_id(&pool, id).expect("deleted rewrite");
+
+        assert_eq!(deleted.domain, "rewrite-me.example");
+        assert_eq!(deleted.ipv4.as_deref(), Some("192.0.2.77"));
+        assert!(get_rewrite_by_id(&pool, id).is_none());
+        assert!(delete_rewrite_by_id(&pool, id).is_none());
     }
 }

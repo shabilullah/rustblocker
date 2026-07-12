@@ -326,6 +326,38 @@ else
     fail "$STEP" "stats-concurrency" "one or more concurrent stats summaries failed"
 fi
 
+# Step: Verify allowlist delete-by-ID path removes only the selected runtime entry.
+ALLOWLIST_DELETE_DOMAIN="mock-allow-delete-$(date +%s)-$$.rustblocker.test"
+ALLOWLIST_RESPONSE_FILE=$(mktemp)
+
+step
+HTTP_CODE=$("${CURL[@]}" -o "$ALLOWLIST_RESPONSE_FILE" -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/allowlist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$ALLOWLIST_DELETE_DOMAIN\"}")
+ALLOWLIST_RESPONSE=$(cat "$ALLOWLIST_RESPONSE_FILE")
+rm -f "$ALLOWLIST_RESPONSE_FILE"
+ALLOWLIST_ID=$(echo "$ALLOWLIST_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+if [ "$HTTP_CODE" = "201" ] && [ -n "$ALLOWLIST_ID" ]; then
+    ok "$STEP" "allowlist-delete" "added temporary allowlist entry $ALLOWLIST_DELETE_DOMAIN (id=$ALLOWLIST_ID)"
+else
+    fail "$STEP" "allowlist-delete" "failed to add $ALLOWLIST_DELETE_DOMAIN (HTTP $HTTP_CODE, response: ${ALLOWLIST_RESPONSE:-empty})"
+fi
+
+step
+if [ -n "${ALLOWLIST_ID:-}" ]; then
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/allowlist/$ALLOWLIST_ID")
+    ALLOWLIST_SEARCH=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/allowlist?search=$ALLOWLIST_DELETE_DOMAIN&limit=5")
+    if [ "$HTTP_CODE" = "200" ] && echo "$ALLOWLIST_SEARCH" | grep -q '"domains":\[\]'; then
+        ok "$STEP" "allowlist-delete" "removed temporary allowlist entry id=$ALLOWLIST_ID"
+    else
+        fail "$STEP" "allowlist-delete" "failed to remove temporary allowlist entry id=$ALLOWLIST_ID (HTTP $HTTP_CODE, search: ${ALLOWLIST_SEARCH:-empty})"
+    fi
+else
+    skip "$STEP" "allowlist-delete" "delete skipped because temporary entry was not created"
+fi
+
 # Step: Prove DB-heavy requests do not block Actix/Tokio progress.
 step
 SNAPSHOT_STARTED_MS=$(now_ms)
