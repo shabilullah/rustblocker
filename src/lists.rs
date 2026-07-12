@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -170,20 +171,51 @@ impl DomainStore {
 /// Map of domain -> rewrite rules for custom DNS responses.
 #[derive(Debug, Default)]
 pub struct RewriteMap {
-    pub rules: HashMap<String, crate::config::RewriteRule>,
+    pub rules: HashMap<String, RuntimeRewriteRule>,
+}
+
+/// Runtime rewrite rule with IPs parsed once at load/update time.
+#[derive(Debug, Clone)]
+pub struct RuntimeRewriteRule {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl RuntimeRewriteRule {
+    fn from_config(rule: &crate::config::RewriteRule) -> Self {
+        Self {
+            ipv4: rule.ipv4.as_deref().and_then(|ip| ip.parse().ok()),
+            ipv6: rule.ipv6.as_deref().and_then(|ip| ip.parse().ok()),
+        }
+    }
 }
 
 impl RewriteMap {
     pub fn load(rules: Vec<crate::config::RewriteRule>) -> Self {
-        let map: HashMap<String, crate::config::RewriteRule> = rules
-            .into_iter()
-            .map(|r| (normalize_domain(&r.domain), r))
+        let map: HashMap<String, RuntimeRewriteRule> = rules
+            .iter()
+            .map(|rule| {
+                (
+                    normalize_domain(&rule.domain),
+                    RuntimeRewriteRule::from_config(rule),
+                )
+            })
             .collect();
         info!("Loaded {} rewrite rules", map.len());
         Self { rules: map }
     }
 
-    pub fn lookup(&self, domain: &str) -> Option<&crate::config::RewriteRule> {
+    pub fn insert(&mut self, rule: crate::config::RewriteRule) {
+        let domain = normalize_domain(&rule.domain);
+        self.rules
+            .insert(domain, RuntimeRewriteRule::from_config(&rule));
+    }
+
+    pub fn remove(&mut self, domain: &str) {
+        self.rules.remove(&normalize_domain(domain));
+    }
+
+    pub fn lookup(&self, domain: &str) -> Option<&RuntimeRewriteRule> {
         self.rules.get(domain)
     }
 }
@@ -277,5 +309,29 @@ plain.example.com
         let count = store.parse_lines(content, "test");
         assert_eq!(count, 1);
         assert!(store.matches("blocked.com"));
+    }
+
+    #[test]
+    fn test_rewrite_map_parses_ips_once() {
+        let map = RewriteMap::load(vec![
+            crate::config::RewriteRule {
+                domain: "Example.COM.".to_string(),
+                ipv4: Some("192.0.2.10".to_string()),
+                ipv6: Some("2001:db8::10".to_string()),
+            },
+            crate::config::RewriteRule {
+                domain: "invalid.example".to_string(),
+                ipv4: Some("not-an-ip".to_string()),
+                ipv6: None,
+            },
+        ]);
+
+        let rule = map.lookup("example.com").expect("rewrite rule");
+        assert_eq!(rule.ipv4, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(rule.ipv6, Some("2001:db8::10".parse().unwrap()));
+
+        let invalid = map.lookup("invalid.example").expect("invalid rewrite rule");
+        assert_eq!(invalid.ipv4, None);
+        assert_eq!(invalid.ipv6, None);
     }
 }

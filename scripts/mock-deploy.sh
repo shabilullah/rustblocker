@@ -83,7 +83,7 @@ remote_dns_a() {
     local domain="$1"
     local quoted_domain
     quoted_domain=$(shell_quote "$domain")
-    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup \"\$domain\" 127.0.0.1 | awk '/^Name:/ { answer=1 } answer && /^Addresses?:/ { for (i=2; i<=NF; i++) if (\$i ~ /^[0-9.]+\$/) print \$i } answer && /^[[:space:]]+[0-9]+\\./ { print \$1 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
+    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup -type=A \"\$domain\" 127.0.0.1 | awk '/^Name:/ { answer=1 } answer && /^Address(es)?:/ { for (i=2; i<=NF; i++) if (\$i ~ /^[0-9.]+\$/) print \$i } answer && /^[[:space:]]+[0-9]+\\./ { print \$1 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
 }
 
 target_dns_a() {
@@ -93,7 +93,7 @@ target_dns_a() {
     elif command -v drill >/dev/null 2>&1; then
         drill @"$SSH_HOST" "$domain" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print $NF }'
     elif command -v nslookup >/dev/null 2>&1; then
-        nslookup "$domain" "$SSH_HOST" | awk '/^Name:/ { answer=1 } answer && /^Addresses?:/ { for (i=2; i<=NF; i++) if ($i ~ /^[0-9.]+$/) print $i } answer && /^[[:space:]]+[0-9]+\./ { print $1 }'
+        nslookup -type=A "$domain" "$SSH_HOST" | awk '/^Name:/ { answer=1 } answer && /^Address(es)?:/ { for (i=2; i<=NF; i++) if ($i ~ /^[0-9.]+$/) print $i } answer && /^[[:space:]]+[0-9]+\./ { print $1 }'
     else
         remote_dns_a "$domain"
     fi
@@ -495,6 +495,46 @@ if [ "$CLEANUP_COUNT" -ge 2 ]; then
     ok "$STEP" "import-hot-reload" "removed $CLEANUP_COUNT temporary imported entries"
 else
     fail "$STEP" "import-hot-reload" "cleanup removed $CLEANUP_COUNT temporary imported entries"
+fi
+
+# Step: Verify rewrite IPs are applied from the parsed runtime map.
+REWRITE_DOMAIN="mock-rewrite-$(date +%s)-$$.rustblocker.test"
+REWRITE_IPV4="192.0.2.123"
+REWRITE_RESPONSE_FILE=$(mktemp)
+
+step
+HTTP_CODE=$("${CURL[@]}" -o "$REWRITE_RESPONSE_FILE" -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/rewrites" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$REWRITE_DOMAIN\",\"ipv4\":\"$REWRITE_IPV4\",\"ipv6\":null}")
+REWRITE_RESPONSE=$(cat "$REWRITE_RESPONSE_FILE")
+rm -f "$REWRITE_RESPONSE_FILE"
+REWRITE_ID=$(echo "$REWRITE_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+if [ "$HTTP_CODE" = "201" ] && [ -n "$REWRITE_ID" ]; then
+    ok "$STEP" "dns-rewrite" "added temporary rewrite $REWRITE_DOMAIN -> $REWRITE_IPV4 (id=$REWRITE_ID)"
+else
+    fail "$STEP" "dns-rewrite" "failed to add rewrite $REWRITE_DOMAIN (HTTP $HTTP_CODE, response: ${REWRITE_RESPONSE:-empty})"
+fi
+
+step
+REWRITE_DNS=$(target_dns_a "$REWRITE_DOMAIN" 2>/dev/null || true)
+if echo "$REWRITE_DNS" | grep -Fxq "$REWRITE_IPV4"; then
+    ok "$STEP" "dns-rewrite" "$REWRITE_DOMAIN resolved to rewrite IP $REWRITE_IPV4"
+else
+    fail "$STEP" "dns-rewrite" "$REWRITE_DOMAIN did not resolve to $REWRITE_IPV4; output: ${REWRITE_DNS:-empty}"
+fi
+
+step
+if [ -n "${REWRITE_ID:-}" ]; then
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/rewrites/$REWRITE_ID")
+    if [ "$HTTP_CODE" = "200" ]; then
+        ok "$STEP" "dns-rewrite" "removed temporary rewrite id=$REWRITE_ID"
+    else
+        fail "$STEP" "dns-rewrite" "failed to remove temporary rewrite id=$REWRITE_ID (HTTP $HTTP_CODE)"
+    fi
+else
+    skip "$STEP" "dns-rewrite" "cleanup skipped because temporary rewrite was not created"
 fi
 
 # Step: Verify wildcard blocklist matching through the deployed DNS handler.

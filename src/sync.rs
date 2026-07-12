@@ -460,15 +460,11 @@ fn apply_rewrites(data: &serde_json::Value, pool: &DbPool, rewrites: &Arc<RwLock
     let mut map = rewrites.write();
     map.rules.clear();
     for item in &items {
-        let domain = item.domain.to_lowercase();
-        map.rules.insert(
-            domain.clone(),
-            RewriteRule {
-                domain,
-                ipv4: item.ipv4.clone(),
-                ipv6: item.ipv6.clone(),
-            },
-        );
+        map.insert(RewriteRule {
+            domain: item.domain.clone(),
+            ipv4: item.ipv4.clone(),
+            ipv6: item.ipv6.clone(),
+        });
     }
 }
 

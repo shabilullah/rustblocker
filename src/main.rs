@@ -16,9 +16,7 @@ use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
 use rustblocker::forwarder::{ForwardStrategy, ParallelForwarder};
 use rustblocker::handler::DnsBlockerHandler;
-use rustblocker::lists::{
-    AllowlistStore, BlocklistStore, DomainStore, RewriteMap, normalize_domain,
-};
+use rustblocker::lists::{AllowlistStore, BlocklistStore, DomainStore, RewriteMap};
 use rustblocker::stats::QueryLog;
 use rustblocker::sync;
 
@@ -188,16 +186,15 @@ fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
 
 fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
     let rewrites = db::get_rewrites(pool);
-    let mut map = RewriteMap::default();
-    for r in &rewrites {
-        let rule = rustblocker::config::RewriteRule {
+    let rules = rewrites
+        .iter()
+        .map(|r| rustblocker::config::RewriteRule {
             domain: r.domain.clone(),
             ipv4: r.ipv4.clone(),
             ipv6: r.ipv6.clone(),
-        };
-        map.rules.insert(normalize_domain(&r.domain), rule);
-    }
-    map
+        })
+        .collect();
+    RewriteMap::load(rules)
 }
 
 fn get_setting_string(pool: &db::DbPool, key: &str) -> String {

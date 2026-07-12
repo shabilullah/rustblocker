@@ -114,16 +114,8 @@ impl RequestHandler for DnsBlockerHandler {
             let rewrite_rdata: Option<RData> = {
                 let rewrites = self.rewrites.read();
                 rewrites.lookup(&domain).and_then(|rule| match query_type {
-                    RecordType::A => rule
-                        .ipv4
-                        .as_ref()
-                        .and_then(|s| s.parse::<Ipv4Addr>().ok())
-                        .map(|ip| RData::A(A::from(ip))),
-                    RecordType::AAAA => rule
-                        .ipv6
-                        .as_ref()
-                        .and_then(|s| s.parse::<Ipv6Addr>().ok())
-                        .map(|ip| RData::AAAA(AAAA::from(ip))),
+                    RecordType::A => rule.ipv4.map(|ip| RData::A(A::from(ip))),
+                    RecordType::AAAA => rule.ipv6.map(|ip| RData::AAAA(AAAA::from(ip))),
                     _ => None,
                 })
             };

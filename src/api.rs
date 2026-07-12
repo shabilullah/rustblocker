@@ -1031,13 +1031,12 @@ async fn add_rewrite(
         body.ipv4.as_deref(),
         body.ipv6.as_deref(),
     );
-    let domain = body.domain.to_lowercase();
     let rule = crate::config::RewriteRule {
-        domain: domain.clone(),
+        domain: body.domain.clone(),
         ipv4: body.ipv4.clone(),
         ipv6: body.ipv6.clone(),
     };
-    rewrites.write().rules.insert(domain, rule);
+    rewrites.write().insert(rule);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
@@ -1056,7 +1055,7 @@ async fn delete_rewrite(
     let domain = all.iter().find(|r| r.id == id).map(|r| r.domain.clone());
     if db::delete_rewrite(&pool, id) {
         if let Some(ref d) = domain {
-            rewrites.write().rules.remove(&d.to_lowercase());
+            rewrites.write().remove(d);
         }
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
     } else {
