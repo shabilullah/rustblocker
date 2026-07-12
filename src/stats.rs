@@ -203,12 +203,12 @@ impl QueryLog {
                         Some(entry) => {
                             batch.push(entry);
                             if batch.len() >= BATCH_SIZE {
-                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
+                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed)).await;
                             }
                         }
                         None => {
                             if !batch.is_empty() {
-                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
+                                Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed)).await;
                             }
                             debug!("QueryLog writer shutting down");
                             return;
@@ -217,7 +217,7 @@ impl QueryLog {
                 }
                 _ = interval.tick() => {
                     if !batch.is_empty() {
-                        Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed));
+                        Self::flush(&pool, &mut batch, retention.load(Ordering::Relaxed)).await;
                     }
                 }
             }
@@ -225,16 +225,27 @@ impl QueryLog {
     }
 
     /// Insert a batch into SQLite and prune old records.
-    fn flush(pool: &DbPool, batch: &mut Vec<QueryEntry>, retention_days: u64) {
+    async fn flush(pool: &DbPool, batch: &mut Vec<QueryEntry>, retention_days: u64) {
         if batch.is_empty() {
             return;
         }
 
+        let pool = pool.clone();
+        let entries = std::mem::take(batch);
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            Self::flush_entries(&pool, entries, retention_days);
+        })
+        .await
+        {
+            warn!("QueryLog flush task failed: {}", e);
+        }
+    }
+
+    fn flush_entries(pool: &DbPool, entries: Vec<QueryEntry>, retention_days: u64) {
         let conn = match pool.get() {
             Ok(c) => c,
             Err(e) => {
                 warn!("Failed to get DB connection for query log: {}", e);
-                batch.clear();
                 return;
             }
         };
@@ -243,12 +254,11 @@ impl QueryLog {
             Ok(t) => t,
             Err(e) => {
                 warn!("Failed to start transaction for query log: {}", e);
-                batch.clear();
                 return;
             }
         };
 
-        for entry in batch.drain(..) {
+        for entry in entries {
             let action_str = entry.action.to_string();
             let query_type_str = entry.query_type.to_string();
             let ip_str = entry.client_ip.to_string();

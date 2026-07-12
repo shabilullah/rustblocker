@@ -112,6 +112,18 @@ async fn resolve_import_content(body: &BulkImport) -> String {
     }
 }
 
+async fn db_blocking<T, F>(f: F) -> Result<T, HttpResponse>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("database task failed: {}", e)
+        }))
+    })
+}
+
 /// Insert a domain into the correct set (exact or wildcard) of a DomainStore.
 fn insert_domain(store: &mut DomainStore, domain: &str) {
     store.insert(domain);
@@ -132,7 +144,11 @@ async fn get_settings(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let settings = db::get_settings(&pool);
+    let pool = pool.get_ref().clone();
+    let settings = match db_blocking(move || db::get_settings(&pool)).await {
+        Ok(settings) => settings,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(settings)
 }
 
@@ -753,8 +769,19 @@ async fn get_blocklist(
     let search = query.search.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
-    let total = db::count_domains(&pool, "blocklist_domains");
-    let domains = db::search_domains(&pool, "blocklist_domains", search, limit, offset);
+    let search = search.to_string();
+    let pool = pool.get_ref().clone();
+    let (total, domains) = match db_blocking(move || {
+        (
+            db::count_domains(&pool, "blocklist_domains"),
+            db::search_domains(&pool, "blocklist_domains", &search, limit, offset),
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "domains": domains,
         "total": total,
@@ -817,8 +844,18 @@ async fn bulk_import_blocklist(
         return HttpResponse::BadRequest()
             .json(serde_json::json!({"error": "no content or url provided"}));
     }
-    let count = db::bulk_import_domains(&pool, "blocklist_domains", &content);
-    reload_domain_store(&pool, "blocklist_domains", &blocklist);
+    let pool_for_import = pool.get_ref().clone();
+    let count = match db_blocking(move || {
+        db::bulk_import_domains(&pool_for_import, "blocklist_domains", &content)
+    })
+    .await
+    {
+        Ok(count) => count,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = reload_domain_store(&pool, "blocklist_domains", &blocklist).await {
+        return resp;
+    }
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }
 
@@ -836,8 +873,19 @@ async fn get_allowlist(
     let search = query.search.as_deref().unwrap_or("");
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
-    let total = db::count_domains(&pool, "allowlist_domains");
-    let domains = db::search_domains(&pool, "allowlist_domains", search, limit, offset);
+    let search = search.to_string();
+    let pool = pool.get_ref().clone();
+    let (total, domains) = match db_blocking(move || {
+        (
+            db::count_domains(&pool, "allowlist_domains"),
+            db::search_domains(&pool, "allowlist_domains", &search, limit, offset),
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(serde_json::json!({
         "domains": domains,
         "total": total,
@@ -900,8 +948,18 @@ async fn bulk_import_allowlist(
         return HttpResponse::BadRequest()
             .json(serde_json::json!({"error": "no content or url provided"}));
     }
-    let count = db::bulk_import_domains(&pool, "allowlist_domains", &content);
-    reload_domain_store(&pool, "allowlist_domains", &allowlist);
+    let pool_for_import = pool.get_ref().clone();
+    let count = match db_blocking(move || {
+        db::bulk_import_domains(&pool_for_import, "allowlist_domains", &content)
+    })
+    .await
+    {
+        Ok(count) => count,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = reload_domain_store(&pool, "allowlist_domains", &allowlist).await {
+        return resp;
+    }
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }
 
@@ -985,7 +1043,11 @@ async fn get_sources(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let sources = db::get_sources(&pool);
+    let pool = pool.get_ref().clone();
+    let sources = match db_blocking(move || db::get_sources(&pool)).await {
+        Ok(sources) => sources,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(sources)
 }
 
@@ -1002,7 +1064,17 @@ async fn add_source(
     }
     let list_type = body.list_type.as_deref().unwrap_or("blocklist");
     let interval = body.update_interval_hours.unwrap_or(24);
-    let id = db::add_source(&pool, &body.url, list_type, interval);
+    let pool_for_add = pool.get_ref().clone();
+    let url_for_add = body.url.clone();
+    let list_type_for_add = list_type.to_string();
+    let id = match db_blocking(move || {
+        db::add_source(&pool_for_add, &url_for_add, &list_type_for_add, interval)
+    })
+    .await
+    {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
 
     let source = db::DbSource {
         id,
@@ -1045,7 +1117,11 @@ async fn refresh_all_sources(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let sources = db::get_sources(&pool);
+    let pool_for_sources = pool.get_ref().clone();
+    let sources = match db_blocking(move || db::get_sources(&pool_for_sources)).await {
+        Ok(sources) => sources,
+        Err(resp) => return resp,
+    };
     let mut results = Vec::new();
     for source in &sources {
         if !source.enabled {
@@ -1069,7 +1145,11 @@ async fn get_stats(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let limit = query.limit.unwrap_or(10);
-    let stats = QueryLog::get_stats(&pool, limit);
+    let pool = pool.get_ref().clone();
+    let stats = match db_blocking(move || QueryLog::get_stats(&pool, limit)).await {
+        Ok(stats) => stats,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(stats)
 }
 
@@ -1084,7 +1164,11 @@ async fn get_queries(
     }
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
-    let queries = QueryLog::get_queries(&pool, limit, offset);
+    let pool = pool.get_ref().clone();
+    let queries = match db_blocking(move || QueryLog::get_queries(&pool, limit, offset)).await {
+        Ok(queries) => queries,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(queries)
 }
 
@@ -1096,7 +1180,10 @@ async fn clear_stats(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    QueryLog::clear(&pool);
+    let pool = pool.get_ref().clone();
+    if let Err(resp) = db_blocking(move || QueryLog::clear(&pool)).await {
+        return resp;
+    }
     HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
 }
 
@@ -1305,14 +1392,20 @@ async fn apply_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Respo
 
 // --- Helper: reload DomainStore from DB, routing wildcards correctly ---
 
-fn reload_domain_store(pool: &DbPool, table: &str, store: &Arc<RwLock<DomainStore>>) {
-    let domains = db::get_domains(pool, table);
+async fn reload_domain_store(
+    pool: &DbPool,
+    table: &'static str,
+    store: &Arc<RwLock<DomainStore>>,
+) -> Result<(), HttpResponse> {
+    let pool = pool.clone();
+    let domains = db_blocking(move || db::get_domains(&pool, table)).await?;
     let mut s = store.write();
     s.exact.clear();
     s.wildcards.clear();
     for d in &domains {
         insert_domain(&mut s, &d.domain);
     }
+    Ok(())
 }
 
 // --- Sync config (slave-side settings stored in DB) ---
@@ -1385,7 +1478,11 @@ async fn sync_manifest(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let hashes = db::sync_manifest(&pool);
+    let pool = pool.get_ref().clone();
+    let hashes = match db_blocking(move || db::sync_manifest(&pool)).await {
+        Ok(hashes) => hashes,
+        Err(resp) => return resp,
+    };
     HttpResponse::Ok().json(serde_json::json!({"hashes": hashes}))
 }
 
@@ -1399,7 +1496,13 @@ async fn sync_snapshot(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let category = path.into_inner();
-    match db::sync_snapshot(&pool, &category) {
+    let pool = pool.get_ref().clone();
+    let category_for_db = category.clone();
+    let snapshot = match db_blocking(move || db::sync_snapshot(&pool, &category_for_db)).await {
+        Ok(snapshot) => snapshot,
+        Err(resp) => return resp,
+    };
+    match snapshot {
         Some(data) => HttpResponse::Ok().json(data),
         None => HttpResponse::NotFound()
             .json(serde_json::json!({"error": format!("unknown category: {}", category)})),

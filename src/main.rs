@@ -506,7 +506,18 @@ async fn run_server(cli: Cli) -> Result<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
-            let stale = db::get_stale_sources(&refresh_pool);
+            let stale = match tokio::task::spawn_blocking({
+                let refresh_pool = refresh_pool.clone();
+                move || db::get_stale_sources(&refresh_pool)
+            })
+            .await
+            {
+                Ok(stale) => stale,
+                Err(e) => {
+                    warn!("Failed to load stale sources: {}", e);
+                    continue;
+                }
+            };
             if stale.is_empty() {
                 continue;
             }

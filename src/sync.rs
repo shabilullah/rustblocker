@@ -155,7 +155,8 @@ async fn run(
                     Some(data) => {
                         apply_snapshot(
                             category, &data, &pool, &blocklist, &allowlist, &rewrites, &forwarder,
-                        );
+                        )
+                        .await;
                         known_hashes.insert(category.clone(), hash.clone());
                         info!("Sync: applied '{}'", category);
                     }
@@ -238,7 +239,39 @@ async fn fetch_snapshot(
         .ok()
 }
 
-fn apply_snapshot(
+async fn apply_snapshot(
+    category: &str,
+    data: &serde_json::Value,
+    pool: &DbPool,
+    blocklist: &BlocklistStore,
+    allowlist: &AllowlistStore,
+    rewrites: &Arc<RwLock<RewriteMap>>,
+    forwarder: &Arc<RwLock<ParallelForwarder>>,
+) {
+    let category = category.to_string();
+    let data = data.clone();
+    let pool = pool.clone();
+    let blocklist = blocklist.clone();
+    let allowlist = allowlist.clone();
+    let rewrites = rewrites.clone();
+    let forwarder = forwarder.clone();
+
+    let category_for_log = category.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || {
+        apply_snapshot_blocking(
+            &category, &data, &pool, &blocklist, &allowlist, &rewrites, &forwarder,
+        );
+    })
+    .await
+    {
+        warn!(
+            "Sync: apply snapshot task failed for '{}': {}",
+            category_for_log, e
+        );
+    }
+}
+
+fn apply_snapshot_blocking(
     category: &str,
     data: &serde_json::Value,
     pool: &DbPool,

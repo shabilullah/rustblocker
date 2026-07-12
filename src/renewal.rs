@@ -87,18 +87,23 @@ async fn check_and_renew_certificates(pool: &DbPool, threshold_days: i64) -> Res
 /// Attempt to renew a certificate for a specific domain.
 async fn renew_certificate_for_domain(pool: &DbPool, domain: &str) -> Result<()> {
     // Get required settings from database
-    let cloudflare_token = db::get_setting(pool, "cloudflare_api_token")
-        .context("Cloudflare API token not configured")?;
-
-    let acme_email = db::get_setting(pool, "acme_email").context("ACME email not configured")?;
-
-    let directory_url = db::get_setting(pool, "acme_directory_url")
-        .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
-
-    // Check if this is a wildcard certificate
-    let wildcard = db::get_setting(pool, "wildcard_cert")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    let (cloudflare_token, acme_email, directory_url, wildcard) = tokio::task::spawn_blocking({
+        let pool = pool.clone();
+        move || {
+            let cloudflare_token = db::get_setting(&pool, "cloudflare_api_token")
+                .context("Cloudflare API token not configured")?;
+            let acme_email =
+                db::get_setting(&pool, "acme_email").context("ACME email not configured")?;
+            let directory_url = db::get_setting(&pool, "acme_directory_url")
+                .unwrap_or_else(|| "https://acme-v02.api.letsencrypt.org/directory".to_string());
+            let wildcard = db::get_setting(&pool, "wildcard_cert")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            Ok::<_, anyhow::Error>((cloudflare_token, acme_email, directory_url, wildcard))
+        }
+    })
+    .await
+    .context("task failed")??;
 
     // Create Cloudflare client
     let cloudflare = Arc::new(CloudflareClient::new(cloudflare_token)?);

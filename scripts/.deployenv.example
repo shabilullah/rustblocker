@@ -12,6 +12,10 @@ WEBUI_PASSWORD=
 # Web UI port (default: 54)
 WEB_PORT=54
 
+# Number of concurrent DB-heavy snapshot requests used by mock-deploy.sh to
+# prove health/DNS responsiveness while SQLite work is active.
+DB_CONCURRENCY_REQUESTS=16
+
 # Cloudflare + HTTPS / ACME integration checks are disabled by default.
 # Set ENABLE_CLOUDFLARE_HTTPS=true only when the values below are configured
 # and the Cloudflare token has the DNS permissions required for ACME.

@@ -50,6 +50,7 @@ REMOTE_INSTALL_DIR="/usr/local/lib/rustblocker"
 WEB_PORT="${WEB_PORT:-54}"
 BASE_URL="http://${SSH_HOST}:${WEB_PORT}"
 ENABLE_CLOUDFLARE_HTTPS="${ENABLE_CLOUDFLARE_HTTPS:-false}"
+DB_CONCURRENCY_REQUESTS="${DB_CONCURRENCY_REQUESTS:-16}"
 
 # SSH setup: prefer sshpass, fall back to SSH_ASKPASS (askpass.sh)
 export SSHPASS="$SSH_PASSWORD"
@@ -80,6 +81,26 @@ remote_dns_a() {
     local quoted_domain
     quoted_domain=$(shell_quote "$domain")
     "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup \"\$domain\" 127.0.0.1 | awk '/^Address: / { print \$2 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
+}
+
+target_dns_a() {
+    local domain="$1"
+    if command -v dig >/dev/null 2>&1; then
+        dig @"$SSH_HOST" +time=2 +tries=1 +short A "$domain"
+    elif command -v drill >/dev/null 2>&1; then
+        drill @"$SSH_HOST" "$domain" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print $NF }'
+    elif command -v nslookup >/dev/null 2>&1; then
+        nslookup "$domain" "$SSH_HOST" | awk '/^Address: / { print $2 }'
+    else
+        remote_dns_a "$domain"
+    fi
+}
+
+now_ms() {
+    date +%s%3N 2>/dev/null || python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
 }
 
 remote_root() {
@@ -204,6 +225,129 @@ if echo "$SETTINGS" | grep -q '"'; then
     ok "$STEP" "settings" "settings endpoint reachable"
 else
     fail "$STEP" "settings" "could not read settings"
+fi
+
+# Step: DB-backed API smoke checks.
+step
+STATS=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/stats")
+if echo "$STATS" | grep -q '"total_queries"'; then
+    ok "$STEP" "db-api" "stats endpoint reachable"
+else
+    fail "$STEP" "db-api" "could not read stats"
+fi
+
+step
+SOURCES=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/sources")
+if echo "$SOURCES" | grep -q '^\['; then
+    ok "$STEP" "db-api" "sources endpoint reachable"
+else
+    fail "$STEP" "db-api" "could not read sources"
+fi
+
+# Step: Prove DB-heavy requests do not block Actix/Tokio progress.
+step
+SNAPSHOT_STARTED_MS=$(now_ms)
+SNAPSHOT_PIDS=()
+SNAPSHOT_OUTS=()
+SNAPSHOT_CODES=()
+PROBE_LOG=$(mktemp)
+PROBE_STOP=$(mktemp)
+rm -f "$PROBE_STOP"
+(
+    while [ ! -f "$PROBE_STOP" ]; do
+        START_MS=$(now_ms)
+        HEALTH_CODE=$(curl -s --connect-timeout 1 --max-time 2 -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null || true)
+        END_MS=$(now_ms)
+        printf '%s %s\n' "$HEALTH_CODE" "$((END_MS - START_MS))" >> "$PROBE_LOG"
+        sleep 0.05
+    done
+) &
+PROBE_PID=$!
+
+for i in $(seq 1 "$DB_CONCURRENCY_REQUESTS"); do
+    SNAPSHOT_OUT=$(mktemp)
+    SNAPSHOT_CODE=$(mktemp)
+    SNAPSHOT_OUTS+=("$SNAPSHOT_OUT")
+    SNAPSHOT_CODES+=("$SNAPSHOT_CODE")
+    ("${CURL[@]}" -b "$COOKIE_JAR" -o "$SNAPSHOT_OUT" -w "%{http_code}" \
+        "$BASE_URL/api/sync/snapshot/blocklist" > "$SNAPSHOT_CODE") &
+    SNAPSHOT_PIDS+=("$!")
+done
+
+CONCURRENCY_OK=true
+DNS_PROBES=0
+PROBE_OVERLAPPED=false
+DNS_PROBE_OUT=$(mktemp)
+target_dns_a "example.com" > "$DNS_PROBE_OUT" 2>/dev/null &
+DNS_PROBE_PID=$!
+
+for i in $(seq 1 20); do
+    SNAPSHOT_RUNNING=false
+    for pid in "${SNAPSHOT_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            SNAPSHOT_RUNNING=true
+            break
+        fi
+    done
+    if [ "$SNAPSHOT_RUNNING" != true ]; then
+        break
+    fi
+    PROBE_OVERLAPPED=true
+    sleep 0.05
+done
+
+for pid in "${SNAPSHOT_PIDS[@]}"; do
+    wait "$pid" || CONCURRENCY_OK=false
+done
+touch "$PROBE_STOP"
+wait "$PROBE_PID" || true
+if wait "$DNS_PROBE_PID"; then
+    DNS_PROBES=1
+else
+    CONCURRENCY_OK=false
+fi
+rm -f "$DNS_PROBE_OUT"
+
+SNAPSHOT_HTTP_OK=true
+SNAPSHOT_BYTES=0
+for idx in "${!SNAPSHOT_OUTS[@]}"; do
+    SNAPSHOT_HTTP_CODE=$(cat "${SNAPSHOT_CODES[$idx]}" 2>/dev/null || true)
+    if [ "$SNAPSHOT_HTTP_CODE" != "200" ]; then
+        SNAPSHOT_HTTP_OK=false
+    fi
+    BYTES=$(wc -c < "${SNAPSHOT_OUTS[$idx]}" 2>/dev/null || echo 0)
+    SNAPSHOT_BYTES=$((SNAPSHOT_BYTES + BYTES))
+    rm -f "${SNAPSHOT_OUTS[$idx]}" "${SNAPSHOT_CODES[$idx]}"
+done
+
+HEALTH_PROBES=0
+MAX_HEALTH_MS=0
+HEALTH_FAILURES=0
+while read -r code latency; do
+    [ -z "${code:-}" ] && continue
+    HEALTH_PROBES=$((HEALTH_PROBES + 1))
+    if [ "${latency:-0}" -gt "$MAX_HEALTH_MS" ]; then
+        MAX_HEALTH_MS="$latency"
+    fi
+    if [ "$code" != "200" ] || [ "${latency:-0}" -gt 2000 ]; then
+        HEALTH_FAILURES=$((HEALTH_FAILURES + 1))
+    fi
+done < "$PROBE_LOG"
+rm -f "$PROBE_LOG" "$PROBE_STOP"
+
+if [ "$HEALTH_FAILURES" -gt 0 ]; then
+    CONCURRENCY_OK=false
+fi
+
+if [ "$SNAPSHOT_HTTP_OK" != true ]; then
+    fail "$STEP" "db-concurrency" "one or more blocklist snapshots returned non-200"
+elif [ "$PROBE_OVERLAPPED" != true ]; then
+    skip "$STEP" "db-concurrency" "blocklist snapshot completed too quickly to prove concurrent responsiveness"
+elif [ "$CONCURRENCY_OK" = true ]; then
+    ELAPSED_MS=$(( $(now_ms) - SNAPSHOT_STARTED_MS ))
+    ok "$STEP" "db-concurrency" "health/DNS responsive during ${DB_CONCURRENCY_REQUESTS} blocklist snapshots (${SNAPSHOT_BYTES} bytes, ${HEALTH_PROBES} health probes, ${DNS_PROBES} DNS probes, max health ${MAX_HEALTH_MS}ms, elapsed ${ELAPSED_MS}ms)"
+else
+    fail "$STEP" "db-concurrency" "health/DNS degraded during ${DB_CONCURRENCY_REQUESTS} blocklist snapshots (${HEALTH_PROBES} health probes, ${DNS_PROBES} DNS probes, max health ${MAX_HEALTH_MS}ms)"
 fi
 
 # Step: Verify wildcard blocklist matching through the deployed DNS handler.

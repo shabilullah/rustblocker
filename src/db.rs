@@ -152,7 +152,11 @@ pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize
     if content.is_empty() {
         return 0;
     }
-    bulk_import_domains(pool, table, &content)
+    let pool = pool.clone();
+    let table = table.to_string();
+    tokio::task::spawn_blocking(move || bulk_import_domains(&pool, &table, &content))
+        .await
+        .unwrap_or(0)
 }
 
 /// Insert domains from content, preserving `*.` prefix for wildcards.
@@ -631,13 +635,42 @@ pub async fn refresh_source(
     let content = fetch_source(&source.url).await;
     if content.is_empty() {
         let status = "failed: empty response".to_string();
-        update_source_status(pool, source.id, &status);
+        let pool = pool.clone();
+        let status_for_db = status.clone();
+        let source_id = source.id;
+        let _ = tokio::task::spawn_blocking(move || {
+            update_source_status(&pool, source_id, &status_for_db);
+        })
+        .await;
         return status;
     }
 
-    let count = bulk_import_domains(pool, table, &content);
-    let status = format!("ok: {} domains", count);
-    update_source_status(pool, source.id, &status);
+    let pool_for_db = pool.clone();
+    let table_for_db = table.to_string();
+    let source_id = source.id;
+    let db_result = tokio::task::spawn_blocking(move || {
+        let count = bulk_import_domains(&pool_for_db, &table_for_db, &content);
+        let status = format!("ok: {} domains", count);
+        update_source_status(&pool_for_db, source_id, &status);
+        let domains = get_domains(&pool_for_db, &table_for_db);
+        (count, status, domains)
+    })
+    .await;
+
+    let (_count, status, domains) = match db_result {
+        Ok(result) => result,
+        Err(e) => {
+            let status = format!("failed: database task failed: {}", e);
+            let pool = pool.clone();
+            let status_for_db = status.clone();
+            let source_id = source.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                update_source_status(&pool, source_id, &status_for_db);
+            })
+            .await;
+            return status;
+        }
+    };
 
     // Reload in-memory store
     let store = match source.list_type.as_str() {
@@ -645,7 +678,6 @@ pub async fn refresh_source(
         _ => blocklist_store,
     };
     if let Some(store) = store {
-        let domains = get_domains(pool, table);
         let mut s = store.write();
         s.exact.clear();
         s.wildcards.clear();
