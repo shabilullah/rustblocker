@@ -8,6 +8,11 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Returns the compiled-in build identifier.
+pub fn build_id() -> &'static str {
+    env!("RUSTBLOCKER_BUILD_ID")
+}
+
 #[derive(Serialize)]
 pub struct UpdateInfo {
     pub version: String,

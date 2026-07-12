@@ -113,7 +113,8 @@
     async function refreshHeaderVersion() {
         try {
             const v = await fetchJson(API + '/version', 'Version API');
-            document.getElementById('version').textContent = 'v' + v.version + ' (' + v.target + ')';
+            const build = v.build && v.build !== 'official' ? ' · ' + v.build : '';
+            document.getElementById('version').textContent = 'v' + v.version + build + ' (' + v.target + ')';
         } catch {}
     }
 

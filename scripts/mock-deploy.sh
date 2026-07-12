@@ -51,6 +51,8 @@ WEB_PORT="${WEB_PORT:-54}"
 BASE_URL="http://${SSH_HOST}:${WEB_PORT}"
 ENABLE_CLOUDFLARE_HTTPS="${ENABLE_CLOUDFLARE_HTTPS:-false}"
 DB_CONCURRENCY_REQUESTS="${DB_CONCURRENCY_REQUESTS:-16}"
+GIT_REV=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "nogit")
+MOCK_BUILD_ID="${MOCK_BUILD_ID:-mock-$(date +%Y%m%d%H%M%S)-${GIT_REV}}"
 
 # SSH setup: prefer sshpass, fall back to SSH_ASKPASS (askpass.sh)
 export SSHPASS="$SSH_PASSWORD"
@@ -128,17 +130,18 @@ BINARY_PATH="target/${DEPLOY_TARGET}/release/${BINARY_NAME}"
 
 # --- Deploy ---
 if [ "$SKIP_BUILD" != true ]; then
-    step; ok "$STEP" "build" "building release binary..."
+    step; ok "$STEP" "build" "building release binary with build id $MOCK_BUILD_ID..."
     if command -v cargo-zigbuild >/dev/null 2>&1; then
         BUILD_CMD=(cargo zigbuild --release --target "$DEPLOY_TARGET")
     else
         BUILD_CMD=(cargo build --release --target "$DEPLOY_TARGET")
     fi
+    export RUSTBLOCKER_BUILD_ID="$MOCK_BUILD_ID"
     if ! "${BUILD_CMD[@]}" 2>&1; then
         fail "$STEP" "build" "cargo build failed"
         exit 1
     fi
-    ok "$STEP" "build" "release binary built for $DEPLOY_TARGET"
+    ok "$STEP" "build" "release binary built for $DEPLOY_TARGET with build id $MOCK_BUILD_ID"
 else
     step; skip "$STEP" "build" "skipped"
 fi
@@ -225,6 +228,17 @@ if echo "$SETTINGS" | grep -q '"'; then
     ok "$STEP" "settings" "settings endpoint reachable"
 else
     fail "$STEP" "settings" "could not read settings"
+fi
+
+step
+VERSION_JSON=$("${CURL[@]}" "$BASE_URL/api/version")
+DEPLOYED_BUILD=$(echo "$VERSION_JSON" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p' | head -1)
+if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ]; then
+    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID"
+elif { [ "$SKIP_BUILD" = true ] || [ "$SKIP_DEPLOY" = true ]; } && [ -n "$DEPLOYED_BUILD" ]; then
+    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD"
+else
+    fail "$STEP" "version" "unexpected deployed build id '${DEPLOYED_BUILD:-missing}' (expected $MOCK_BUILD_ID; response: ${VERSION_JSON:-empty})"
 fi
 
 # Step: DB-backed API smoke checks.

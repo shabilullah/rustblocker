@@ -1344,6 +1344,7 @@ async fn health() -> impl Responder {
 async fn get_version() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({
         "version": update::current_version(),
+        "build": update::build_id(),
         "target": env!("TARGET_TRIPLE"),
     }))
 }
