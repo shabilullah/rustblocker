@@ -87,7 +87,10 @@ fn init_schema(conn: &rusqlite::Connection) {
         );
         CREATE INDEX IF NOT EXISTS idx_query_log_timestamp ON query_log(timestamp);
         CREATE INDEX IF NOT EXISTS idx_query_log_client_ip ON query_log(client_ip);
-        CREATE INDEX IF NOT EXISTS idx_query_log_action ON query_log(action);",
+        CREATE INDEX IF NOT EXISTS idx_query_log_action ON query_log(action);
+        CREATE INDEX IF NOT EXISTS idx_query_log_domain ON query_log(domain);
+        CREATE INDEX IF NOT EXISTS idx_query_log_action_domain ON query_log(action, domain);
+        CREATE INDEX IF NOT EXISTS idx_query_log_resolver ON query_log(resolver);",
     )
     .expect("failed to init schema");
     // Migration: add columns that may be missing in databases created by older versions.

@@ -304,41 +304,19 @@ impl QueryLog {
             }
         };
 
-        let total: u64 = conn
-            .query_row("SELECT COUNT(*) FROM query_log", [], |r| r.get(0))
-            .unwrap_or(0);
-
-        let blocked: u64 = conn
+        let (total, blocked, allowed, rewritten, forwarded): (u64, u64, u64, u64, u64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM query_log WHERE action = 'blocked'",
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN action = 'blocked' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN action = 'allowed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN action = 'rewritten' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN action = 'forwarded' THEN 1 ELSE 0 END), 0)
+                 FROM query_log",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
-            .unwrap_or(0);
-
-        let allowed: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM query_log WHERE action = 'allowed'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        let rewritten: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM query_log WHERE action = 'rewritten'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-
-        let forwarded: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM query_log WHERE action = 'forwarded'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
+            .unwrap_or((0, 0, 0, 0, 0));
 
         let top_clients: Vec<ClientCount> = match conn.prepare(
             "SELECT client_ip, COUNT(*) as cnt FROM query_log GROUP BY client_ip ORDER BY cnt DESC LIMIT ?1",
@@ -461,14 +439,18 @@ impl QueryLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
     fn test_pool() -> DbPool {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_millis();
-        let path = std::env::temp_dir().join(format!("rustblocker-stats-test-{millis}.db"));
+        let id = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("rustblocker-stats-test-{millis}-{id}.db"));
         crate::db::create_pool(path).expect("failed to create test database pool")
     }
 
@@ -499,5 +481,69 @@ mod tests {
         assert_eq!(live.action, "blocked");
 
         writer.abort();
+    }
+
+    #[test]
+    fn stats_summary_counts_actions_in_one_pass() {
+        let pool = test_pool();
+        let conn = pool.get().expect("test db connection");
+        let rows = [
+            ("10.0.0.1", "blocked.example", "blocked", None, None),
+            ("10.0.0.1", "blocked.example", "blocked", None, None),
+            (
+                "10.0.0.2",
+                "forwarded.example",
+                "forwarded",
+                Some("1.1.1.1"),
+                Some(20_u64),
+            ),
+            (
+                "10.0.0.3",
+                "forwarded.example",
+                "forwarded",
+                Some("1.1.1.1"),
+                Some(40_u64),
+            ),
+            ("10.0.0.4", "rewritten.example", "rewritten", None, None),
+        ];
+
+        for (client_ip, domain, action, resolver, latency_us) in rows {
+            conn.execute(
+                "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action, resolver, latency_us)
+                 VALUES (datetime('now'), ?1, ?2, 'A', ?3, ?4, ?5)",
+                rusqlite::params![client_ip, domain, action, resolver, latency_us],
+            )
+            .expect("insert query log row");
+        }
+
+        let stats = QueryLog::get_stats(&pool, 10);
+
+        assert_eq!(stats.total_queries, 5);
+        assert_eq!(stats.blocked, 2);
+        assert_eq!(stats.allowed, 0);
+        assert_eq!(stats.rewritten, 1);
+        assert_eq!(stats.forwarded, 2);
+        assert_eq!(stats.top_blocked_domains[0].domain, "blocked.example");
+        assert_eq!(stats.top_blocked_domains[0].count, 2);
+        assert_eq!(stats.upstream_stats[0].resolver, "1.1.1.1");
+        assert_eq!(stats.upstream_stats[0].avg_latency_us, 30);
+    }
+
+    #[test]
+    fn query_log_stats_indexes_are_created() {
+        let pool = test_pool();
+        let conn = pool.get().expect("test db connection");
+        let mut stmt = conn
+            .prepare("PRAGMA index_list('query_log')")
+            .expect("prepare index list");
+        let indexes: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("read index list")
+            .filter_map(|row| row.ok())
+            .collect();
+
+        assert!(indexes.contains("idx_query_log_domain"));
+        assert!(indexes.contains("idx_query_log_action_domain"));
+        assert!(indexes.contains("idx_query_log_resolver"));
     }
 }

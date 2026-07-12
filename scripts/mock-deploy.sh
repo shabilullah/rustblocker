@@ -51,6 +51,7 @@ WEB_PORT="${WEB_PORT:-54}"
 BASE_URL="http://${SSH_HOST}:${WEB_PORT}"
 ENABLE_CLOUDFLARE_HTTPS="${ENABLE_CLOUDFLARE_HTTPS:-false}"
 DB_CONCURRENCY_REQUESTS="${DB_CONCURRENCY_REQUESTS:-16}"
+STATS_CONCURRENCY_REQUESTS="${STATS_CONCURRENCY_REQUESTS:-8}"
 GIT_REV=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "nogit")
 MOCK_BUILD_ID="${MOCK_BUILD_ID:-mock-$(date +%Y%m%d%H%M%S)-${GIT_REV}}"
 
@@ -256,6 +257,45 @@ if echo "$SOURCES" | grep -q '^\['; then
     ok "$STEP" "db-api" "sources endpoint reachable"
 else
     fail "$STEP" "db-api" "could not read sources"
+fi
+
+# Step: Prove concurrent stats requests return complete summaries.
+step
+STATS_STARTED_MS=$(now_ms)
+STATS_PIDS=()
+STATS_OUTS=()
+STATS_CODES=()
+for i in $(seq 1 "$STATS_CONCURRENCY_REQUESTS"); do
+    STATS_OUT=$(mktemp)
+    STATS_CODE=$(mktemp)
+    STATS_OUTS+=("$STATS_OUT")
+    STATS_CODES+=("$STATS_CODE")
+    ("${CURL[@]}" -b "$COOKIE_JAR" -o "$STATS_OUT" -w "%{http_code}" \
+        "$BASE_URL/api/stats?limit=10" > "$STATS_CODE") &
+    STATS_PIDS+=("$!")
+done
+
+STATS_OK=true
+for pid in "${STATS_PIDS[@]}"; do
+    wait "$pid" || STATS_OK=false
+done
+
+STATS_BYTES=0
+for idx in "${!STATS_OUTS[@]}"; do
+    STATS_HTTP_CODE=$(cat "${STATS_CODES[$idx]}" 2>/dev/null || true)
+    if [ "$STATS_HTTP_CODE" != "200" ] || ! grep -q '"total_queries"' "${STATS_OUTS[$idx]}"; then
+        STATS_OK=false
+    fi
+    BYTES=$(wc -c < "${STATS_OUTS[$idx]}" 2>/dev/null || echo 0)
+    STATS_BYTES=$((STATS_BYTES + BYTES))
+    rm -f "${STATS_OUTS[$idx]}" "${STATS_CODES[$idx]}"
+done
+
+if [ "$STATS_OK" = true ]; then
+    STATS_ELAPSED_MS=$(( $(now_ms) - STATS_STARTED_MS ))
+    ok "$STEP" "stats-concurrency" "${STATS_CONCURRENCY_REQUESTS} stats summaries completed (${STATS_BYTES} bytes, elapsed ${STATS_ELAPSED_MS}ms)"
+else
+    fail "$STEP" "stats-concurrency" "one or more concurrent stats summaries failed"
 fi
 
 # Step: Prove DB-heavy requests do not block Actix/Tokio progress.
