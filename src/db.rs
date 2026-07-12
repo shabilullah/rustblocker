@@ -5,7 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::info;
 
+use crate::lists::DomainStore;
+
 pub type DbPool = Pool<SqliteConnectionManager>;
+
+pub struct DomainImportResult {
+    pub inserted: usize,
+    pub store: DomainStore,
+}
 
 pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, r2d2::Error> {
     let path = db_path.as_ref();
@@ -154,41 +161,58 @@ pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize
     }
     let pool = pool.clone();
     let table = table.to_string();
-    tokio::task::spawn_blocking(move || bulk_import_domains(&pool, &table, &content))
-        .await
-        .unwrap_or(0)
+    tokio::task::spawn_blocking(move || {
+        bulk_import_domains_with_entries(&pool, &table, &content).inserted
+    })
+    .await
+    .unwrap_or(0)
 }
 
-/// Insert domains from content, preserving `*.` prefix for wildcards.
-fn insert_domains_from_content(conn: &rusqlite::Connection, table: &str, content: &str) {
+fn parse_domain_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let domain_part = if line.starts_with("0.0.0.0") || line.starts_with("127.0.0.1") {
+        line.split_whitespace().nth(1).unwrap_or("")
+    } else {
+        line
+    };
+
+    let domain_part = domain_part.trim();
+    if domain_part.is_empty() {
+        return None;
+    }
+
+    let normalized = domain_part.to_lowercase();
+    let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+/// Insert parsed domains, preserving `*.` prefix for wildcards.
+fn insert_domains_from_content(
+    conn: &rusqlite::Connection,
+    table: &str,
+    content: &str,
+) -> DomainStore {
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
+    let mut store = DomainStore::default();
     // Wrap all inserts in a single transaction so a 100k-line source
     // doesn't create 100k individual write transactions.
     let _ = conn.execute("BEGIN", []);
     for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let domain_part = if line.starts_with("0.0.0.0") || line.starts_with("127.0.0.1") {
-            line.split_whitespace().nth(1).unwrap_or("")
-        } else {
-            line
-        };
-
-        let domain_part = domain_part.trim();
-        if domain_part.is_empty() {
-            continue;
-        }
-
-        let normalized = domain_part.to_lowercase();
-        let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
-        if !normalized.is_empty() {
-            conn.execute(&sql, params![normalized]).ok();
+        if let Some(domain) = parse_domain_line(line) {
+            conn.execute(&sql, params![domain]).ok();
+            store.insert(&domain);
         }
     }
     let _ = conn.execute("COMMIT", []);
+    store
 }
 
 // --- Settings ---
@@ -466,19 +490,30 @@ pub fn delete_domain(pool: &DbPool, table: &str, id: i64) -> bool {
 }
 
 pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
+    bulk_import_domains_with_entries(pool, table, content).inserted
+}
+
+pub fn bulk_import_domains_with_entries(
+    pool: &DbPool,
+    table: &str,
+    content: &str,
+) -> DomainImportResult {
     let conn = pool.get().expect("failed to get DB connection");
     let before: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
             row.get(0)
         })
         .unwrap_or(0);
-    insert_domains_from_content(&conn, table, content);
+    let store = insert_domains_from_content(&conn, table, content);
     let after: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
             row.get(0)
         })
         .unwrap_or(0);
-    (after - before) as usize
+    DomainImportResult {
+        inserted: (after - before) as usize,
+        store,
+    }
 }
 
 // --- Rewrites ---
@@ -649,15 +684,14 @@ pub async fn refresh_source(
     let table_for_db = table.to_string();
     let source_id = source.id;
     let db_result = tokio::task::spawn_blocking(move || {
-        let count = bulk_import_domains(&pool_for_db, &table_for_db, &content);
-        let status = format!("ok: {} domains", count);
+        let result = bulk_import_domains_with_entries(&pool_for_db, &table_for_db, &content);
+        let status = format!("ok: {} domains", result.inserted);
         update_source_status(&pool_for_db, source_id, &status);
-        let domains = get_domains(&pool_for_db, &table_for_db);
-        (count, status, domains)
+        (status, result.store)
     })
     .await;
 
-    let (_count, status, domains) = match db_result {
+    let (status, imported_store) = match db_result {
         Ok(result) => result,
         Err(e) => {
             let status = format!("failed: database task failed: {}", e);
@@ -679,15 +713,8 @@ pub async fn refresh_source(
     };
     if let Some(store) = store {
         let mut s = store.write();
-        s.exact.clear();
-        s.wildcards.clear();
-        for d in &domains {
-            if let Some(stripped) = d.domain.strip_prefix("*.") {
-                s.wildcards.insert(stripped.to_lowercase());
-            } else {
-                s.exact.insert(d.domain.to_lowercase());
-            }
-        }
+        s.exact.extend(imported_store.exact);
+        s.wildcards.extend(imported_store.wildcards);
     }
 
     info!("Source refreshed: {} -> {}", source.url, status);

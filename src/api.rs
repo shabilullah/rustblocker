@@ -129,6 +129,11 @@ fn insert_domain(store: &mut DomainStore, domain: &str) {
     store.insert(domain);
 }
 
+fn merge_domain_store(store: &mut DomainStore, imported: DomainStore) {
+    store.exact.extend(imported.exact);
+    store.wildcards.extend(imported.wildcards);
+}
+
 /// Remove a domain from both sets of a DomainStore.
 fn remove_domain(store: &mut DomainStore, domain: &str) {
     store.remove(domain);
@@ -845,16 +850,18 @@ async fn bulk_import_blocklist(
             .json(serde_json::json!({"error": "no content or url provided"}));
     }
     let pool_for_import = pool.get_ref().clone();
-    let count = match db_blocking(move || {
-        db::bulk_import_domains(&pool_for_import, "blocklist_domains", &content)
+    let import_result = match db_blocking(move || {
+        db::bulk_import_domains_with_entries(&pool_for_import, "blocklist_domains", &content)
     })
     .await
     {
-        Ok(count) => count,
+        Ok(result) => result,
         Err(resp) => return resp,
     };
-    if let Err(resp) = reload_domain_store(&pool, "blocklist_domains", &blocklist).await {
-        return resp;
+    let count = import_result.inserted;
+    {
+        let mut store = blocklist.write();
+        merge_domain_store(&mut store, import_result.store);
     }
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }
@@ -949,16 +956,18 @@ async fn bulk_import_allowlist(
             .json(serde_json::json!({"error": "no content or url provided"}));
     }
     let pool_for_import = pool.get_ref().clone();
-    let count = match db_blocking(move || {
-        db::bulk_import_domains(&pool_for_import, "allowlist_domains", &content)
+    let import_result = match db_blocking(move || {
+        db::bulk_import_domains_with_entries(&pool_for_import, "allowlist_domains", &content)
     })
     .await
     {
-        Ok(count) => count,
+        Ok(result) => result,
         Err(resp) => return resp,
     };
-    if let Err(resp) = reload_domain_store(&pool, "allowlist_domains", &allowlist).await {
-        return resp;
+    let count = import_result.inserted;
+    {
+        let mut store = allowlist.write();
+        merge_domain_store(&mut store, import_result.store);
     }
     HttpResponse::Ok().json(serde_json::json!({"imported": count}))
 }
@@ -1388,24 +1397,6 @@ async fn apply_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Respo
             "error": format!("join error: {:#}", e),
         })),
     }
-}
-
-// --- Helper: reload DomainStore from DB, routing wildcards correctly ---
-
-async fn reload_domain_store(
-    pool: &DbPool,
-    table: &'static str,
-    store: &Arc<RwLock<DomainStore>>,
-) -> Result<(), HttpResponse> {
-    let pool = pool.clone();
-    let domains = db_blocking(move || db::get_domains(&pool, table)).await?;
-    let mut s = store.write();
-    s.exact.clear();
-    s.wildcards.clear();
-    for d in &domains {
-        insert_domain(&mut s, &d.domain);
-    }
-    Ok(())
 }
 
 // --- Sync config (slave-side settings stored in DB) ---

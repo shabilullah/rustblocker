@@ -80,7 +80,7 @@ remote_dns_a() {
     local domain="$1"
     local quoted_domain
     quoted_domain=$(shell_quote "$domain")
-    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup \"\$domain\" 127.0.0.1 | awk '/^Address: / { print \$2 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
+    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup \"\$domain\" 127.0.0.1 | awk '/^Name:/ { answer=1 } answer && /^Addresses?:/ { for (i=2; i<=NF; i++) if (\$i ~ /^[0-9.]+\$/) print \$i } answer && /^[[:space:]]+[0-9]+\\./ { print \$1 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
 }
 
 target_dns_a() {
@@ -90,7 +90,7 @@ target_dns_a() {
     elif command -v drill >/dev/null 2>&1; then
         drill @"$SSH_HOST" "$domain" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print $NF }'
     elif command -v nslookup >/dev/null 2>&1; then
-        nslookup "$domain" "$SSH_HOST" | awk '/^Address: / { print $2 }'
+        nslookup "$domain" "$SSH_HOST" | awk '/^Name:/ { answer=1 } answer && /^Addresses?:/ { for (i=2; i<=NF; i++) if ($i ~ /^[0-9.]+$/) print $i } answer && /^[[:space:]]+[0-9]+\./ { print $1 }'
     else
         remote_dns_a "$domain"
     fi
@@ -350,9 +350,57 @@ else
     fail "$STEP" "db-concurrency" "health/DNS degraded during ${DB_CONCURRENCY_REQUESTS} blocklist snapshots (${HEALTH_PROBES} health probes, ${DNS_PROBES} DNS probes, max health ${MAX_HEALTH_MS}ms)"
 fi
 
-# Step: Verify wildcard blocklist matching through the deployed DNS handler.
+# Step: Verify bulk import hot-reloads the in-memory blocklist without restart.
 SINKHOLE_IPV4=$(echo "$SETTINGS" | sed -n 's/.*"sinkhole_ipv4":"\([^"]*\)".*/\1/p' | head -1)
 SINKHOLE_IPV4="${SINKHOLE_IPV4:-0.0.0.0}"
+IMPORT_BASE="mock-import-$(date +%s)-$$.rustblocker.test"
+IMPORT_EXACT="exact.${IMPORT_BASE}"
+IMPORT_WILDCARD_BASE="wild.${IMPORT_BASE}"
+IMPORT_WILDCARD_SUBDOMAIN="sub.${IMPORT_WILDCARD_BASE}"
+IMPORT_RESPONSE_FILE=$(mktemp)
+
+step
+HTTP_CODE=$("${CURL[@]}" -o "$IMPORT_RESPONSE_FILE" -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/blocklist/import" \
+    -H "Content-Type: application/json" \
+    -d "{\"content\":\"0.0.0.0 $IMPORT_EXACT\\n*.$IMPORT_WILDCARD_BASE\\n\"}")
+IMPORT_RESPONSE=$(cat "$IMPORT_RESPONSE_FILE")
+rm -f "$IMPORT_RESPONSE_FILE"
+IMPORTED_COUNT=$(echo "$IMPORT_RESPONSE" | grep -o '"imported":[0-9]*' | head -1 | cut -d: -f2)
+if [ "$HTTP_CODE" = "200" ] && [ "${IMPORTED_COUNT:-0}" -ge 2 ]; then
+    ok "$STEP" "import-hot-reload" "imported temporary blocklist entries for $IMPORT_BASE"
+else
+    fail "$STEP" "import-hot-reload" "bulk import failed for $IMPORT_BASE (HTTP $HTTP_CODE, response: ${IMPORT_RESPONSE:-empty})"
+fi
+
+step
+IMPORT_EXACT_DNS=$(target_dns_a "$IMPORT_EXACT" 2>/dev/null || true)
+IMPORT_WILDCARD_DNS=$(target_dns_a "$IMPORT_WILDCARD_SUBDOMAIN" 2>/dev/null || true)
+if echo "$IMPORT_EXACT_DNS" | grep -Fxq "$SINKHOLE_IPV4" \
+    && echo "$IMPORT_WILDCARD_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+    ok "$STEP" "import-hot-reload" "bulk imported exact and wildcard domains resolved to sinkhole $SINKHOLE_IPV4"
+else
+    fail "$STEP" "import-hot-reload" "bulk imported domains were not sinkholed (exact: ${IMPORT_EXACT_DNS:-empty}; wildcard: ${IMPORT_WILDCARD_DNS:-empty})"
+fi
+
+step
+CLEANUP_JSON=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$IMPORT_BASE&limit=20")
+CLEANUP_IDS=$(echo "$CLEANUP_JSON" | grep -o '"id":[0-9]*' | cut -d: -f2 || true)
+CLEANUP_COUNT=0
+for id in $CLEANUP_IDS; do
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/blocklist/$id")
+    if [ "$HTTP_CODE" = "200" ]; then
+        CLEANUP_COUNT=$((CLEANUP_COUNT + 1))
+    fi
+done
+if [ "$CLEANUP_COUNT" -ge 2 ]; then
+    ok "$STEP" "import-hot-reload" "removed $CLEANUP_COUNT temporary imported entries"
+else
+    fail "$STEP" "import-hot-reload" "cleanup removed $CLEANUP_COUNT temporary imported entries"
+fi
+
+# Step: Verify wildcard blocklist matching through the deployed DNS handler.
 WILDCARD_BASE="mock-wildcard-$(date +%s)-$$.rustblocker.test"
 WILDCARD_ENTRY="*.${WILDCARD_BASE}"
 WILDCARD_SUBDOMAIN="sub.${WILDCARD_BASE}"
