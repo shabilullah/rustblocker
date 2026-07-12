@@ -154,16 +154,18 @@ impl QueryLog {
             QueryAction::Forwarded => self.forwarded.fetch_add(1, Ordering::Relaxed),
         };
 
-        // Broadcast to live SSE subscribers before consuming entry.
-        let live = LiveQuery {
-            client_ip: entry.client_ip.to_string(),
-            domain: entry.domain.clone(),
-            query_type: entry.query_type.to_string(),
-            action: entry.action.to_string(),
-            resolver: entry.resolver.clone(),
-            latency_us: entry.latency_us,
-        };
-        let _ = self.live_tx.send(live);
+        // Avoid per-query string allocation when nobody is watching the live SSE feed.
+        if self.live_tx.receiver_count() > 0 {
+            let live = LiveQuery {
+                client_ip: entry.client_ip.to_string(),
+                domain: entry.domain.clone(),
+                query_type: entry.query_type.to_string(),
+                action: entry.action.to_string(),
+                resolver: entry.resolver.clone(),
+                latency_us: entry.latency_us,
+            };
+            let _ = self.live_tx.send(live);
+        }
 
         if self.tx.try_send(entry).is_err() {
             debug!("QueryLog channel full, dropping entry");
@@ -453,5 +455,49 @@ impl QueryLog {
         };
         let _ = conn.execute("DELETE FROM query_log", []);
         let _ = conn.execute("DELETE FROM sqlite_sequence WHERE name='query_log'", []);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_pool() -> DbPool {
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_millis();
+        let path = std::env::temp_dir().join(format!("rustblocker-stats-test-{millis}.db"));
+        crate::db::create_pool(path).expect("failed to create test database pool")
+    }
+
+    fn query_entry(domain: &str) -> QueryEntry {
+        QueryEntry {
+            client_ip: "127.0.0.1".parse().expect("valid test IP"),
+            domain: domain.to_string(),
+            query_type: RecordType::A,
+            action: QueryAction::Blocked,
+            resolver: None,
+            latency_us: Some(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn record_only_builds_live_events_when_subscribed() {
+        let (log, writer) = QueryLog::new(test_pool(), Arc::new(AtomicU64::new(30)));
+
+        assert_eq!(log.live_tx.receiver_count(), 0);
+        log.record(query_entry("no-subscriber.example"));
+
+        let mut rx = log.subscribe();
+        assert_eq!(log.live_tx.receiver_count(), 1);
+        log.record(query_entry("subscriber.example"));
+
+        let live = rx.recv().await.expect("live query event");
+        assert_eq!(live.domain, "subscriber.example");
+        assert_eq!(live.action, "blocked");
+
+        writer.abort();
     }
 }

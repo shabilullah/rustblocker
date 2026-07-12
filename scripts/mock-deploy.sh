@@ -384,6 +384,21 @@ else
 fi
 
 step
+LIVE_QUERY_OUT=$(mktemp)
+("${CURL[@]}" --no-buffer --max-time 6 -b "$COOKIE_JAR" "$BASE_URL/api/stats/live" > "$LIVE_QUERY_OUT" 2>/dev/null || true) &
+LIVE_QUERY_PID=$!
+sleep 0.5
+target_dns_a "$IMPORT_EXACT" >/dev/null 2>&1 || true
+wait "$LIVE_QUERY_PID" || true
+if grep -q "\"domain\":\"$IMPORT_EXACT\"" "$LIVE_QUERY_OUT"; then
+    ok "$STEP" "query-log-live" "live SSE emitted query event for $IMPORT_EXACT"
+else
+    LIVE_QUERY_SAMPLE=$(head -c 200 "$LIVE_QUERY_OUT" 2>/dev/null || true)
+    fail "$STEP" "query-log-live" "live SSE did not emit query event for $IMPORT_EXACT; output: ${LIVE_QUERY_SAMPLE:-empty}"
+fi
+rm -f "$LIVE_QUERY_OUT"
+
+step
 CLEANUP_JSON=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$IMPORT_BASE&limit=20")
 CLEANUP_IDS=$(echo "$CLEANUP_JSON" | grep -o '"id":[0-9]*' | cut -d: -f2 || true)
 CLEANUP_COUNT=0
