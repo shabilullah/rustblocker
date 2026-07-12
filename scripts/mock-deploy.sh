@@ -106,6 +106,11 @@ print(int(time.time() * 1000))
 PY
 }
 
+json_number() {
+    local key="$1"
+    sed -n "s/.*\"$key\":\([0-9][0-9]*\).*/\1/p" | head -1
+}
+
 remote_root() {
     local command="$1"
     local quoted_command quoted_password
@@ -356,6 +361,54 @@ if [ -n "${ALLOWLIST_ID:-}" ]; then
     fi
 else
     skip "$STEP" "allowlist-delete" "delete skipped because temporary entry was not created"
+fi
+
+# Step: Verify allowlisted DNS hits are persisted as allowed actions.
+ALLOWLIST_STATS_DOMAIN="mock-allow-stats-$(date +%s)-$$.example.com"
+ALLOWLIST_STATS_ID=""
+ALLOWLIST_STATS_RESPONSE_FILE=$(mktemp)
+
+step
+STATS_BEFORE_ALLOW=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/stats")
+ALLOWED_BEFORE=$(printf '%s\n' "$STATS_BEFORE_ALLOW" | json_number "allowed")
+HTTP_CODE=$("${CURL[@]}" -o "$ALLOWLIST_STATS_RESPONSE_FILE" -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/allowlist" \
+    -H "Content-Type: application/json" \
+    -d "{\"domain\":\"$ALLOWLIST_STATS_DOMAIN\"}")
+ALLOWLIST_STATS_RESPONSE=$(cat "$ALLOWLIST_STATS_RESPONSE_FILE")
+rm -f "$ALLOWLIST_STATS_RESPONSE_FILE"
+ALLOWLIST_STATS_ID=$(echo "$ALLOWLIST_STATS_RESPONSE" | grep -o '"id":[0-9]*' | head -1 | cut -d: -f2)
+if [ "$HTTP_CODE" = "201" ] && [ -n "$ALLOWLIST_STATS_ID" ] && [ -n "$ALLOWED_BEFORE" ]; then
+    ok "$STEP" "allowlist-stats" "added temporary allowlist entry $ALLOWLIST_STATS_DOMAIN (id=$ALLOWLIST_STATS_ID, allowed before=$ALLOWED_BEFORE)"
+else
+    fail "$STEP" "allowlist-stats" "failed to prepare allowlist stats check (HTTP $HTTP_CODE, allowed before=${ALLOWED_BEFORE:-missing}, response: ${ALLOWLIST_STATS_RESPONSE:-empty})"
+fi
+
+step
+if [ -n "${ALLOWLIST_STATS_ID:-}" ] && [ -n "${ALLOWED_BEFORE:-}" ]; then
+    target_dns_a "$ALLOWLIST_STATS_DOMAIN" >/dev/null 2>&1 || true
+    ALLOWLIST_STATS_OK=false
+    for _ in $(seq 1 8); do
+        sleep 1
+        STATS_AFTER_ALLOW=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/stats")
+        ALLOWED_AFTER=$(printf '%s\n' "$STATS_AFTER_ALLOW" | json_number "allowed")
+        QUERY_LOG_AFTER=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/stats/queries?limit=20")
+        if [ -n "$ALLOWED_AFTER" ] \
+            && [ "$ALLOWED_AFTER" -gt "$ALLOWED_BEFORE" ] \
+            && printf '%s\n' "$QUERY_LOG_AFTER" | tr '{' '\n' | grep -F "\"domain\":\"$ALLOWLIST_STATS_DOMAIN\"" | grep -Fq '"action":"allowed"'; then
+            ALLOWLIST_STATS_OK=true
+            break
+        fi
+    done
+    if [ "$ALLOWLIST_STATS_OK" = true ]; then
+        ok "$STEP" "allowlist-stats" "DNS allowlist hit persisted as allowed (allowed ${ALLOWED_BEFORE}->${ALLOWED_AFTER})"
+    else
+        fail "$STEP" "allowlist-stats" "allowlist DNS hit was not persisted as allowed (allowed before=${ALLOWED_BEFORE:-missing}, after=${ALLOWED_AFTER:-missing}, queries: ${QUERY_LOG_AFTER:-empty})"
+    fi
+    "${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X DELETE "$BASE_URL/api/allowlist/$ALLOWLIST_STATS_ID" >/dev/null || true
+else
+    skip "$STEP" "allowlist-stats" "stats check skipped because temporary entry was not created"
 fi
 
 # Step: Prove DB-heavy requests do not block Actix/Tokio progress.

@@ -145,11 +145,11 @@ impl RequestHandler for DnsBlockerHandler {
             }
 
             // 2. Check allowlist, then blocklist
-            let action: Option<RData> = {
+            let (allowlisted, block_response): (bool, Option<RData>) = {
                 let allowlist = self.allowlist.read();
                 if allowlist.matches(&domain) {
                     debug!("Allowed: {}", domain);
-                    None
+                    (true, None)
                 } else {
                     let blocklist = self.blocklist.read();
                     if blocklist.matches(&domain) {
@@ -164,14 +164,14 @@ impl RequestHandler for DnsBlockerHandler {
                         });
                         let sink_v4 = *self.sinkhole_ipv4.read();
                         let sink_v6 = *self.sinkhole_ipv6.read();
-                        Some(build_rdata(query_type, sink_v4, sink_v6))
+                        (false, Some(build_rdata(query_type, sink_v4, sink_v6)))
                     } else {
-                        None
+                        (false, None)
                     }
                 }
             };
 
-            if let Some(rdata) = action {
+            if let Some(rdata) = block_response {
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.response_code = ResponseCode::NoError;
@@ -197,7 +197,11 @@ impl RequestHandler for DnsBlockerHandler {
                 client_ip: src_ip,
                 domain,
                 query_type,
-                action: QueryAction::Forwarded,
+                action: if allowlisted {
+                    QueryAction::Allowed
+                } else {
+                    QueryAction::Forwarded
+                },
                 resolver: Some(result.resolver),
                 latency_us: Some(result.latency_us),
             });

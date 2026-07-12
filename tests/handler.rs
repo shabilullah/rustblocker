@@ -85,20 +85,25 @@ async fn blocklist_wildcard_does_not_match_bare_domain() {
 
 #[tokio::test]
 async fn allowlist_bypasses_blocklist() {
-    let (handler, _) = make_handler(&["ads.example.com"], &["ads.example.com"], &[]);
-    // Domain in both lists: allowlist wins → forwarded (dead upstream → SERVFAIL),
-    // NOT sinkholed (answers != 1).
+    let (handler, query_log) = make_handler(&["ads.example.com"], &["ads.example.com"], &[]);
+    // Domain in both lists: allowlist wins and forwards to upstream (dead
+    // upstream -> SERVFAIL), but stats record the runtime action as allowed.
     let (rcode, answers, _) = query(&handler, "ads.example.com", RecordType::A).await;
     assert_ne!(
         (rcode, answers),
         (ResponseCode::NoError, 1),
         "allowlisted domain must not be sinkholed"
     );
+    assert_eq!(
+        query_log.counters(),
+        (1, 0, 1, 0, 0),
+        "allowlist hit must be counted as allowed, not forwarded"
+    );
 }
 
 #[tokio::test]
 async fn allowlist_wildcard_bypasses_blocklist_wildcard() {
-    let (handler, _) = make_handler(&["*.shopee.com"], &["*.shopee.com"], &[]);
+    let (handler, query_log) = make_handler(&["*.shopee.com"], &["*.shopee.com"], &[]);
     for sub in ["phys.shopee.com", "id.shopee.com", "api.id.shopee.com"] {
         let (rcode, answers, _) = query(&handler, sub, RecordType::A).await;
         assert_ne!(
@@ -107,6 +112,11 @@ async fn allowlist_wildcard_bypasses_blocklist_wildcard() {
             "{sub}: allowlist wildcard must bypass blocklist wildcard"
         );
     }
+    assert_eq!(
+        query_log.counters(),
+        (3, 0, 3, 0, 0),
+        "allowlist wildcard hits must be counted as allowed, not forwarded"
+    );
 }
 
 // --- Rewrite ---
@@ -149,12 +159,18 @@ async fn rewrite_takes_precedence_over_blocklist() {
 #[tokio::test]
 async fn allowlist_wins_over_blocklist_for_same_domain() {
     // Same exact domain in both: allowlist short-circuits before blocklist.
-    let (handler, _) = make_handler(&["tracker.example.com"], &["tracker.example.com"], &[]);
+    let (handler, query_log) =
+        make_handler(&["tracker.example.com"], &["tracker.example.com"], &[]);
     let (rcode, answers, _) = query(&handler, "tracker.example.com", RecordType::A).await;
-    // Allowlist → forwarded → dead upstream → SERVFAIL (not sinkhole).
+    // Allowlist -> forwarded to dead upstream -> SERVFAIL (not sinkhole).
     assert_ne!(
         (rcode, answers),
         (ResponseCode::NoError, 1),
         "allowlist must win over blocklist"
+    );
+    assert_eq!(
+        query_log.counters(),
+        (1, 0, 1, 0, 0),
+        "allowlist precedence must record an allowed action"
     );
 }
