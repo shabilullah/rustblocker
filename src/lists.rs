@@ -223,7 +223,11 @@ impl RewriteMap {
 /// Normalize a domain: lowercase, strip trailing dot.
 pub fn normalize_domain(domain: &str) -> String {
     let d = domain.to_lowercase();
-    d.strip_suffix('.').unwrap_or(&d).to_string()
+    if d.ends_with('.') {
+        d[..d.len() - 1].to_owned()
+    } else {
+        d
+    }
 }
 
 #[cfg(test)]

@@ -129,7 +129,7 @@ impl RequestHandler for DnsBlockerHandler {
                     resolver: None,
                     latency_us: None,
                 });
-                info!("Rewrite: {} -> {}", domain, rdata);
+                debug!("Rewrite: {} -> {}", domain, rdata);
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let mut metadata = Metadata::response_from_request(&request.metadata);
                 metadata.response_code = ResponseCode::NoError;

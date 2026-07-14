@@ -141,7 +141,9 @@ fn main() -> Result<()> {
 
     info!("Starting RustBlocker");
 
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     runtime.block_on(run_server(cli))
 }
 
