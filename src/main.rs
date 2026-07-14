@@ -315,7 +315,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         .await
         .with_context(|| format!("Failed to bind TCP listener on {}", listen_addr))?;
     info!("DNS listening on TCP {}", listen_addr);
-    server.register_listener(tcp_listener, Duration::from_secs(5), 1024);
+    server.register_listener(tcp_listener, Duration::from_secs(5), 8192);
 
     let web_addr: SocketAddr = format!("{}:{}", listen_address, web_port).parse()?;
 
