@@ -64,6 +64,29 @@ MEMORY_RSS_GROWTH_MAX_KB="${MEMORY_RSS_GROWTH_MAX_KB:-65536}"
 PROCESS_FD_MAX="${PROCESS_FD_MAX:-1024}"
 PROCESS_THREADS_MAX="${PROCESS_THREADS_MAX:-128}"
 REMOTE_DB_PATH="${REMOTE_DB_PATH:-/var/lib/rustblocker/rustblocker.db}"
+MOCK_DOMAINSTORE_BASELINE="${MOCK_DOMAINSTORE_BASELINE:-true}"
+DOMAINSTORE_BASELINE_DOMAINS="${DOMAINSTORE_BASELINE_DOMAINS:-10000}"
+DOMAINSTORE_BASELINE_BATCH="${DOMAINSTORE_BASELINE_BATCH:-1000}"
+DOMAINSTORE_BASELINE_FILE="${DOMAINSTORE_BASELINE_FILE:-target/mock-domainstore-memory-baseline.json}"
+DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN_MAX="${DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN_MAX:-0}"
+DOMAINSTORE_BASELINE_RSS_GROWTH_MAX_KB="${DOMAINSTORE_BASELINE_RSS_GROWTH_MAX_KB:-0}"
+DOMAINSTORE_BASELINE_DNS_SAMPLES="${DOMAINSTORE_BASELINE_DNS_SAMPLES:-24}"
+DOMAINSTORE_BASELINE_DNS_MAX_FAILURES="${DOMAINSTORE_BASELINE_DNS_MAX_FAILURES:-0}"
+DOMAINSTORE_BASELINE_SETTLE_SECS="${DOMAINSTORE_BASELINE_SETTLE_SECS:-2}"
+DOMAINSTORE_BASELINE_CLEANUP_METHOD="unknown"
+DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN=0
+DOMAINSTORE_BASELINE_RSS_BEFORE_KB=0
+DOMAINSTORE_BASELINE_RSS_AFTER_KB=0
+DOMAINSTORE_BASELINE_RSS_GROWTH_KB=0
+DOMAINSTORE_BASELINE_STATUS="not_started"
+DOMAINSTORE_BASELINE_IMPORTED=0
+DOMAINSTORE_BASELINE_DNS_FAILURES=0
+DOMAINSTORE_BASELINE_DNS_P95_MS=0
+DOMAINSTORE_BASELINE_DNS_MAX_MS=0
+DOMAINSTORE_BASELINE_DNS_AVG_MS=0
+DOMAINSTORE_BASELINE_DNS_SAMPLES_RUN=0
+DOMAINSTORE_BASELINE_NOTE=""
+
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
 STRESS_INSTALL_SQLITE3="${STRESS_INSTALL_SQLITE3:-true}"
 STRESS_BLOCKLIST_TIERS="${STRESS_BLOCKLIST_TIERS:-auto}"
@@ -444,6 +467,60 @@ write_stress_baseline() {
 }
 EOF
 }
+
+write_domainstore_baseline() {
+    local dir note_escaped
+    dir=$(dirname "$DOMAINSTORE_BASELINE_FILE")
+    mkdir -p "$dir"
+    note_escaped=$(printf '%s' "$DOMAINSTORE_BASELINE_NOTE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "$DOMAINSTORE_BASELINE_FILE" <<EOF
+{
+  "status": "$DOMAINSTORE_BASELINE_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "domains": $DOMAINSTORE_BASELINE_DOMAINS,
+  "imported": $DOMAINSTORE_BASELINE_IMPORTED,
+  "rss_before_kb": $DOMAINSTORE_BASELINE_RSS_BEFORE_KB,
+  "rss_after_kb": $DOMAINSTORE_BASELINE_RSS_AFTER_KB,
+  "rss_growth_kb": $DOMAINSTORE_BASELINE_RSS_GROWTH_KB,
+  "bytes_per_domain": $DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN,
+  "dns_samples": $DOMAINSTORE_BASELINE_DNS_SAMPLES_RUN,
+  "dns_failures": $DOMAINSTORE_BASELINE_DNS_FAILURES,
+  "dns_p95_ms": $DOMAINSTORE_BASELINE_DNS_P95_MS,
+  "dns_max_ms": $DOMAINSTORE_BASELINE_DNS_MAX_MS,
+  "dns_avg_ms": $DOMAINSTORE_BASELINE_DNS_AVG_MS,
+  "cleanup_method": "$DOMAINSTORE_BASELINE_CLEANUP_METHOD",
+  "note": "$note_escaped",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+domainstore_select_cleanup_method() {
+    # Prefer sqlite for large imports; fall back to API only when domain count fits the API cleanup cap.
+    # Intentionally does NOT use stress_max_tier / STRESS_RESOLVED_TIERS (those stay "auto" until the stress block).
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1; then
+        DOMAINSTORE_BASELINE_CLEANUP_METHOD="sqlite"
+        return 0
+    fi
+    if enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1; then
+        DOMAINSTORE_BASELINE_CLEANUP_METHOD="sqlite"
+        return 0
+    fi
+    if [ "$DOMAINSTORE_BASELINE_DOMAINS" -le "$STRESS_API_CLEANUP_MAX_DOMAINS" ]; then
+        DOMAINSTORE_BASELINE_CLEANUP_METHOD="api"
+        return 0
+    fi
+    DOMAINSTORE_BASELINE_CLEANUP_METHOD="unknown"
+    return 1
+}
+
+domainstore_baseline_cleanup() {
+    local prefix="$1"
+    STRESS_CLEANUP_METHOD="$DOMAINSTORE_BASELINE_CLEANUP_METHOD"
+    stress_cleanup_blocklist "$prefix"
+}
+
 
 REMOTE_ARCH=$("${SSH[@]}" "$REMOTE" "uname -m" 2>/dev/null || true)
 case "$REMOTE_ARCH" in
@@ -1276,6 +1353,131 @@ fi
 
 step
 check_resource_snapshot "resource-final" "$RESOURCE_BASE_RSS_KB"
+
+# DomainStore memory baseline: import a fixed domain count, measure RSS growth
+# attributable to the in-memory DomainStore representation, verify DNS matching,
+# then clean up. Writes target/mock-domainstore-memory-baseline.json for comparisons.
+if enabled "$MOCK_DOMAINSTORE_BASELINE"; then
+    DOMAINSTORE_BASE="${RUN_TAG}-domainstore-baseline.rustblocker.test"
+    DOMAINSTORE_BASELINE_STATUS="running"
+    DOMAINSTORE_BASELINE_NOTE="post-fix packed-arena DomainStore"
+
+    step
+    if domainstore_select_cleanup_method; then
+        ok "$STEP" "domainstore-baseline-prereq" "cleanup method=$DOMAINSTORE_BASELINE_CLEANUP_METHOD domains=$DOMAINSTORE_BASELINE_DOMAINS"
+    else
+        DOMAINSTORE_BASELINE_STATUS="cleanup_unavailable"
+        fail "$STEP" "domainstore-baseline-prereq" "no safe cleanup method: install sqlite3 on target or keep DOMAINSTORE_BASELINE_DOMAINS <= STRESS_API_CLEANUP_MAX_DOMAINS ($STRESS_API_CLEANUP_MAX_DOMAINS)"
+    fi
+    step
+    if [ "$DOMAINSTORE_BASELINE_STATUS" = "running" ] && remote_resource_snapshot; then
+        DOMAINSTORE_BASELINE_RSS_BEFORE_KB="$RESOURCE_RSS_KB"
+        ok "$STEP" "domainstore-baseline-before" "rss=${DOMAINSTORE_BASELINE_RSS_BEFORE_KB}KB base=$DOMAINSTORE_BASE"
+    elif [ "$DOMAINSTORE_BASELINE_STATUS" = "running" ]; then
+        DOMAINSTORE_BASELINE_STATUS="resource_failed"
+        fail "$STEP" "domainstore-baseline-before" "could not read process resources before import"
+    else
+        skip "$STEP" "domainstore-baseline-before" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$DOMAINSTORE_BASELINE_STATUS" = "running" ]; then
+        DOMAINSTORE_IMPORT_OK=true
+        DOMAINSTORE_IMPORTED_TOTAL=0
+        DOMAINSTORE_IMPORT_STARTED_MS=$(now_ms)
+        while [ "$DOMAINSTORE_IMPORTED_TOTAL" -lt "$DOMAINSTORE_BASELINE_DOMAINS" ]; do
+            remaining=$((DOMAINSTORE_BASELINE_DOMAINS - DOMAINSTORE_IMPORTED_TOTAL))
+            batch="$DOMAINSTORE_BASELINE_BATCH"
+            [ "$batch" -gt "$remaining" ] && batch="$remaining"
+            if stress_import_blocklist_batch "$DOMAINSTORE_BASE" $((DOMAINSTORE_IMPORTED_TOTAL + 1)) "$batch"; then
+                DOMAINSTORE_IMPORTED_TOTAL=$((DOMAINSTORE_IMPORTED_TOTAL + STRESS_IMPORTED_BATCH))
+            else
+                DOMAINSTORE_IMPORT_OK=false
+                break
+            fi
+        done
+        DOMAINSTORE_IMPORT_MS=$(( $(now_ms) - DOMAINSTORE_IMPORT_STARTED_MS ))
+        DOMAINSTORE_BASELINE_IMPORTED="$DOMAINSTORE_IMPORTED_TOTAL"
+
+        if [ "$DOMAINSTORE_IMPORT_OK" = true ] && stress_ensure_blocklist_size "$DOMAINSTORE_BASE" "$DOMAINSTORE_BASELINE_DOMAINS"; then
+            ok "$STEP" "domainstore-baseline-import" "imported ${DOMAINSTORE_BASELINE_IMPORTED} domains in ${DOMAINSTORE_IMPORT_MS}ms"
+        else
+            DOMAINSTORE_BASELINE_STATUS="import_failed"
+            fail "$STEP" "domainstore-baseline-import" "import incomplete after ${DOMAINSTORE_IMPORT_MS}ms (imported=${DOMAINSTORE_BASELINE_IMPORTED}/${DOMAINSTORE_BASELINE_DOMAINS}, error=${STRESS_IMPORT_ERROR:-none})"
+        fi
+    else
+        skip "$STEP" "domainstore-baseline-import" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$DOMAINSTORE_BASELINE_STATUS" = "running" ]; then
+        sleep "$DOMAINSTORE_BASELINE_SETTLE_SECS"
+        stress_measure_dns_latency "$DOMAINSTORE_BASE" "$DOMAINSTORE_BASELINE_DOMAINS" "$DOMAINSTORE_BASELINE_DNS_SAMPLES"
+        DOMAINSTORE_BASELINE_DNS_SAMPLES_RUN="$STRESS_DNS_SAMPLE_COUNT"
+        DOMAINSTORE_BASELINE_DNS_FAILURES="$STRESS_DNS_FAILURES"
+        DOMAINSTORE_BASELINE_DNS_P95_MS="$STRESS_DNS_P95_MS"
+        DOMAINSTORE_BASELINE_DNS_MAX_MS="$STRESS_DNS_MAX_OBSERVED_MS"
+        DOMAINSTORE_BASELINE_DNS_AVG_MS="$STRESS_DNS_AVG_MS"
+
+        if ! remote_resource_snapshot; then
+            DOMAINSTORE_BASELINE_STATUS="resource_failed"
+            fail "$STEP" "domainstore-baseline-after" "could not read process resources after import"
+        else
+            DOMAINSTORE_BASELINE_RSS_AFTER_KB="$RESOURCE_RSS_KB"
+            DOMAINSTORE_BASELINE_RSS_GROWTH_KB=$((DOMAINSTORE_BASELINE_RSS_AFTER_KB - DOMAINSTORE_BASELINE_RSS_BEFORE_KB))
+            [ "$DOMAINSTORE_BASELINE_RSS_GROWTH_KB" -lt 0 ] && DOMAINSTORE_BASELINE_RSS_GROWTH_KB=0
+            if [ "$DOMAINSTORE_BASELINE_IMPORTED" -gt 0 ]; then
+                DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN=$(( DOMAINSTORE_BASELINE_RSS_GROWTH_KB * 1024 / DOMAINSTORE_BASELINE_IMPORTED ))
+            else
+                DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN=0
+            fi
+
+            if [ "$DOMAINSTORE_BASELINE_DNS_FAILURES" -gt "$DOMAINSTORE_BASELINE_DNS_MAX_FAILURES" ]; then
+                DOMAINSTORE_BASELINE_STATUS="dns_failed"
+                fail "$STEP" "domainstore-baseline-after" "dns failures=${DOMAINSTORE_BASELINE_DNS_FAILURES} p95=${DOMAINSTORE_BASELINE_DNS_P95_MS}ms (sample=${STRESS_DNS_FAILURE_SAMPLE:-none})"
+            elif [ "$DOMAINSTORE_BASELINE_RSS_GROWTH_MAX_KB" -gt 0 ] && [ "$DOMAINSTORE_BASELINE_RSS_GROWTH_KB" -gt "$DOMAINSTORE_BASELINE_RSS_GROWTH_MAX_KB" ]; then
+                DOMAINSTORE_BASELINE_STATUS="rss_exceeded"
+                fail "$STEP" "domainstore-baseline-after" "rss growth ${DOMAINSTORE_BASELINE_RSS_GROWTH_KB}KB exceeded max ${DOMAINSTORE_BASELINE_RSS_GROWTH_MAX_KB}KB (before=${DOMAINSTORE_BASELINE_RSS_BEFORE_KB}KB after=${DOMAINSTORE_BASELINE_RSS_AFTER_KB}KB)"
+            elif [ "$DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN_MAX" -gt 0 ] && [ "$DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN" -gt "$DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN_MAX" ]; then
+                DOMAINSTORE_BASELINE_STATUS="bytes_per_domain_exceeded"
+                fail "$STEP" "domainstore-baseline-after" "bytes/domain ${DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN} exceeded max ${DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN_MAX} (growth=${DOMAINSTORE_BASELINE_RSS_GROWTH_KB}KB)"
+            else
+                DOMAINSTORE_BASELINE_STATUS="passed"
+                ok "$STEP" "domainstore-baseline-after" "rss_before=${DOMAINSTORE_BASELINE_RSS_BEFORE_KB}KB rss_after=${DOMAINSTORE_BASELINE_RSS_AFTER_KB}KB growth=${DOMAINSTORE_BASELINE_RSS_GROWTH_KB}KB bytes/domain=${DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN} dns_p95=${DOMAINSTORE_BASELINE_DNS_P95_MS}ms failures=${DOMAINSTORE_BASELINE_DNS_FAILURES}"
+            fi
+        fi
+    else
+        skip "$STEP" "domainstore-baseline-after" "skipped because import did not complete"
+    fi
+
+    step
+    if [ "$DOMAINSTORE_BASELINE_IMPORTED" -gt 0 ]; then
+        if domainstore_baseline_cleanup "$DOMAINSTORE_BASE"; then
+            DOMAINSTORE_LEFTOVER=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$DOMAINSTORE_BASE&limit=1")
+            if printf '%s\n' "$DOMAINSTORE_LEFTOVER" | grep -q '"domains":\[\]'; then
+                ok "$STEP" "domainstore-baseline-cleanup" "removed baseline prefix and restarted service"
+            else
+                fail "$STEP" "domainstore-baseline-cleanup" "cleanup left residual entries (search=${DOMAINSTORE_LEFTOVER:-empty})"
+            fi
+        else
+            fail "$STEP" "domainstore-baseline-cleanup" "failed to clean baseline prefix $DOMAINSTORE_BASE"
+        fi
+    else
+        skip "$STEP" "domainstore-baseline-cleanup" "no baseline entries were imported"
+    fi
+
+    step
+    write_domainstore_baseline
+    if [ "$DOMAINSTORE_BASELINE_STATUS" = "passed" ]; then
+        ok "$STEP" "domainstore-baseline-report" "wrote $DOMAINSTORE_BASELINE_FILE (domains=$DOMAINSTORE_BASELINE_IMPORTED growth=${DOMAINSTORE_BASELINE_RSS_GROWTH_KB}KB bytes/domain=${DOMAINSTORE_BASELINE_BYTES_PER_DOMAIN})"
+    else
+        ok "$STEP" "domainstore-baseline-report" "wrote $DOMAINSTORE_BASELINE_FILE with status=$DOMAINSTORE_BASELINE_STATUS"
+    fi
+else
+    step
+    skip "$STEP" "domainstore-baseline" "disabled; set MOCK_DOMAINSTORE_BASELINE=true to measure DomainStore RSS"
+fi
+
 
 # Optional blocklist capacity stress. This intentionally grows the deployed
 # blocklist until DNS latency/resource thresholds reject a tier, then records

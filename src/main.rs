@@ -256,8 +256,8 @@ async fn run_server(cli: Cli) -> Result<()> {
 
     info!(
         "Loaded from DB: {} blocked, {} allowed, {} rewrites",
-        blocklist.read().exact.len() + blocklist.read().wildcards.len(),
-        allowlist.read().exact.len() + allowlist.read().wildcards.len(),
+        blocklist.read().len(),
+        allowlist.read().len(),
         rewrites.read().rules.len(),
     );
 

@@ -779,8 +779,7 @@ pub async fn refresh_source(
     };
     if let Some(store) = store {
         let mut s = store.write();
-        s.exact.extend(imported_store.exact);
-        s.wildcards.extend(imported_store.wildcards);
+        s.merge(imported_store);
     }
 
     info!("Source refreshed: {} -> {}", source.url, status);

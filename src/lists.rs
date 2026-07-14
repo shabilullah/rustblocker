@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::sync::Arc;
@@ -7,11 +8,21 @@ use anyhow::{Context, Result};
 use parking_lot::RwLock;
 use tracing::info;
 
-/// Store for domain block/allow lists with exact and wildcard matching.
-#[derive(Debug, Default)]
+/// Compact domain store: one packed byte arena + hash indexes.
+///
+/// Domains are stored length-prefixed in `arena` instead of as individual
+/// `String` allocations. Indexes map a stable string hash to one or more
+/// arena offsets (rare collisions are disambiguated by byte equality).
+#[derive(Debug, Default, Clone)]
 pub struct DomainStore {
-    pub exact: HashSet<String>,
-    pub wildcards: HashSet<String>, // stored as "example.com" from "*.example.com"
+    /// Packed entries: `[u16 LE length][domain bytes]...`
+    arena: Vec<u8>,
+    /// hash(domain) -> arena offsets of exact-match domains
+    exact: HashMap<u64, Vec<u32>>,
+    /// hash(suffix) -> arena offsets of wildcard suffixes (`*.example.com` stores `example.com`)
+    wildcards: HashMap<u64, Vec<u32>>,
+    exact_count: usize,
+    wildcard_count: usize,
 }
 
 /// Newtype wrapper so actix can distinguish blocklist from allowlist in app data.
@@ -34,6 +45,12 @@ impl std::ops::Deref for AllowlistStore {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+fn domain_hash(domain: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    domain.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl DomainStore {
@@ -95,48 +112,103 @@ impl DomainStore {
                 continue;
             }
 
-            if let Some(domain) = domain_part.strip_prefix("*.") {
-                // Wildcard: "*.example.com" -> store "example.com"
-                let normalized = normalize_domain(domain);
-                if !normalized.is_empty() {
-                    self.wildcards.insert(normalized);
-                    count += 1;
-                }
-            } else {
-                let normalized = normalize_domain(domain_part);
-                if !normalized.is_empty() {
-                    self.exact.insert(normalized);
-                    count += 1;
-                }
+            if self.insert(domain_part) {
+                count += 1;
             }
         }
         info!("Parsed {} entries from {}", count, source);
         count
     }
 
+    /// Number of exact-match domains.
+    pub fn exact_len(&self) -> usize {
+        self.exact_count
+    }
+
+    /// Number of wildcard suffixes.
+    pub fn wildcard_len(&self) -> usize {
+        self.wildcard_count
+    }
+
+    /// Total exact + wildcard entries.
+    pub fn len(&self) -> usize {
+        self.exact_count + self.wildcard_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drop all entries and reclaim the arena.
+    pub fn clear(&mut self) {
+        self.arena.clear();
+        self.exact.clear();
+        self.wildcards.clear();
+        self.exact_count = 0;
+        self.wildcard_count = 0;
+    }
+
+    /// Merge another store into this one (used by bulk import / source refresh).
+    pub fn merge(&mut self, other: DomainStore) {
+        // Prefer borrowing other's arena rather than cloning domain strings.
+        for offsets in other.exact.values() {
+            for &offset in offsets {
+                let domain = other.domain_at(offset);
+                self.insert_normalized(domain, false);
+            }
+        }
+        for offsets in other.wildcards.values() {
+            for &offset in offsets {
+                let domain = other.domain_at(offset);
+                self.insert_normalized(domain, true);
+            }
+        }
+    }
+
     /// Insert a domain into the store, normalizing it first
     /// (lowercase, strip trailing dot).
-    pub fn insert(&mut self, domain: &str) {
+    ///
+    /// Returns `true` if the domain was newly inserted.
+    pub fn insert(&mut self, domain: &str) -> bool {
         let normalized = normalize_domain(domain);
+        if normalized.is_empty() {
+            return false;
+        }
         if let Some(stripped) = normalized.strip_prefix("*.") {
-            self.wildcards.insert(stripped.to_string());
+            if stripped.is_empty() {
+                return false;
+            }
+            self.insert_normalized(stripped, true)
         } else {
-            self.exact.insert(normalized);
+            self.insert_normalized(&normalized, false)
         }
     }
 
     /// Remove a domain from the store, normalizing it first.
+    ///
+    /// Arena bytes for removed domains are intentionally not reclaimed; removes
+    /// are rare relative to inserts and full rebuilds clear the arena.
     pub fn remove(&mut self, domain: &str) {
         let normalized = normalize_domain(domain);
         if let Some(stripped) = normalized.strip_prefix("*.") {
-            self.wildcards.remove(stripped);
+            remove_from_index(
+                &self.arena,
+                &mut self.wildcards,
+                &mut self.wildcard_count,
+                stripped,
+            );
         }
-        self.exact.remove(&normalized);
+        remove_from_index(
+            &self.arena,
+            &mut self.exact,
+            &mut self.exact_count,
+            &normalized,
+        );
     }
 
     /// Check if a normalized domain matches this store.
     pub fn matches(&self, domain: &str) -> bool {
-        if self.exact.contains(domain) {
+        if contains_in(&self.arena, &self.exact, domain, domain_hash(domain)) {
             return true;
         }
 
@@ -144,8 +216,11 @@ impl DomainStore {
         // Walk parent suffixes from the queried domain so lookup cost scales
         // with label depth instead of the number of wildcard entries.
         for (idx, byte) in domain.bytes().enumerate() {
-            if byte == b'.' && self.wildcards.contains(&domain[idx + 1..]) {
-                return true;
+            if byte == b'.' {
+                let suffix = &domain[idx + 1..];
+                if contains_in(&self.arena, &self.wildcards, suffix, domain_hash(suffix)) {
+                    return true;
+                }
             }
         }
         false
@@ -154,9 +229,16 @@ impl DomainStore {
     /// Compile all entries (exact + wildcards) into a single deduplicated file.
     /// Output format: one domain per line, wildcards prefixed with `*.`.
     pub fn compile_to_file(&self, output_path: &str) -> Result<usize> {
-        let mut entries: Vec<String> = self.exact.iter().cloned().collect();
-        for w in &self.wildcards {
-            entries.push(format!("*.{}", w));
+        let mut entries: Vec<String> = Vec::with_capacity(self.len());
+        for offsets in self.exact.values() {
+            for &offset in offsets {
+                entries.push(self.domain_at(offset).to_owned());
+            }
+        }
+        for offsets in self.wildcards.values() {
+            for &offset in offsets {
+                entries.push(format!("*.{}", self.domain_at(offset)));
+            }
         }
         entries.sort();
         let count = entries.len();
@@ -166,6 +248,92 @@ impl DomainStore {
         info!("Compiled {} entries to {}", count, output_path);
         Ok(count)
     }
+
+    fn insert_normalized(&mut self, domain: &str, wildcard: bool) -> bool {
+        if domain.is_empty() {
+            return false;
+        }
+        if domain.len() > u16::MAX as usize {
+            // Domains this long are not valid DNS labels in practice; skip to
+            // keep the arena length prefix compact.
+            return false;
+        }
+
+        let hash = domain_hash(domain);
+        let exists = if wildcard {
+            contains_in(&self.arena, &self.wildcards, domain, hash)
+        } else {
+            contains_in(&self.arena, &self.exact, domain, hash)
+        };
+        if exists {
+            return false;
+        }
+
+        let offset = self.push_domain(domain);
+        if wildcard {
+            self.wildcards.entry(hash).or_default().push(offset);
+            self.wildcard_count += 1;
+        } else {
+            self.exact.entry(hash).or_default().push(offset);
+            self.exact_count += 1;
+        }
+        true
+    }
+
+    fn push_domain(&mut self, domain: &str) -> u32 {
+        let offset = self.arena.len() as u32;
+        let len = domain.len() as u16;
+        self.arena.extend_from_slice(&len.to_le_bytes());
+        self.arena.extend_from_slice(domain.as_bytes());
+        offset
+    }
+
+    fn domain_at(&self, offset: u32) -> &str {
+        domain_at(&self.arena, offset)
+    }
+}
+
+fn contains_in(arena: &[u8], index: &HashMap<u64, Vec<u32>>, domain: &str, hash: u64) -> bool {
+    let Some(offsets) = index.get(&hash) else {
+        return false;
+    };
+    offsets
+        .iter()
+        .any(|&offset| domain_eq(arena, offset, domain))
+}
+
+fn remove_from_index(
+    arena: &[u8],
+    index: &mut HashMap<u64, Vec<u32>>,
+    count: &mut usize,
+    domain: &str,
+) {
+    let hash = domain_hash(domain);
+    let Some(offsets) = index.get_mut(&hash) else {
+        return;
+    };
+    let before = offsets.len();
+    offsets.retain(|&offset| !domain_eq(arena, offset, domain));
+    let removed = before - offsets.len();
+    if removed > 0 {
+        *count = count.saturating_sub(removed);
+    }
+    if offsets.is_empty() {
+        index.remove(&hash);
+    }
+}
+
+fn domain_at(arena: &[u8], offset: u32) -> &str {
+    let i = offset as usize;
+    debug_assert!(i + 2 <= arena.len());
+    let len = u16::from_le_bytes([arena[i], arena[i + 1]]) as usize;
+    debug_assert!(i + 2 + len <= arena.len());
+    // Domains are inserted from &str / normalize_domain, so bytes are valid UTF-8.
+    unsafe { std::str::from_utf8_unchecked(&arena[i + 2..i + 2 + len]) }
+}
+
+fn domain_eq(arena: &[u8], offset: u32, domain: &str) -> bool {
+    domain_at(arena, offset) == domain
 }
 
 /// Map of domain -> rewrite rules for custom DNS responses.
@@ -244,26 +412,30 @@ mod tests {
     #[test]
     fn test_exact_match() {
         let mut store = DomainStore::default();
-        store.exact.insert("example.com".to_string());
+        assert!(store.insert("example.com"));
         assert!(store.matches("example.com"));
         assert!(!store.matches("sub.example.com"));
         assert!(!store.matches("other.com"));
+        assert_eq!(store.exact_len(), 1);
+        assert_eq!(store.wildcard_len(), 0);
     }
 
     #[test]
     fn test_wildcard_match() {
         let mut store = DomainStore::default();
-        store.wildcards.insert("example.com".to_string());
+        assert!(store.insert("*.example.com"));
         assert!(store.matches("sub.example.com"));
         assert!(store.matches("sub.sub.example.com"));
         // Wildcard does NOT match the bare domain itself
         assert!(!store.matches("example.com"));
+        assert_eq!(store.exact_len(), 0);
+        assert_eq!(store.wildcard_len(), 1);
     }
 
     #[test]
     fn test_wildcard_does_not_match_partial() {
         let mut store = DomainStore::default();
-        store.wildcards.insert("example.com".to_string());
+        assert!(store.insert("*.example.com"));
         // Should NOT match "notexample.com" (missing the dot separator)
         assert!(!store.matches("notexample.com"));
     }
@@ -272,9 +444,9 @@ mod tests {
     fn test_wildcard_match_uses_parent_suffixes() {
         let mut store = DomainStore::default();
         for i in 0..1000 {
-            store.wildcards.insert(format!("irrelevant-{i}.test"));
+            store.insert(&format!("*.irrelevant-{i}.test"));
         }
-        store.wildcards.insert("example.com".to_string());
+        store.insert("*.example.com");
 
         assert!(store.matches("sub.sub.example.com"));
         assert!(!store.matches("example.com"));
@@ -313,6 +485,62 @@ plain.example.com
         let count = store.parse_lines(content, "test");
         assert_eq!(count, 1);
         assert!(store.matches("blocked.com"));
+    }
+
+    #[test]
+    fn test_insert_is_idempotent() {
+        let mut store = DomainStore::default();
+        assert!(store.insert("Example.COM."));
+        assert!(!store.insert("example.com"));
+        assert_eq!(store.exact_len(), 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_exact_and_wildcard() {
+        let mut store = DomainStore::default();
+        store.insert("ads.example.com");
+        store.insert("*.tracker.example.com");
+        assert!(store.matches("ads.example.com"));
+        assert!(store.matches("x.tracker.example.com"));
+
+        store.remove("ads.example.com");
+        store.remove("*.tracker.example.com");
+        assert!(!store.matches("ads.example.com"));
+        assert!(!store.matches("x.tracker.example.com"));
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_merge_combines_exact_and_wildcard() {
+        let mut a = DomainStore::default();
+        a.insert("a.example.com");
+        a.insert("*.wild-a.example.com");
+
+        let mut b = DomainStore::default();
+        b.insert("b.example.com");
+        b.insert("*.wild-b.example.com");
+        // Duplicate should not inflate counts.
+        b.insert("a.example.com");
+
+        a.merge(b);
+        assert!(a.matches("a.example.com"));
+        assert!(a.matches("b.example.com"));
+        assert!(a.matches("x.wild-a.example.com"));
+        assert!(a.matches("x.wild-b.example.com"));
+        assert_eq!(a.exact_len(), 2);
+        assert_eq!(a.wildcard_len(), 2);
+    }
+
+    #[test]
+    fn test_clear_resets_store() {
+        let mut store = DomainStore::default();
+        store.insert("example.com");
+        store.insert("*.ads.example.com");
+        store.clear();
+        assert!(store.is_empty());
+        assert!(!store.matches("example.com"));
+        assert!(!store.matches("x.ads.example.com"));
     }
 
     #[test]

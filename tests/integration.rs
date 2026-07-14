@@ -25,7 +25,7 @@ fn make_request(name: &str) -> Request {
 fn make_domain_store(domains: &[&str]) -> DomainStore {
     let mut store = DomainStore::default();
     for d in domains {
-        store.exact.insert(d.to_string());
+        store.insert(d);
     }
     store
 }

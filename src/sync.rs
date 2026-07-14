@@ -573,8 +573,7 @@ fn apply_domains_inner(
 
     // Reload in-memory store only after the transaction committed.
     let mut s = store.write();
-    s.exact.clear();
-    s.wildcards.clear();
+    s.clear();
     for domain in &domains {
         s.insert(domain);
     }

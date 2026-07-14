@@ -130,8 +130,7 @@ fn insert_domain(store: &mut DomainStore, domain: &str) {
 }
 
 fn merge_domain_store(store: &mut DomainStore, imported: DomainStore) {
-    store.exact.extend(imported.exact);
-    store.wildcards.extend(imported.wildcards);
+    store.merge(imported);
 }
 
 /// Remove a domain from both sets of a DomainStore.
