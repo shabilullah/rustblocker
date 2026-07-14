@@ -165,6 +165,12 @@ impl DomainStore {
         }
     }
 
+    /// Replace the entire store with another store's contents.
+    /// Reclaims arena memory from removed domains.
+    pub fn replace_with(&mut self, other: DomainStore) {
+        *self = other;
+    }
+
     /// Insert a domain into the store, normalizing it first
     /// (lowercase, strip trailing dot).
     ///

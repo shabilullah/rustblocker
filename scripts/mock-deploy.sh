@@ -87,6 +87,27 @@ DOMAINSTORE_BASELINE_DNS_AVG_MS=0
 DOMAINSTORE_BASELINE_DNS_SAMPLES_RUN=0
 DOMAINSTORE_BASELINE_NOTE=""
 
+MOCK_STICKY_BASELINE="${MOCK_STICKY_BASELINE:-true}"
+STICKY_BASELINE_DOMAINS="${STICKY_BASELINE_DOMAINS:-5000}"
+STICKY_BASELINE_KEEP="${STICKY_BASELINE_KEEP:-2500}"
+STICKY_BASELINE_FILE="${STICKY_BASELINE_FILE:-target/mock-sticky-domain-baseline.json}"
+STICKY_BASELINE_SETTLE_SECS="${STICKY_BASELINE_SETTLE_SECS:-2}"
+STICKY_BASELINE_STATUS="not_started"
+STICKY_BASELINE_NOTE=""
+STICKY_BASELINE_SOURCE_ID=""
+STICKY_BASELINE_RSS_BEFORE_KB=0
+STICKY_BASELINE_RSS_FULL_KB=0
+STICKY_BASELINE_RSS_SHRINK_KB=0
+STICKY_BASELINE_RSS_RECLAIM_KB=0
+STICKY_BASELINE_STICKY_DNS=0
+STICKY_BASELINE_KEEP_DNS_OK=0
+STICKY_BASELINE_FULL_DNS_OK=0
+STICKY_BASELINE_REMOVED_DOMAIN=""
+STICKY_BASELINE_KEEP_DOMAIN=""
+STICKY_FULL_COUNT=0
+STICKY_SHRINK_COUNT=0
+
+
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
 STRESS_INSTALL_SQLITE3="${STRESS_INSTALL_SQLITE3:-true}"
 STRESS_BLOCKLIST_TIERS="${STRESS_BLOCKLIST_TIERS:-auto}"
@@ -520,6 +541,75 @@ domainstore_baseline_cleanup() {
     STRESS_CLEANUP_METHOD="$DOMAINSTORE_BASELINE_CLEANUP_METHOD"
     stress_cleanup_blocklist "$prefix"
 }
+
+write_sticky_baseline() {
+    local dir note_escaped
+    dir=$(dirname "$STICKY_BASELINE_FILE")
+    mkdir -p "$dir"
+    note_escaped=$(printf '%s' "$STICKY_BASELINE_NOTE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "$STICKY_BASELINE_FILE" <<EOF
+{
+  "status": "$STICKY_BASELINE_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "domains_full": $STICKY_BASELINE_DOMAINS,
+  "domains_keep": $STICKY_BASELINE_KEEP,
+  "rss_before_kb": $STICKY_BASELINE_RSS_BEFORE_KB,
+  "rss_full_kb": $STICKY_BASELINE_RSS_FULL_KB,
+  "rss_shrink_kb": $STICKY_BASELINE_RSS_SHRINK_KB,
+  "rss_reclaim_kb": $STICKY_BASELINE_RSS_RECLAIM_KB,
+  "sticky_dns": $STICKY_BASELINE_STICKY_DNS,
+  "full_dns_ok": $STICKY_BASELINE_FULL_DNS_OK,
+  "keep_dns_ok": $STICKY_BASELINE_KEEP_DNS_OK,
+  "removed_domain": "$STICKY_BASELINE_REMOVED_DOMAIN",
+  "keep_domain": "$STICKY_BASELINE_KEEP_DOMAIN",
+  "note": "$note_escaped",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+sticky_write_remote_list() {
+    local remote_path="$1"
+    local start="$2"
+    local end="$3"
+    local prefix="$4"
+    local quoted_path quoted_prefix
+    quoted_path=$(shell_quote "$remote_path")
+    quoted_prefix=$(shell_quote "$prefix")
+    # shell loop is slower than python but avoids quoting traps over SSH.
+    remote_root "i=$start; end=$end; path=$quoted_path; prefix=$quoted_prefix; : > \"\$path\"; while [ \"\$i\" -le \"\$end\" ]; do printf '0.0.0.0 sticky-%s.%s\\n' \"\$i\" \"\$prefix\" >> \"\$path\"; i=\$((i + 1)); done; wc -l < \"\$path\""
+}
+
+sticky_relogin() {
+    # Cold restarts clear in-memory session validity for some deploy modes; always re-auth.
+    rm -f "$COOKIE_JAR"
+    COOKIE_JAR=$(mktemp)
+    HTTP_CODE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" \
+        -X POST "$BASE_URL/api/auth/login" \
+        -H "Content-Type: application/json" \
+        -d "{\"password\":\"$WEBUI_PASSWORD\"}")
+    [ "$HTTP_CODE" = "200" ]
+}
+
+sticky_cleanup() {
+    local prefix="$1"
+    local source_id="$2"
+    if [ -n "$source_id" ]; then
+        "${CURL[@]}" -o /dev/null -b "$COOKIE_JAR" -X DELETE "$BASE_URL/api/sources/$source_id" || true
+    fi
+    STRESS_CLEANUP_METHOD="sqlite"
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1 \
+        || (enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1); then
+        stress_cleanup_blocklist "$prefix" || true
+    else
+        api_cleanup_blocklist_prefix "$prefix" 250 40 || true
+        restart_remote_service || true
+        wait_for_health 15 2 || true
+    fi
+    remote_root "rm -f /tmp/${prefix}-full.list /tmp/${prefix}-shrink.list" || true
+}
+
 
 
 REMOTE_ARCH=$("${SSH[@]}" "$REMOTE" "uname -m" 2>/dev/null || true)
@@ -1477,6 +1567,188 @@ else
     step
     skip "$STEP" "domainstore-baseline" "disabled; set MOCK_DOMAINSTORE_BASELINE=true to measure DomainStore RSS"
 fi
+
+# Sticky-domain baseline (issue 1b): source refresh that shrinks a list must drop
+# removed domains from DNS matching and reclaim RAM. sticky_dns=1 means the bug.
+if enabled "$MOCK_STICKY_BASELINE"; then
+    STICKY_PREFIX="${RUN_TAG}-sticky.rustblocker.test"
+    STICKY_FULL_PATH="/tmp/${STICKY_PREFIX}-full.list"
+    STICKY_SHRINK_PATH="/tmp/${STICKY_PREFIX}-shrink.list"
+    STICKY_BASELINE_STATUS="running"
+    STICKY_BASELINE_NOTE="post-fix sticky source refresh (provenance rebuild)"
+    STICKY_BASELINE_REMOVED_DOMAIN="sticky-${STICKY_BASELINE_DOMAINS}.${STICKY_PREFIX}"
+    STICKY_BASELINE_KEEP_DOMAIN="sticky-1.${STICKY_PREFIX}"
+
+    if [ "$STICKY_BASELINE_KEEP" -ge "$STICKY_BASELINE_DOMAINS" ]; then
+        step
+        fail "$STEP" "sticky-baseline-prereq" "STICKY_BASELINE_KEEP ($STICKY_BASELINE_KEEP) must be < STICKY_BASELINE_DOMAINS ($STICKY_BASELINE_DOMAINS)"
+        STICKY_BASELINE_STATUS="invalid_config"
+    fi
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ] && sticky_write_remote_list "$STICKY_FULL_PATH" 1 "$STICKY_BASELINE_DOMAINS" "$STICKY_PREFIX" >/dev/null; then
+        sticky_write_remote_list "$STICKY_SHRINK_PATH" 1 "$STICKY_BASELINE_KEEP" "$STICKY_PREFIX" >/dev/null || true
+        ok "$STEP" "sticky-baseline-files" "wrote remote lists full=$STICKY_BASELINE_DOMAINS keep=$STICKY_BASELINE_KEEP"
+    elif [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        STICKY_BASELINE_STATUS="file_failed"
+        fail "$STEP" "sticky-baseline-files" "failed to write remote source list files"
+    else
+        skip "$STEP" "sticky-baseline-files" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ] && remote_resource_snapshot; then
+        STICKY_BASELINE_RSS_BEFORE_KB="$RESOURCE_RSS_KB"
+        ok "$STEP" "sticky-baseline-before" "rss=${STICKY_BASELINE_RSS_BEFORE_KB}KB"
+    elif [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        STICKY_BASELINE_STATUS="resource_failed"
+        fail "$STEP" "sticky-baseline-before" "could not read process resources before source import"
+    else
+        skip "$STEP" "sticky-baseline-before" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        STICKY_ADD_RESP=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+            -X POST "$BASE_URL/api/sources" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\":\"$STICKY_FULL_PATH\",\"list_type\":\"blocklist\",\"update_interval_hours\":24}")
+        STICKY_ADD_HTTP=$(printf '%s\n' "$STICKY_ADD_RESP" | tail -1)
+        STICKY_ADD_BODY=$(printf '%s\n' "$STICKY_ADD_RESP" | sed '$d')
+        STICKY_BASELINE_SOURCE_ID=$(printf '%s\n' "$STICKY_ADD_BODY" | json_number "id")
+        STICKY_ADD_STATUS=$(printf '%s\n' "$STICKY_ADD_BODY" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -1)
+        if [ "$STICKY_ADD_HTTP" = "201" ] && [ -n "$STICKY_BASELINE_SOURCE_ID" ]; then
+            ok "$STEP" "sticky-baseline-import" "source id=$STICKY_BASELINE_SOURCE_ID status=${STICKY_ADD_STATUS:-unknown}"
+        else
+            STICKY_BASELINE_STATUS="import_failed"
+            fail "$STEP" "sticky-baseline-import" "add source failed HTTP=$STICKY_ADD_HTTP body=${STICKY_ADD_BODY:-empty}"
+        fi
+    else
+        skip "$STEP" "sticky-baseline-import" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        sleep "$STICKY_BASELINE_SETTLE_SECS"
+        STICKY_FULL_DNS=$(target_dns_a "$STICKY_BASELINE_REMOVED_DOMAIN" 2>/dev/null || true)
+        STICKY_KEEP_DNS=$(target_dns_a "$STICKY_BASELINE_KEEP_DOMAIN" 2>/dev/null || true)
+        if echo "$STICKY_FULL_DNS" | grep -Fxq "$SINKHOLE_IPV4" \
+            && echo "$STICKY_KEEP_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+            STICKY_BASELINE_FULL_DNS_OK=1
+            if remote_resource_snapshot; then STICKY_BASELINE_RSS_FULL_KB="$RESOURCE_RSS_KB"; fi
+            STICKY_FULL_TOTAL=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$STICKY_PREFIX&limit=1")
+            STICKY_FULL_COUNT=$(printf '%s\n' "$STICKY_FULL_TOTAL" | json_number "total")
+            ok "$STEP" "sticky-baseline-full-dns" "full list sinkholed count=${STICKY_FULL_COUNT:-?} keep=$STICKY_BASELINE_KEEP_DOMAIN removed=$STICKY_BASELINE_REMOVED_DOMAIN"
+        else
+            STICKY_BASELINE_STATUS="dns_failed"
+            fail "$STEP" "sticky-baseline-full-dns" "expected sinkhole $SINKHOLE_IPV4; keep=${STICKY_KEEP_DNS:-empty} removed=${STICKY_FULL_DNS:-empty}"
+        fi
+    else
+        skip "$STEP" "sticky-baseline-full-dns" "skipped because import did not complete"
+    fi
+
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        remote_root "cp -f $(shell_quote "$STICKY_SHRINK_PATH") $(shell_quote "$STICKY_FULL_PATH")" >/dev/null
+        STICKY_SHRINK_LINES=$(remote_root "wc -l < $(shell_quote "$STICKY_FULL_PATH")" 2>/dev/null | tr -d '[:space:]')
+        STICKY_REFRESH=$(curl -s --connect-timeout 5 --max-time 120 -w "\n%{http_code}" -b "$COOKIE_JAR" -X POST "$BASE_URL/api/sources/$STICKY_BASELINE_SOURCE_ID/refresh")
+        STICKY_REFRESH_HTTP=$(printf '%s\n' "$STICKY_REFRESH" | tail -1)
+        STICKY_REFRESH_BODY=$(printf '%s\n' "$STICKY_REFRESH" | sed '$d')
+        STICKY_REFRESH_STATUS=$(printf '%s\n' "$STICKY_REFRESH_BODY" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p' | head -1)
+        if [ "$STICKY_REFRESH_HTTP" = "200" ] && printf '%s' "$STICKY_REFRESH_BODY" | grep -q "ok: $STICKY_BASELINE_KEEP domains"; then
+            ok "$STEP" "sticky-baseline-shrink-refresh" "refreshed sources after shrink (lines=${STICKY_SHRINK_LINES:-?}, status=${STICKY_REFRESH_STATUS:-unknown})"
+        else
+            STICKY_BASELINE_STATUS="refresh_failed"
+            fail "$STEP" "sticky-baseline-shrink-refresh" "refresh failed HTTP=$STICKY_REFRESH_HTTP lines=${STICKY_SHRINK_LINES:-?} body=${STICKY_REFRESH_BODY:-empty}"
+        fi
+    else
+        skip "$STEP" "sticky-baseline-shrink-refresh" "skipped because full import did not complete"
+    fi
+
+    step
+    if [ "$STICKY_BASELINE_STATUS" = "running" ]; then
+        STICKY_BASELINE_KEEP_DNS_OK=0
+        STICKY_BASELINE_STICKY_DNS=0
+        STICKY_REMOVED_DNS=""
+        STICKY_KEEP_DNS2=""
+        for _try in 1 2 3 4 5; do
+            sleep "$STICKY_BASELINE_SETTLE_SECS"
+            STICKY_REMOVED_DNS=$(target_dns_a "$STICKY_BASELINE_REMOVED_DOMAIN" 2>/dev/null || true)
+            STICKY_KEEP_DNS2=$(target_dns_a "$STICKY_BASELINE_KEEP_DOMAIN" 2>/dev/null || true)
+            if echo "$STICKY_KEEP_DNS2" | grep -Fxq "$SINKHOLE_IPV4"; then
+                STICKY_BASELINE_KEEP_DNS_OK=1
+            fi
+            if echo "$STICKY_REMOVED_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+                STICKY_BASELINE_STICKY_DNS=1
+            else
+                STICKY_BASELINE_STICKY_DNS=0
+            fi
+            # Success path for post-fix: keep sinkholed, removed not sinkholed.
+            if [ "$STICKY_BASELINE_KEEP_DNS_OK" -eq 1 ] && [ "$STICKY_BASELINE_STICKY_DNS" -eq 0 ]; then
+                break
+            fi
+            # Pre-fix sticky path: both sinkholed — no need to retry forever.
+            if [ "$STICKY_BASELINE_KEEP_DNS_OK" -eq 1 ] && [ "$STICKY_BASELINE_STICKY_DNS" -eq 1 ]; then
+                break
+            fi
+        done
+        STICKY_SEARCH=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$STICKY_BASELINE_KEEP_DOMAIN&limit=5")
+        STICKY_SEARCH_TOTAL=$(printf '%s\n' "$STICKY_SEARCH" | json_number "total")
+
+        # Hot RSS after shrink (same mode as rss_full) so reclaim is comparable.
+        if remote_resource_snapshot; then
+            STICKY_BASELINE_RSS_SHRINK_KB="$RESOURCE_RSS_KB"
+            STICKY_BASELINE_RSS_RECLAIM_KB=$((STICKY_BASELINE_RSS_FULL_KB - STICKY_BASELINE_RSS_SHRINK_KB))
+            [ "$STICKY_BASELINE_RSS_RECLAIM_KB" -lt 0 ] && STICKY_BASELINE_RSS_RECLAIM_KB=0
+        fi
+
+        if [ "$STICKY_BASELINE_KEEP_DNS_OK" -ne 1 ]; then
+            STICKY_BASELINE_STATUS="dns_failed"
+            fail "$STEP" "sticky-baseline-after-shrink" "kept domain no longer sinkholed (got=${STICKY_KEEP_DNS2:-empty}, search_total=${STICKY_SEARCH_TOTAL:-?}, refresh=${STICKY_REFRESH_STATUS:-?})"
+        elif [ "$STICKY_BASELINE_STICKY_DNS" -ne 0 ]; then
+            STICKY_BASELINE_STATUS="sticky_dns"
+            fail "$STEP" "sticky-baseline-after-shrink" "removed domain still sinkholed (sticky_dns=1, removed_dns=${STICKY_REMOVED_DNS:-empty})"
+        else
+            # Optional cold persistence check (DNS only; RSS stays hot/hot).
+            if restart_remote_service && wait_for_health 15 2 && sticky_relogin; then
+                STICKY_REMOVED_COLD=$(target_dns_a "$STICKY_BASELINE_REMOVED_DOMAIN" 2>/dev/null || true)
+                STICKY_KEEP_COLD=$(target_dns_a "$STICKY_BASELINE_KEEP_DOMAIN" 2>/dev/null || true)
+                if ! echo "$STICKY_KEEP_COLD" | grep -Fxq "$SINKHOLE_IPV4"; then
+                    STICKY_BASELINE_STATUS="dns_failed"
+                    fail "$STEP" "sticky-baseline-after-shrink" "cold restart lost keep domain (got=${STICKY_KEEP_COLD:-empty})"
+                elif echo "$STICKY_REMOVED_COLD" | grep -Fxq "$SINKHOLE_IPV4"; then
+                    STICKY_BASELINE_STATUS="sticky_dns"
+                    fail "$STEP" "sticky-baseline-after-shrink" "cold restart still sinkholes removed domain"
+                else
+                    STICKY_BASELINE_STATUS="passed"
+                    STICKY_SHRINK_TOTAL=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$STICKY_PREFIX&limit=1")
+                    STICKY_SHRINK_COUNT=$(printf '%s\n' "$STICKY_SHRINK_TOTAL" | json_number "total")
+                    ok "$STEP" "sticky-baseline-after-shrink" "sticky_dns=0 keep_ok=1 cold_ok=1 count_full=${STICKY_FULL_COUNT:-?} count_shrink=${STICKY_SHRINK_COUNT:-?} rss_full=${STICKY_BASELINE_RSS_FULL_KB}KB rss_shrink=${STICKY_BASELINE_RSS_SHRINK_KB}KB reclaim=${STICKY_BASELINE_RSS_RECLAIM_KB}KB removed_dns=${STICKY_REMOVED_DNS:-empty}"
+                fi
+            else
+                STICKY_BASELINE_STATUS="passed"
+                STICKY_SHRINK_TOTAL=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$STICKY_PREFIX&limit=1")
+                STICKY_SHRINK_COUNT=$(printf '%s\n' "$STICKY_SHRINK_TOTAL" | json_number "total")
+                ok "$STEP" "sticky-baseline-after-shrink" "sticky_dns=0 keep_ok=1 count_full=${STICKY_FULL_COUNT:-?} count_shrink=${STICKY_SHRINK_COUNT:-?} rss_full=${STICKY_BASELINE_RSS_FULL_KB}KB rss_shrink=${STICKY_BASELINE_RSS_SHRINK_KB}KB reclaim=${STICKY_BASELINE_RSS_RECLAIM_KB}KB removed_dns=${STICKY_REMOVED_DNS:-empty} (cold check skipped)"
+            fi
+        fi
+    else
+        skip "$STEP" "sticky-baseline-after-shrink" "skipped because shrink refresh did not complete"
+    fi
+
+    step
+    sticky_cleanup "$STICKY_PREFIX" "$STICKY_BASELINE_SOURCE_ID"
+    ok "$STEP" "sticky-baseline-cleanup" "removed sticky source/domains for $STICKY_PREFIX"
+
+    step
+    write_sticky_baseline
+    ok "$STEP" "sticky-baseline-report" "wrote $STICKY_BASELINE_FILE status=$STICKY_BASELINE_STATUS sticky_dns=$STICKY_BASELINE_STICKY_DNS reclaim=${STICKY_BASELINE_RSS_RECLAIM_KB}KB"
+else
+    step
+    skip "$STEP" "sticky-baseline" "disabled; set MOCK_STICKY_BASELINE=true to measure sticky source refresh"
+fi
+
 
 
 # Optional blocklist capacity stress. This intentionally grows the deployed

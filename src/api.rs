@@ -1132,16 +1132,30 @@ async fn delete_source(
     pool: web::Data<DbPool>,
     req: HttpRequest,
     acl: web::Data<SharedAcl>,
+    blocklist: web::Data<BlocklistStore>,
+    allowlist: web::Data<AllowlistStore>,
     path: web::Path<i64>,
 ) -> impl Responder {
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    if db::delete_source(&pool, id) {
-        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
-    } else {
-        HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}))
+    let pool_for_delete = pool.get_ref().clone();
+    let result =
+        match db_blocking(move || db::delete_source_with_cleanup(&pool_for_delete, id)).await {
+            Ok(result) => result,
+            Err(resp) => return resp,
+        };
+    match result {
+        Some((list_type, rebuilt)) => {
+            if list_type == "allowlist" {
+                allowlist.write().replace_with(rebuilt);
+            } else {
+                blocklist.write().replace_with(rebuilt);
+            }
+            HttpResponse::Ok().json(serde_json::json!({"ok": true}))
+        }
+        None => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
     }
 }
 
@@ -1169,6 +1183,34 @@ async fn refresh_all_sources(
         results.push(serde_json::json!({"id": source.id, "url": source.url, "status": status}));
     }
     HttpResponse::Ok().json(serde_json::json!({"refreshed": results.len(), "results": results}))
+}
+
+async fn refresh_one_source(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    blocklist: web::Data<BlocklistStore>,
+    allowlist: web::Data<AllowlistStore>,
+    path: web::Path<i64>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let id = path.into_inner();
+    let pool_for_lookup = pool.get_ref().clone();
+    let source = match db_blocking(move || db::get_source_by_id(&pool_for_lookup, id)).await {
+        Ok(source) => source,
+        Err(resp) => return resp,
+    };
+    let Some(source) = source else {
+        return HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}));
+    };
+    let status = db::refresh_source(&pool, &source, Some(&blocklist), Some(&allowlist)).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "id": source.id,
+        "url": source.url,
+        "status": status
+    }))
 }
 
 // --- Stats ---
@@ -1643,6 +1685,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/rewrites/{id}", web::delete().to(delete_rewrite))
             .route("/sources", web::get().to(get_sources))
             .route("/sources", web::post().to(add_source))
+            .route("/sources/{id}/refresh", web::post().to(refresh_one_source))
             .route("/sources/{id}", web::delete().to(delete_source))
             .route("/sources/refresh", web::post().to(refresh_all_sources))
             .route("/stats", web::get().to(get_stats))

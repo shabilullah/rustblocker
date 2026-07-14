@@ -14,6 +14,13 @@ pub struct DomainImportResult {
     pub store: DomainStore,
 }
 
+/// Result of refreshing a source: status text plus a full rebuilt runtime store
+/// for the affected list table (so removed source domains leave RAM).
+pub struct SourceRefreshResult {
+    pub status: String,
+    pub store: DomainStore,
+}
+
 pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, r2d2::Error> {
     let path = db_path.as_ref();
     let manager = SqliteConnectionManager::file(path);
@@ -97,6 +104,20 @@ fn init_schema(conn: &rusqlite::Connection) {
     // CREATE TABLE IF NOT EXISTS won't alter existing tables, so we do it explicitly.
     let _ = conn.execute("ALTER TABLE query_log ADD COLUMN resolver TEXT", []);
     let _ = conn.execute("ALTER TABLE query_log ADD COLUMN latency_us INTEGER", []);
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS source_domains (
+            source_id INTEGER NOT NULL,
+            domain TEXT NOT NULL,
+            PRIMARY KEY (source_id, domain)
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_domains_domain ON source_domains(domain);
+        CREATE INDEX IF NOT EXISTS idx_source_domains_source ON source_domains(source_id);
+        CREATE TABLE IF NOT EXISTS manual_domains (
+            list_type TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            PRIMARY KEY (list_type, domain)
+        );",
+    );
 }
 
 /// Seed the database with sensible defaults (only if tables are empty).
@@ -205,6 +226,10 @@ fn insert_domains_from_content(
     content: &str,
 ) -> DomainStore {
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
+    let list_type = match table {
+        "allowlist_domains" => "allowlist",
+        _ => "blocklist",
+    };
     let mut store = DomainStore::default();
     // Wrap all inserts in a single transaction so a 100k-line source
     // doesn't create 100k individual write transactions.
@@ -212,6 +237,11 @@ fn insert_domains_from_content(
     for line in content.lines() {
         if let Some(domain) = parse_domain_line(line) {
             conn.execute(&sql, params![domain]).ok();
+            // API bulk import is treated as manual so source refresh won't prune it.
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)",
+                params![list_type, domain],
+            );
             store.insert(&domain);
         }
     }
@@ -483,7 +513,24 @@ pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
     let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
     conn.execute(&sql, params![normalized]).ok();
-    conn.last_insert_rowid()
+    // Resolve the real domain row id. Do not use last_insert_rowid() after the
+    // manual_domains insert — that would return the wrong table's rowid.
+    let id: i64 = conn
+        .query_row(
+            &format!("SELECT id FROM {} WHERE domain = ?1", table),
+            params![normalized],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let list_type = match table {
+        "allowlist_domains" => "allowlist",
+        _ => "blocklist",
+    };
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)",
+        params![list_type, normalized],
+    );
+    id
 }
 
 pub fn get_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<DbDomain> {
@@ -513,7 +560,19 @@ pub fn delete_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<String
         .ok()?;
     let delete_sql = format!("DELETE FROM {} WHERE id = ?1", table);
     let rows = conn.execute(&delete_sql, params![id]).ok()?;
-    if rows > 0 { Some(domain) } else { None }
+    if rows > 0 {
+        let list_type = match table {
+            "allowlist_domains" => "allowlist",
+            _ => "blocklist",
+        };
+        let _ = conn.execute(
+            "DELETE FROM manual_domains WHERE list_type = ?1 AND domain = ?2",
+            params![list_type, domain],
+        );
+        Some(domain)
+    } else {
+        None
+    }
 }
 
 pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
@@ -643,6 +702,26 @@ pub struct DbSource {
     pub last_status: Option<String>,
 }
 
+pub fn get_source_by_id(pool: &DbPool, id: i64) -> Option<DbSource> {
+    let conn = pool.get().ok()?;
+    conn.query_row(
+        "SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status FROM sources WHERE id = ?1",
+        params![id],
+        |row| {
+            Ok(DbSource {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                list_type: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
+                update_interval_hours: row.get(4)?,
+                last_updated: row.get(5)?,
+                last_status: row.get(6)?,
+            })
+        },
+    )
+    .ok()
+}
+
 pub fn get_sources(pool: &DbPool) -> Vec<DbSource> {
     let conn = pool.get().expect("failed to get DB connection");
     let mut stmt = conn
@@ -669,16 +748,107 @@ pub fn add_source(pool: &DbPool, url: &str, list_type: &str, interval_hours: i64
     conn.execute(
         "INSERT OR IGNORE INTO sources (url, list_type, enabled, update_interval_hours) VALUES (?1, ?2, 1, ?3)",
         params![url, list_type, interval_hours],
-    ).ok();
-    conn.last_insert_rowid()
+    )
+    .ok();
+    // INSERT OR IGNORE does not update last_insert_rowid when the URL already exists.
+    conn.query_row(
+        "SELECT id FROM sources WHERE url = ?1",
+        params![url],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
 }
 
 pub fn delete_source(pool: &DbPool, id: i64) -> bool {
-    let conn = pool.get().expect("failed to get DB connection");
-    let rows = conn
+    delete_source_with_cleanup(pool, id).is_some()
+}
+
+/// Delete a source and drop domains that are no longer referenced by any source.
+/// Returns `(list_type, rebuilt DomainStore)` when the source existed.
+pub fn delete_source_with_cleanup(pool: &DbPool, id: i64) -> Option<(String, DomainStore)> {
+    let mut conn = pool.get().ok()?;
+    let list_type: String = conn
+        .query_row(
+            "SELECT list_type FROM sources WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let table = match list_type.as_str() {
+        "allowlist" => "allowlist_domains",
+        _ => "blocklist_domains",
+    };
+
+    let tx = conn.transaction().ok()?;
+    let owned: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT domain FROM source_domains WHERE source_id = ?1")
+            .ok()?;
+        stmt.query_map(params![id], |row| row.get(0))
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    tx.execute(
+        "DELETE FROM source_domains WHERE source_id = ?1",
+        params![id],
+    )
+    .ok()?;
+    let rows = tx
         .execute("DELETE FROM sources WHERE id = ?1", params![id])
-        .unwrap();
-    rows > 0
+        .ok()?;
+    if rows == 0 {
+        return None;
+    }
+
+    {
+        let _ = tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS tmp_source_old_domains (
+                domain TEXT PRIMARY KEY
+            );
+            DELETE FROM tmp_source_old_domains;",
+        );
+        {
+            let mut stmt = tx
+                .prepare("INSERT OR IGNORE INTO tmp_source_old_domains (domain) VALUES (?1)")
+                .ok()?;
+            for domain in &owned {
+                let _ = stmt.execute(params![domain]);
+            }
+        }
+        let prune_sql = match table {
+            "allowlist_domains" => {
+                "DELETE FROM allowlist_domains
+                 WHERE domain IN (
+                     SELECT o.domain FROM tmp_source_old_domains o
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM source_domains sd WHERE sd.domain = o.domain
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM manual_domains m
+                         WHERE m.list_type = 'allowlist' AND m.domain = o.domain
+                     )
+                 )"
+            }
+            _ => {
+                "DELETE FROM blocklist_domains
+                 WHERE domain IN (
+                     SELECT o.domain FROM tmp_source_old_domains o
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM source_domains sd WHERE sd.domain = o.domain
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM manual_domains m
+                         WHERE m.list_type = 'blocklist' AND m.domain = o.domain
+                     )
+                 )"
+            }
+        };
+        let _ = tx.execute(prune_sql, []);
+    }
+    tx.commit().ok()?;
+
+    Some((list_type, load_domain_store_from_conn(&conn, table)))
 }
 
 pub fn update_source_status(pool: &DbPool, id: i64, status: &str) {
@@ -719,7 +889,133 @@ pub fn get_stale_sources(pool: &DbPool) -> Vec<DbSource> {
     .collect()
 }
 
-/// Refresh a single source: fetch URL, import domains, update status.
+/// Replace one source's domain set, prune unreferenced domains, and rebuild the
+/// runtime store for the affected list table.
+fn replace_source_domains(
+    pool: &DbPool,
+    source_id: i64,
+    table: &str,
+    content: &str,
+) -> Result<(usize, DomainStore), String> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| format!("failed to get DB connection: {e}"))?;
+
+    let mut new_list: Vec<String> = content.lines().filter_map(parse_domain_line).collect();
+    new_list.sort();
+    new_list.dedup();
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("failed to begin transaction: {e}"))?;
+
+    // Snapshot old ownership for this source into a temp table for set-based prune.
+    tx.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS tmp_source_old_domains (
+            domain TEXT PRIMARY KEY
+        );
+        DELETE FROM tmp_source_old_domains;",
+    )
+    .map_err(|e| format!("prepare temp old domains: {e}"))?;
+
+    tx.execute(
+        "INSERT OR IGNORE INTO tmp_source_old_domains (domain)
+         SELECT domain FROM source_domains WHERE source_id = ?1",
+        params![source_id],
+    )
+    .map_err(|e| format!("snapshot old domains: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM source_domains WHERE source_id = ?1",
+        params![source_id],
+    )
+    .map_err(|e| format!("clear source_domains: {e}"))?;
+
+    {
+        let mut insert_src = tx
+            .prepare("INSERT OR IGNORE INTO source_domains (source_id, domain) VALUES (?1, ?2)")
+            .map_err(|e| format!("prepare source_domains insert: {e}"))?;
+        let mut insert_domain = match table {
+            "allowlist_domains" => tx
+                .prepare("INSERT OR IGNORE INTO allowlist_domains (domain) VALUES (?1)")
+                .map_err(|e| format!("prepare allowlist insert: {e}"))?,
+            _ => tx
+                .prepare("INSERT OR IGNORE INTO blocklist_domains (domain) VALUES (?1)")
+                .map_err(|e| format!("prepare blocklist insert: {e}"))?,
+        };
+        for domain in &new_list {
+            insert_src
+                .execute(params![source_id, domain])
+                .map_err(|e| format!("insert source_domains: {e}"))?;
+            insert_domain
+                .execute(params![domain])
+                .map_err(|e| format!("insert domain: {e}"))?;
+        }
+    }
+
+    // Set-based prune: domains this source used to own, no longer owned by any source,
+    // and not marked manual. Avoids per-domain COUNT/DELETE loops on large lists.
+    let prune_sql = match table {
+        "allowlist_domains" => {
+            "DELETE FROM allowlist_domains
+             WHERE domain IN (
+                 SELECT o.domain FROM tmp_source_old_domains o
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM source_domains sd WHERE sd.domain = o.domain
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM manual_domains m
+                     WHERE m.list_type = 'allowlist' AND m.domain = o.domain
+                 )
+             )"
+        }
+        _ => {
+            "DELETE FROM blocklist_domains
+             WHERE domain IN (
+                 SELECT o.domain FROM tmp_source_old_domains o
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM source_domains sd WHERE sd.domain = o.domain
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM manual_domains m
+                     WHERE m.list_type = 'blocklist' AND m.domain = o.domain
+                 )
+             )"
+        }
+    };
+    tx.execute(prune_sql, [])
+        .map_err(|e| format!("prune unreferenced domains: {e}"))?;
+
+    tx.execute(
+        "UPDATE sources SET last_updated = datetime('now'), last_status = ?1 WHERE id = ?2",
+        params![format!("ok: {} domains", new_list.len()), source_id],
+    )
+    .map_err(|e| format!("update source status: {e}"))?;
+
+    tx.commit()
+        .map_err(|e| format!("commit source refresh: {e}"))?;
+
+    let rebuilt = load_domain_store_from_conn(&conn, table);
+    Ok((new_list.len(), rebuilt))
+}
+fn load_domain_store_from_conn(conn: &rusqlite::Connection, table: &str) -> DomainStore {
+    let mut store = DomainStore::default();
+    let sql = match table {
+        "allowlist_domains" => "SELECT domain FROM allowlist_domains",
+        _ => "SELECT domain FROM blocklist_domains",
+    };
+    if let Ok(mut stmt) = conn.prepare(sql)
+        && let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0))
+    {
+        for domain in rows.flatten() {
+            store.insert(&domain);
+        }
+    }
+    store
+}
+
+/// Refresh a single source: fetch URL, replace that source's domain set, prune
+/// domains no longer owned by any source, and rebuild the in-memory store.
 /// Returns a status string like "ok: 12345 domains" or "failed: ...".
 pub async fn refresh_source(
     pool: &DbPool,
@@ -750,17 +1046,25 @@ pub async fn refresh_source(
     let table_for_db = table.to_string();
     let source_id = source.id;
     let db_result = tokio::task::spawn_blocking(move || {
-        let result = bulk_import_domains_with_entries(&pool_for_db, &table_for_db, &content);
-        let status = format!("ok: {} domains", result.inserted);
-        update_source_status(&pool_for_db, source_id, &status);
-        (status, result.store)
+        replace_source_domains(&pool_for_db, source_id, &table_for_db, &content)
     })
     .await;
 
-    let (status, imported_store) = match db_result {
-        Ok(result) => result,
+    let (status, rebuilt_store) = match db_result {
+        Ok(Ok((count, store))) => (format!("ok: {count} domains"), store),
+        Ok(Err(e)) => {
+            let status = format!("failed: {e}");
+            let pool = pool.clone();
+            let status_for_db = status.clone();
+            let source_id = source.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                update_source_status(&pool, source_id, &status_for_db);
+            })
+            .await;
+            return status;
+        }
         Err(e) => {
-            let status = format!("failed: database task failed: {}", e);
+            let status = format!("failed: database task failed: {e}");
             let pool = pool.clone();
             let status_for_db = status.clone();
             let source_id = source.id;
@@ -772,14 +1076,14 @@ pub async fn refresh_source(
         }
     };
 
-    // Reload in-memory store
+    // Full replace — removed source domains leave RAM.
     let store = match source.list_type.as_str() {
         "allowlist" => allowlist_store,
         _ => blocklist_store,
     };
     if let Some(store) = store {
         let mut s = store.write();
-        s.merge(imported_store);
+        s.replace_with(rebuilt_store);
     }
 
     info!("Source refreshed: {} -> {}", source.url, status);
@@ -984,6 +1288,82 @@ mod tests {
         assert_eq!(deleted.as_deref(), Some("delete-me.example"));
         assert!(get_domain_by_id(&pool, "blocklist_domains", id).is_none());
         assert!(delete_domain_by_id(&pool, "blocklist_domains", id).is_none());
+    }
+
+    #[test]
+    fn source_refresh_removes_domains_no_longer_in_source() {
+        let pool = test_pool();
+        let id = add_source(&pool, "memory://sticky-source", "blocklist", 24);
+
+        let full = "0.0.0.0 keep.example.com\n0.0.0.0 drop.example.com\n";
+        let (full_count, full_store) =
+            replace_source_domains(&pool, id, "blocklist_domains", full).expect("full replace");
+        assert_eq!(full_count, 2);
+        assert!(full_store.matches("keep.example.com"));
+        assert!(full_store.matches("drop.example.com"));
+
+        let shrink = "0.0.0.0 keep.example.com\n";
+        let (shrink_count, shrink_store) =
+            replace_source_domains(&pool, id, "blocklist_domains", shrink).expect("shrink replace");
+        assert_eq!(shrink_count, 1);
+        assert!(shrink_store.matches("keep.example.com"));
+        assert!(
+            !shrink_store.matches("drop.example.com"),
+            "removed source domain must leave the rebuilt store"
+        );
+
+        // DB must also drop the unreferenced domain.
+        let domains = get_domains(&pool, "blocklist_domains");
+        let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
+        assert!(names.iter().any(|d| d == "keep.example.com"));
+        assert!(!names.iter().any(|d| d == "drop.example.com"));
+    }
+
+    #[test]
+    fn source_refresh_preserves_manual_domains() {
+        let pool = test_pool();
+        let _manual_id = add_domain(&pool, "blocklist_domains", "manual.example.com");
+        let id = add_source(&pool, "memory://manual-overlap", "blocklist", 24);
+        replace_source_domains(
+            &pool,
+            id,
+            "blocklist_domains",
+            "0.0.0.0 manual.example.com\n0.0.0.0 source-only.example.com\n",
+        )
+        .expect("seed overlapping source");
+
+        let (_count, store) = replace_source_domains(
+            &pool,
+            id,
+            "blocklist_domains",
+            "0.0.0.0 source-only.example.com\n",
+        )
+        .expect("shrink source without manual domain");
+
+        // Source-only domain remains; manual domain must remain even though source dropped it.
+        assert!(store.matches("source-only.example.com"));
+        assert!(store.matches("manual.example.com"));
+        let domains = get_domains(&pool, "blocklist_domains");
+        let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
+        assert!(names.iter().any(|d| d == "manual.example.com"));
+    }
+
+    #[test]
+    fn source_delete_prunes_owned_domains() {
+        let pool = test_pool();
+        let id = add_source(&pool, "memory://delete-source", "blocklist", 24);
+        replace_source_domains(
+            &pool,
+            id,
+            "blocklist_domains",
+            "0.0.0.0 only-from-source.example.com\n",
+        )
+        .expect("seed source domains");
+
+        let (list_type, rebuilt) = delete_source_with_cleanup(&pool, id).expect("source deleted");
+        assert_eq!(list_type, "blocklist");
+        assert!(!rebuilt.matches("only-from-source.example.com"));
+        assert_eq!(count_domains(&pool, "blocklist_domains"), 0);
     }
 
     #[test]
