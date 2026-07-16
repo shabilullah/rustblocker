@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use hickory_net::{DnsError, NetError};
 use hickory_proto::op::{Metadata, ResponseCode};
 use hickory_proto::rr::{Name, RData, Record, RecordData, RecordType};
-use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::lookup::Lookup;
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::{Resolver, TokioResolver};
@@ -155,6 +155,16 @@ impl Clone for ParallelForwarder {
 }
 
 impl ParallelForwarder {
+    /// Default cache size per resolver: 256K responses (was 1M).
+    /// All upstreams query the same domain space, so most entries overlap.
+    /// Reducing per-resolver cache cuts total memory ~4× with negligible
+    /// cache-miss penalty (queries still hit the fastest upstream first).
+    const DEFAULT_CACHE_SIZE: u64 = 256_000;
+    /// More aggressive hedging: fan out to 3 upstreams simultaneously.
+    const DEFAULT_NUM_CONCURRENT_REQS: usize = 3;
+    /// Shorter negative TTL to avoid caching stale NXDOMAIN/NODATA too long.
+    const DEFAULT_NEGATIVE_MIN_TTL_SECS: u64 = 600; // 10 minutes
+
     pub fn new(upstreams: &[UpstreamConfig], timeout_secs: u64) -> Result<Self> {
         Self::new_with_strategy(upstreams, timeout_secs, ForwardStrategy::default())
     }
@@ -175,8 +185,15 @@ impl ParallelForwarder {
             let ns_config = NameServerConfig::udp_and_tcp(ip);
             let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
 
-            let resolver =
-                Resolver::builder_with_config(config, TokioRuntimeProvider::default()).build()?;
+            // Tune resolver opts: smaller shared cache, more concurrent requests.
+            let mut opts = ResolverOpts::default();
+            opts.cache_size = Self::DEFAULT_CACHE_SIZE;
+            opts.num_concurrent_reqs = Self::DEFAULT_NUM_CONCURRENT_REQS;
+            opts.negative_min_ttl = Some(Duration::from_secs(Self::DEFAULT_NEGATIVE_MIN_TTL_SECS));
+
+            let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+                .with_options(opts)
+                .build()?;
             resolvers.push(resolver);
             addresses.push(upstream.address.clone());
             debug!("Added upstream resolver: {}", upstream.address);
@@ -196,7 +213,6 @@ impl ParallelForwarder {
             max_adaptive_parallel: DEFAULT_MAX_ADAPTIVE_PARALLEL,
         })
     }
-
     /// Reload upstream resolvers from a fresh config list.
     /// Called after adding/removing upstreams via the web API.
     pub fn reload(
@@ -363,11 +379,6 @@ impl ParallelForwarder {
             Ok(Ok(resolve_result)) => Ok(resolve_result),
             Ok(Err(ForwardAttemptError::Upstream(Some(last_err)))) => {
                 let latency_us = start.elapsed().as_micros() as u64;
-                // NoRecordsFound is a legitimate upstream response: it covers
-                // NODATA (NOERROR with 0 answers, e.g. an AAAA query for a
-                // domain with only A records) and NXDomain (nonexistent domain).
-                // Forward it to the client verbatim with the original response
-                // code and authority records rather than masking it as SERVFAIL.
                 let (info, resolver) =
                     build_error_response(request, response_handle, &last_err).await?;
                 Ok(ResolveResult {

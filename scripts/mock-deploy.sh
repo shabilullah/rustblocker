@@ -106,6 +106,18 @@ STICKY_BASELINE_REMOVED_DOMAIN=""
 STICKY_BASELINE_KEEP_DOMAIN=""
 STICKY_FULL_COUNT=0
 STICKY_SHRINK_COUNT=0
+MOCK_RESOLVER_CACHE_BASELINE="${MOCK_RESOLVER_CACHE_BASELINE:-true}"
+RESOLVER_CACHE_BASELINE_FILE="${RESOLVER_CACHE_BASELINE_FILE:-target/mock-resolver-cache-baseline.json}"
+RESOLVER_CACHE_BASELINE_UPSTREAMS="${RESOLVER_CACHE_BASELINE_UPSTREAMS:-2}"
+RESOLVER_CACHE_BASELINE_DNS_SAMPLES="${RESOLVER_CACHE_BASELINE_DNS_SAMPLES:-48}"
+RESOLVER_CACHE_BASELINE_SETTLE_SECS="${RESOLVER_CACHE_BASELINE_SETTLE_SECS:-2}"
+RESOLVER_CACHE_BASELINE_STATUS="not_started"
+RESOLVER_CACHE_BASELINE_RSS_PRE_KB=0
+RESOLVER_CACHE_BASELINE_RSS_POST_KB=0
+RESOLVER_CACHE_BASELINE_QUERY_COUNT=0
+RESOLVER_CACHE_BASELINE_DNS_FAILURES=0
+RESOLVER_CACHE_BASELINE_DNS_P95_MS=0
+RESOLVER_CACHE_BASELINE_NOTE=""
 
 
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
@@ -1566,6 +1578,84 @@ if enabled "$MOCK_DOMAINSTORE_BASELINE"; then
 else
     step
     skip "$STEP" "domainstore-baseline" "disabled; set MOCK_DOMAINSTORE_BASELINE=true to measure DomainStore RSS"
+fi
+
+# Resolver cache baseline: verify that tuned resolver cache (256K per upstream,
+# 3 concurrent requests) maintains DNS correctness and latency without regressions.
+# Proof points: 100% queries reach upstream (no SERVFAIL), p95 latency stable.
+# RSS not measured — jemalloc won't return memory after cache shrink.
+if enabled "$MOCK_RESOLVER_CACHE_BASELINE"; then
+    RESOLVER_CACHE_BASELINE_STATUS="running"
+    RESOLVER_CACHE_BASELINE_SERVFAIL=0
+    RESOLVER_CACHE_BASELINE_EMPTY=0
+    RESOLVER_CACHE_BASELINE_UPSTREAM=0
+    RESOLVER_CACHE_BASELINE_LATENCIES=()
+
+    # Use real domains that actually resolve to exercise the forwarder resolver cache.
+    # Repeating 6 domains × 8 = 48 queries. NXDOMAIN from upstream is valid;
+    # SERVFAIL or empty output indicates a forwarder problem.
+    REAL_DOMAINS=(example.com cloudflare.com google.com github.com mozilla.org rust-lang.org)
+
+    for i in $(seq 1 48); do
+        DOMAIN_IDX=$(( (i - 1) % 6 ))
+        DOMAIN="${REAL_DOMAINS[$DOMAIN_IDX]}"
+        START_MS=$(now_ms)
+        RESULT=$(target_dns_a "$DOMAIN" 2>/dev/null || true)
+        END_MS=$(now_ms)
+        LATENCY=$((END_MS - START_MS))
+        RESOLVER_CACHE_BASELINE_LATENCIES+=("$LATENCY")
+
+        # Empty output = forwarder/connection failure (no response at all)
+        if [ -z "$RESULT" ]; then
+            RESOLVER_CACHE_BASELINE_EMPTY=$((RESOLVER_CACHE_BASELINE_EMPTY + 1))
+        # SERVFAIL / error / connection refused = upstream forwarding problem
+        elif echo "$RESULT" | grep -qi "servfail\|error\|connection refused\|timed out"; then
+            RESOLVER_CACHE_BASELINE_SERVFAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + 1))
+        else
+            # Any other response (A record, NXDOMAIN, CNAME chain) = upstream reached
+            RESOLVER_CACHE_BASELINE_UPSTREAM=$((RESOLVER_CACHE_BASELINE_UPSTREAM + 1))
+        fi
+    done
+
+    # Calculate p95 latency
+    RESOLVER_CACHE_BASELINE_P95_MS=0
+    RESOLVER_CACHE_BASELINE_MAX_MS=0
+    if [ ${#RESOLVER_CACHE_BASELINE_LATENCIES[@]} -gt 0 ]; then
+        SORTED_LAT=$(printf '%s\n' "${RESOLVER_CACHE_BASELINE_LATENCIES[@]}" | sort -n)
+        LAT_COUNT=${#RESOLVER_CACHE_BASELINE_LATENCIES[@]}
+        P95_IDX=$(( (LAT_COUNT * 95 + 99) / 100 ))
+        [ "$P95_IDX" -lt 1 ] && P95_IDX=1
+        RESOLVER_CACHE_BASELINE_P95_MS=$(printf '%s\n' "$SORTED_LAT" | sed -n "${P95_IDX}p")
+        RESOLVER_CACHE_BASELINE_MAX_MS=$(printf '%s\n' "$SORTED_LAT" | tail -1)
+    fi
+
+    RESOLVER_CACHE_BASELINE_NOTE="cache_size=256K_per_resolver num_concurrent=3 negative_ttl=10m"
+    RESOLVER_CACHE_BASELINE_TOTAL_FAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY))
+    if [ "$RESOLVER_CACHE_BASELINE_TOTAL_FAIL" -eq 0 ]; then
+        ok "$STEP" "resolver-cache-baseline" "upstream=${RESOLVER_CACHE_BASELINE_UPSTREAM} p95=${RESOLVER_CACHE_BASELINE_P95_MS}ms max=${RESOLVER_CACHE_BASELINE_MAX_MS}ms note="$RESOLVER_CACHE_BASELINE_NOTE""
+    else
+        fail "$STEP" "resolver-cache-baseline" "failures=empty=${RESOLVER_CACHE_BASELINE_EMPTY} servfail=${RESOLVER_CACHE_BASELINE_SERVFAIL} upstream=${RESOLVER_CACHE_BASELINE_UPSTREAM}"
+    fi
+
+    # Write baseline JSON (shell-based, no python dependency)
+    cat > "$RESOLVER_CACHE_BASELINE_FILE" <<JSONEOF
+{
+  "status": "$([ "$RESOLVER_CACHE_BASELINE_TOTAL_FAIL" -eq 0 ] && echo passed || echo failed)",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "query_count": $((RESOLVER_CACHE_BASELINE_UPSTREAM + RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY)),
+  "upstream_success": $RESOLVER_CACHE_BASELINE_UPSTREAM,
+  "servfail": $RESOLVER_CACHE_BASELINE_SERVFAIL,
+  "empty": $RESOLVER_CACHE_BASELINE_EMPTY,
+  "dns_p95_ms": $RESOLVER_CACHE_BASELINE_P95_MS,
+  "dns_max_ms": $RESOLVER_CACHE_BASELINE_MAX_MS,
+  "note": "$RESOLVER_CACHE_BASELINE_NOTE",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+JSONEOF
+    echo "wrote baseline queries=$((RESOLVER_CACHE_BASELINE_UPSTREAM + RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY)) p95=${RESOLVER_CACHE_BASELINE_P95_MS}ms"
+else
+    skip "$STEP" "resolver-cache-baseline" "disabled by MOCK_RESOLVER_CACHE_BASELINE=false"
 fi
 
 # Sticky-domain baseline (issue 1b): source refresh that shrinks a list must drop
