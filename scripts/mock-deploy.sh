@@ -131,6 +131,30 @@ REMOVE_COMPACT_STICKY_DNS=0
 REMOVE_COMPACT_KEEP_DNS_OK=0
 REMOVE_COMPACT_REMOVED_DOMAIN=""
 REMOVE_COMPACT_KEEP_DOMAIN=""
+
+# Sync apply_domains replace_with (finding 5): always-on agent smoke.
+# Spawns a temp slave against the deployed master; master shrinks blocklist;
+# slave must drop removed domains from DNS (apply path uses replace_with).
+MOCK_SYNC_APPLY_BASELINE=true
+SYNC_APPLY_DOMAINS=80
+SYNC_APPLY_KEEP=15
+SYNC_APPLY_INTERVAL_SECS=2
+SYNC_APPLY_SETTLE_SECS=3
+SYNC_APPLY_WAIT_ATTEMPTS=20
+SYNC_APPLY_SLAVE_DNS_PORT=1853
+SYNC_APPLY_SLAVE_WEB_PORT=1854
+SYNC_APPLY_BASELINE_FILE="target/mock-sync-apply-domains-baseline.json"
+SYNC_APPLY_STATUS="not_started"
+SYNC_APPLY_NOTE=""
+SYNC_APPLY_SLAVE_PID=""
+SYNC_APPLY_SLAVE_DB=""
+SYNC_APPLY_IMPORTED=0
+SYNC_APPLY_DELETED=0
+SYNC_APPLY_STICKY_DNS=0
+SYNC_APPLY_KEEP_DNS_OK=0
+SYNC_APPLY_FULL_DNS_OK=0
+SYNC_APPLY_REMOVED_DOMAIN=""
+SYNC_APPLY_KEEP_DOMAIN=""
 MOCK_RESOLVER_CACHE_BASELINE="${MOCK_RESOLVER_CACHE_BASELINE:-true}"
 RESOLVER_CACHE_BASELINE_FILE="${RESOLVER_CACHE_BASELINE_FILE:-target/mock-resolver-cache-baseline.json}"
 RESOLVER_CACHE_BASELINE_UPSTREAMS="${RESOLVER_CACHE_BASELINE_UPSTREAMS:-2}"
@@ -687,6 +711,54 @@ remove_compact_cleanup() {
     else
         api_cleanup_blocklist_prefix "$prefix" 250 40 || true
     fi
+}
+
+write_sync_apply_baseline() {
+    local dir note_escaped
+    dir=$(dirname "$SYNC_APPLY_BASELINE_FILE")
+    mkdir -p "$dir"
+    note_escaped=$(printf '%s' "$SYNC_APPLY_NOTE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "$SYNC_APPLY_BASELINE_FILE" <<EOF
+{
+  "status": "$SYNC_APPLY_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "domains": $SYNC_APPLY_DOMAINS,
+  "keep": $SYNC_APPLY_KEEP,
+  "imported": $SYNC_APPLY_IMPORTED,
+  "deleted": $SYNC_APPLY_DELETED,
+  "sticky_dns": $SYNC_APPLY_STICKY_DNS,
+  "keep_dns_ok": $SYNC_APPLY_KEEP_DNS_OK,
+  "full_dns_ok": $SYNC_APPLY_FULL_DNS_OK,
+  "removed_domain": "$SYNC_APPLY_REMOVED_DOMAIN",
+  "keep_domain": "$SYNC_APPLY_KEEP_DOMAIN",
+  "slave_dns_port": $SYNC_APPLY_SLAVE_DNS_PORT,
+  "note": "$note_escaped",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+sync_apply_cleanup_slave() {
+    local pid="${SYNC_APPLY_SLAVE_PID:-}"
+    local db="${SYNC_APPLY_SLAVE_DB:-}"
+    if [ -n "$pid" ]; then
+        remote_root "kill $pid 2>/dev/null || true; sleep 1; kill -9 $pid 2>/dev/null || true" || true
+    fi
+    # Reap by cmdline/port if PID lost.
+    remote_root "pkill -f 'rustblocker.*--dns-port ${SYNC_APPLY_SLAVE_DNS_PORT}' 2>/dev/null || true; fuser -k ${SYNC_APPLY_SLAVE_DNS_PORT}/udp ${SYNC_APPLY_SLAVE_DNS_PORT}/tcp ${SYNC_APPLY_SLAVE_WEB_PORT}/tcp 2>/dev/null || true" || true
+    if [ -n "$db" ]; then
+        remote_root "rm -f $(shell_quote "$db") $(shell_quote "${db}-wal") $(shell_quote "${db}-shm") /tmp/rb-sync-apply-slave.log" || true
+    fi
+    SYNC_APPLY_SLAVE_PID=""
+}
+
+remote_dns_a_port() {
+    local domain="$1"
+    local port="$2"
+    local quoted_domain
+    quoted_domain=$(shell_quote "$domain")
+    "${SSH[@]}" "$REMOTE" "domain=$quoted_domain; port=$port; if command -v dig >/dev/null 2>&1; then dig @127.0.0.1 -p \"\$port\" +time=2 +tries=1 +short A \"\$domain\"; elif command -v drill >/dev/null 2>&1; then drill -p \"\$port\" @127.0.0.1 \"\$domain\" A | awk '/^[^;].*[[:space:]]A[[:space:]]/ { print \$NF }'; elif command -v nslookup >/dev/null 2>&1; then nslookup -type=A -port=\$port \"\$domain\" 127.0.0.1 | awk '/^Name:/ { answer=1 } answer && /^Address(es)?:/ { for (i=2; i<=NF; i++) if (\$i ~ /^[0-9.]+\$/) print \$i } answer && /^[[:space:]]+[0-9]+\\./ { print \$1 }'; else echo '__NO_DNS_TOOL__'; exit 3; fi"
 }
 
 
@@ -2175,6 +2247,264 @@ else
     step
     skip "$STEP" "remove-compact" "hardcoded off (MOCK_REMOVE_COMPACT_BASELINE=false)"
 fi
+
+# Sync apply_domains replace_with (finding 5): always-on agent smoke.
+# Side slave polls master; after master shrinks blocklist, slave DNS must drop
+# removed domains (apply_domains_inner uses replace_with). Capacity reclaim is
+# unit-level; this proves the sync apply runtime path.
+if enabled "$MOCK_SYNC_APPLY_BASELINE"; then
+    SYNC_APPLY_PREFIX="${RUN_TAG}-syncapply.rustblocker.test"
+    SYNC_APPLY_STATUS="running"
+    SYNC_APPLY_NOTE="post-fix sync apply_domains replace_with via temp slave"
+    SYNC_APPLY_KEEP_DOMAIN="sap-1.${SYNC_APPLY_PREFIX}"
+    SYNC_APPLY_REMOVED_DOMAIN="sap-${SYNC_APPLY_DOMAINS}.${SYNC_APPLY_PREFIX}"
+    SYNC_APPLY_SLAVE_DB="/tmp/rb-sync-apply-$$.db"
+    SYNC_APPLY_SLAVE_LOG="/tmp/rb-sync-apply-slave.log"
+    SYNC_APPLY_MASTER_URL="http://127.0.0.1:${WEB_PORT}"
+    SYNC_APPLY_SLAVE_BASE="http://${SSH_HOST}:${SYNC_APPLY_SLAVE_WEB_PORT}"
+    SYNC_APPLY_SLAVE_COOKIE=""
+
+    if [ "$SYNC_APPLY_KEEP" -ge "$SYNC_APPLY_DOMAINS" ]; then
+        step
+        fail "$STEP" "sync-apply-prereq" "SYNC_APPLY_KEEP ($SYNC_APPLY_KEEP) must be < SYNC_APPLY_DOMAINS ($SYNC_APPLY_DOMAINS)"
+        SYNC_APPLY_STATUS="invalid_config"
+    fi
+
+    # Ensure no leftover slave from a prior aborted run.
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        sync_apply_cleanup_slave
+        ok "$STEP" "sync-apply-prep" "cleared prior slave state ports=${SYNC_APPLY_SLAVE_DNS_PORT}/${SYNC_APPLY_SLAVE_WEB_PORT}"
+    else
+        skip "$STEP" "sync-apply-prep" "skipped because prerequisite failed"
+    fi
+
+    # Seed master blocklist (full set).
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        SYNC_APPLY_CONTENT=""
+        for i in $(seq 1 "$SYNC_APPLY_DOMAINS"); do
+            SYNC_APPLY_CONTENT="${SYNC_APPLY_CONTENT}0.0.0.0 sap-${i}.${SYNC_APPLY_PREFIX}\\n"
+        done
+        SYNC_APPLY_IMPORT=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+            -X POST "$BASE_URL/api/blocklist/import" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$SYNC_APPLY_CONTENT\"}")
+        SYNC_APPLY_IMPORT_HTTP=$(printf '%s\n' "$SYNC_APPLY_IMPORT" | tail -1)
+        SYNC_APPLY_IMPORT_BODY=$(printf '%s\n' "$SYNC_APPLY_IMPORT" | sed '$d')
+        SYNC_APPLY_IMPORTED=$(printf '%s\n' "$SYNC_APPLY_IMPORT_BODY" | json_number "imported")
+        if [ "$SYNC_APPLY_IMPORT_HTTP" = "200" ] && [ "${SYNC_APPLY_IMPORTED:-0}" -ge "$SYNC_APPLY_DOMAINS" ]; then
+            ok "$STEP" "sync-apply-master-import" "master imported ${SYNC_APPLY_IMPORTED} domains"
+        else
+            SYNC_APPLY_STATUS="import_failed"
+            fail "$STEP" "sync-apply-master-import" "import failed HTTP=$SYNC_APPLY_IMPORT_HTTP body=${SYNC_APPLY_IMPORT_BODY:-empty}"
+        fi
+    else
+        skip "$STEP" "sync-apply-master-import" "skipped because prerequisite failed"
+    fi
+
+    # Start temp slave on remote host against local master web port.
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        SLAVE_BIN="${REMOTE_INSTALL_DIR}/${BINARY_NAME}"
+        remote_root "rm -f $(shell_quote "$SYNC_APPLY_SLAVE_DB") $(shell_quote "${SYNC_APPLY_SLAVE_DB}-wal") $(shell_quote "${SYNC_APPLY_SLAVE_DB}-shm") $(shell_quote "$SYNC_APPLY_SLAVE_LOG")" || true
+        # Fresh DB seeds its own admin hash; --sync-password is master auth only.
+        START_OUT=$(remote_root "nohup $(shell_quote "$SLAVE_BIN") \
+            --db-path $(shell_quote "$SYNC_APPLY_SLAVE_DB") \
+            --dns-port ${SYNC_APPLY_SLAVE_DNS_PORT} \
+            --web-port ${SYNC_APPLY_SLAVE_WEB_PORT} \
+            --force-http \
+            --sync-master $(shell_quote "$SYNC_APPLY_MASTER_URL") \
+            --sync-password $(shell_quote "$WEBUI_PASSWORD") \
+            --sync-interval ${SYNC_APPLY_INTERVAL_SECS} \
+            >$(shell_quote "$SYNC_APPLY_SLAVE_LOG") 2>&1 & echo \$!" 2>/dev/null || true)
+        SYNC_APPLY_SLAVE_PID=$(printf '%s\n' "$START_OUT" | tr -d '[:space:]' | tail -1)
+        if [ -n "$SYNC_APPLY_SLAVE_PID" ] && [ "$SYNC_APPLY_SLAVE_PID" -gt 0 ] 2>/dev/null; then
+            SLAVE_HEALTHY=false
+            for _i in $(seq 1 15); do
+                if curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" \
+                    "http://${SSH_HOST}:${SYNC_APPLY_SLAVE_WEB_PORT}/api/health" 2>/dev/null | grep -q '200'; then
+                    SLAVE_HEALTHY=true
+                    break
+                fi
+                sleep 1
+            done
+            if [ "$SLAVE_HEALTHY" = true ]; then
+                ok "$STEP" "sync-apply-slave-start" "slave pid=$SYNC_APPLY_SLAVE_PID dns=${SYNC_APPLY_SLAVE_DNS_PORT} web=${SYNC_APPLY_SLAVE_WEB_PORT}"
+            else
+                SYNC_APPLY_STATUS="slave_start_failed"
+                SLAVE_LOG_TAIL=$(remote_root "tail -n 40 $(shell_quote "$SYNC_APPLY_SLAVE_LOG") 2>/dev/null" 2>/dev/null || true)
+                fail "$STEP" "sync-apply-slave-start" "slave health failed pid=${SYNC_APPLY_SLAVE_PID:-?} log=${SLAVE_LOG_TAIL:-empty}"
+                sync_apply_cleanup_slave
+            fi
+        else
+            SYNC_APPLY_STATUS="slave_start_failed"
+            fail "$STEP" "sync-apply-slave-start" "failed to launch slave (out=${START_OUT:-empty})"
+        fi
+    else
+        skip "$STEP" "sync-apply-slave-start" "skipped because master import failed"
+    fi
+
+    # Wait for first sync poll via slave DNS only (/api/sync/status needs auth cookie).
+    # Poll loop discards immediate tick → first apply after ~SYNC_APPLY_INTERVAL_SECS.
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        SYNC_APPLY_SYNC_OK=false
+        for _i in $(seq 1 "$SYNC_APPLY_WAIT_ATTEMPTS"); do
+            sleep "$SYNC_APPLY_SETTLE_SECS"
+            FULL_DNS=$(remote_dns_a_port "$SYNC_APPLY_REMOVED_DOMAIN" "$SYNC_APPLY_SLAVE_DNS_PORT" 2>/dev/null || true)
+            KEEP_DNS=$(remote_dns_a_port "$SYNC_APPLY_KEEP_DOMAIN" "$SYNC_APPLY_SLAVE_DNS_PORT" 2>/dev/null || true)
+            if echo "$FULL_DNS" | grep -Fxq "$SINKHOLE_IPV4" \
+                && echo "$KEEP_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+                SYNC_APPLY_FULL_DNS_OK=1
+                SYNC_APPLY_SYNC_OK=true
+                break
+            fi
+        done
+        if [ "$SYNC_APPLY_SYNC_OK" = true ]; then
+            ok "$STEP" "sync-apply-full-sync" "slave DNS full+keep sinkholed on port $SYNC_APPLY_SLAVE_DNS_PORT"
+        else
+            SYNC_APPLY_STATUS="sync_failed"
+            SLAVE_LOG_TAIL=$(remote_root "tail -n 60 $(shell_quote "$SYNC_APPLY_SLAVE_LOG") 2>/dev/null" 2>/dev/null || true)
+            fail "$STEP" "sync-apply-full-sync" "slave DNS did not sinkhole full list keep=${KEEP_DNS:-empty} removed=${FULL_DNS:-empty} log=${SLAVE_LOG_TAIL:-empty}"
+        fi
+    else
+        skip "$STEP" "sync-apply-full-sync" "skipped because slave did not start"
+    fi
+
+    # Shrink master list: delete domains above KEEP via API.
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        SYNC_APPLY_DELETED=0
+        SYNC_APPLY_DELETE_OK=true
+        for _pass in $(seq 1 40); do
+            page=$("${CURL[@]}" -b "$COOKIE_JAR" \
+                "$BASE_URL/api/blocklist?search=$SYNC_APPLY_PREFIX&limit=250")
+            if printf '%s\n' "$page" | grep -q '"domains":\[\]'; then
+                break
+            fi
+            deleted_this_pass=0
+            while IFS= read -r obj; do
+                [ -z "$obj" ] && continue
+                domain=$(printf '%s\n' "$obj" | sed -n 's/.*"domain":"\([^"]*\)".*/\1/p' | head -1)
+                id=$(printf '%s\n' "$obj" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p' | head -1)
+                [ -n "$domain" ] && [ -n "$id" ] || continue
+                case "$domain" in
+                    sap-*.${SYNC_APPLY_PREFIX})
+                        n=${domain#sap-}
+                        n=${n%%.*}
+                        if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$SYNC_APPLY_KEEP" ] 2>/dev/null; then
+                            continue
+                        fi
+                        ;;
+                esac
+                http_code=$("${CURL[@]}" --max-time 30 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                    -X DELETE "$BASE_URL/api/blocklist/$id")
+                if [ "$http_code" = "200" ]; then
+                    SYNC_APPLY_DELETED=$((SYNC_APPLY_DELETED + 1))
+                    deleted_this_pass=$((deleted_this_pass + 1))
+                else
+                    SYNC_APPLY_DELETE_OK=false
+                fi
+            done < <(printf '%s\n' "$page" | tr '{' '\n' | grep -F '"domain":' || true)
+            leftover_non_keep=0
+            check_page=$("${CURL[@]}" -b "$COOKIE_JAR" \
+                "$BASE_URL/api/blocklist?search=$SYNC_APPLY_PREFIX&limit=250")
+            while IFS= read -r obj; do
+                [ -z "$obj" ] && continue
+                domain=$(printf '%s\n' "$obj" | sed -n 's/.*"domain":"\([^"]*\)".*/\1/p' | head -1)
+                [ -n "$domain" ] || continue
+                case "$domain" in
+                    sap-*.${SYNC_APPLY_PREFIX})
+                        n=${domain#sap-}
+                        n=${n%%.*}
+                        if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$SYNC_APPLY_KEEP" ] 2>/dev/null; then
+                            continue
+                        fi
+                        ;;
+                esac
+                leftover_non_keep=$((leftover_non_keep + 1))
+            done < <(printf '%s\n' "$check_page" | tr '{' '\n' | grep -F '"domain":' || true)
+            if [ "$leftover_non_keep" -eq 0 ]; then
+                break
+            fi
+            if [ "$deleted_this_pass" -eq 0 ]; then
+                SYNC_APPLY_DELETE_OK=false
+                break
+            fi
+        done
+        expected_deleted=$((SYNC_APPLY_DOMAINS - SYNC_APPLY_KEEP))
+        if [ "$SYNC_APPLY_DELETE_OK" = true ] && [ "$SYNC_APPLY_DELETED" -ge "$expected_deleted" ]; then
+            ok "$STEP" "sync-apply-master-shrink" "master deleted ${SYNC_APPLY_DELETED} (expected>=${expected_deleted})"
+        else
+            SYNC_APPLY_STATUS="shrink_failed"
+            fail "$STEP" "sync-apply-master-shrink" "delete incomplete deleted=${SYNC_APPLY_DELETED} expected>=${expected_deleted} ok=$SYNC_APPLY_DELETE_OK"
+        fi
+    else
+        skip "$STEP" "sync-apply-master-shrink" "skipped because full sync failed"
+    fi
+
+    # Wait for slave next poll to apply shrink (replace_with path).
+    step
+    if [ "$SYNC_APPLY_STATUS" = "running" ]; then
+        SYNC_APPLY_STICKY_DNS=1
+        SYNC_APPLY_KEEP_DNS_OK=0
+        for _i in $(seq 1 "$SYNC_APPLY_WAIT_ATTEMPTS"); do
+            sleep "$SYNC_APPLY_SETTLE_SECS"
+            REMOVED_DNS=$(remote_dns_a_port "$SYNC_APPLY_REMOVED_DOMAIN" "$SYNC_APPLY_SLAVE_DNS_PORT" 2>/dev/null || true)
+            KEEP_DNS2=$(remote_dns_a_port "$SYNC_APPLY_KEEP_DOMAIN" "$SYNC_APPLY_SLAVE_DNS_PORT" 2>/dev/null || true)
+            if echo "$KEEP_DNS2" | grep -Fxq "$SINKHOLE_IPV4"; then
+                SYNC_APPLY_KEEP_DNS_OK=1
+            else
+                SYNC_APPLY_KEEP_DNS_OK=0
+            fi
+            if echo "$REMOVED_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+                SYNC_APPLY_STICKY_DNS=1
+            else
+                SYNC_APPLY_STICKY_DNS=0
+            fi
+            if [ "$SYNC_APPLY_KEEP_DNS_OK" -eq 1 ] && [ "$SYNC_APPLY_STICKY_DNS" -eq 0 ]; then
+                break
+            fi
+        done
+        if [ "$SYNC_APPLY_KEEP_DNS_OK" -ne 1 ]; then
+            SYNC_APPLY_STATUS="dns_failed"
+            fail "$STEP" "sync-apply-after-shrink" "slave keep no longer sinkholed (got=${KEEP_DNS2:-empty})"
+        elif [ "$SYNC_APPLY_STICKY_DNS" -ne 0 ]; then
+            SYNC_APPLY_STATUS="sticky_dns"
+            fail "$STEP" "sync-apply-after-shrink" "slave still sinkholes removed domain (apply_domains did not replace) removed_dns=${REMOVED_DNS:-empty}"
+        else
+            SYNC_APPLY_STATUS="passed"
+            ok "$STEP" "sync-apply-after-shrink" "sticky_dns=0 keep_ok=1 slave applied shrink via replace_with path"
+        fi
+    else
+        skip "$STEP" "sync-apply-after-shrink" "skipped because master shrink failed"
+    fi
+
+    step
+    # Cleanup master domains + slave process (always).
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1 \
+        || (enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1); then
+        STRESS_CLEANUP_METHOD="sqlite"
+        stress_cleanup_blocklist "$SYNC_APPLY_PREFIX" || true
+    else
+        api_cleanup_blocklist_prefix "$SYNC_APPLY_PREFIX" 250 40 || true
+    fi
+    sync_apply_cleanup_slave
+    ok "$STEP" "sync-apply-cleanup" "removed master prefix + stopped slave"
+
+    step
+    write_sync_apply_baseline
+    if [ "$SYNC_APPLY_STATUS" = "passed" ]; then
+        ok "$STEP" "sync-apply-report" "wrote $SYNC_APPLY_BASELINE_FILE status=passed deleted=$SYNC_APPLY_DELETED sticky_dns=$SYNC_APPLY_STICKY_DNS"
+    else
+        fail "$STEP" "sync-apply-report" "wrote $SYNC_APPLY_BASELINE_FILE status=$SYNC_APPLY_STATUS sticky_dns=$SYNC_APPLY_STICKY_DNS"
+    fi
+else
+    step
+    skip "$STEP" "sync-apply" "hardcoded off (MOCK_SYNC_APPLY_BASELINE=false)"
+fi
+
 
 
 

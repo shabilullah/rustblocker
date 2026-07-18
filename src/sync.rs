@@ -601,9 +601,11 @@ fn apply_domains_inner(
     drop(conn);
 
     // Reload in-memory store only after the transaction committed.
-    let mut s = store.write();
-    s.clear();
+    // Build fresh + replace_with so arena/HashMap capacity from a larger prior
+    // snapshot is dropped (clear()+insert retains old capacity).
+    let mut fresh = DomainStore::default();
     for domain in &domains {
-        s.insert(domain);
+        fresh.insert(domain);
     }
+    store.write().replace_with(fresh);
 }
