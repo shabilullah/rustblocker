@@ -119,12 +119,18 @@
     }
 
     async function refreshDashboardStats() {
-        const stats = await fetchJson(API + '/stats?limit=10', 'Stats API');
+        const [stats, dnsConcurrency] = await Promise.all([
+            fetchJson(API + '/stats?limit=10', 'Stats API'),
+            fetchJson(API + '/dns/concurrency', 'DNS concurrency API'),
+        ]);
         updateStatNumber('stat-total-queries', stats.total_queries);
         updateStatNumber('stat-q-blocked', stats.blocked);
         updateStatNumber('stat-q-allowed', stats.allowed);
         updateStatNumber('stat-q-rewritten', stats.rewritten);
         updateStatNumber('stat-q-forwarded', stats.forwarded);
+        updateStatNumber('stat-dns-rejected', dnsConcurrency.rejected);
+        updateStatNumber('stat-dns-in-flight', dnsConcurrency.in_flight);
+        updateStatNumber('stat-dns-max-in-flight', dnsConcurrency.max_in_flight);
         updateDashboardChart(stats);
 
         const clientsDiv = document.getElementById('stats-top-clients');

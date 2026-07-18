@@ -190,6 +190,43 @@ RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB=0
 RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB=0
 RESOLVER_CACHE_BASELINE_RSS_DELTA_KB=0
 
+# DNS accept/handle concurrency limit (finding 7): always-on stress.
+# Starts an isolated side rustblocker with --dns-max-in-flight=1 and a
+# blackhole upstream. Concurrent unique queries must increment live rejected
+# counter while health stays 200.
+MOCK_DNS_CONCURRENCY_STRESS=true
+DNS_CONCURRENCY_STRESS_REQUESTS=256
+DNS_CONCURRENCY_STRESS_MAX_MS=15000
+DNS_CONCURRENCY_STRESS_MAX_FAILURES=8
+DNS_CONCURRENCY_STRESS_BASELINE_FILE="target/mock-dns-concurrency-stress-baseline.json"
+DNS_CONCURRENCY_STRESS_STATUS="not_started"
+DNS_CONCURRENCY_STRESS_NOTE=""
+DNS_CONCURRENCY_STRESS_ELAPSED_MS=0
+DNS_CONCURRENCY_STRESS_FAILURES=0
+DNS_CONCURRENCY_STRESS_OK=0
+DNS_CONCURRENCY_STRESS_RSS_BEFORE_KB=0
+DNS_CONCURRENCY_STRESS_RSS_AFTER_KB=0
+DNS_CONCURRENCY_STRESS_THREADS_AFTER=0
+DNS_CONCURRENCY_STRESS_FDS_AFTER=0
+
+# DNS flood capacity: measures deployed service on target box.
+# Ramps box-local concurrent unique queries and records last tier that keeps
+# health/resources inside gates. This estimates current box flood headroom.
+MOCK_DNS_FLOOD_CAPACITY="${MOCK_DNS_FLOOD_CAPACITY:-true}"
+DNS_FLOOD_CAPACITY_TIERS="${DNS_FLOOD_CAPACITY_TIERS:-256 512 1024 2048 4096}"
+DNS_FLOOD_CAPACITY_MAX_MS="${DNS_FLOOD_CAPACITY_MAX_MS:-30000}"
+DNS_FLOOD_CAPACITY_MIN_OK="${DNS_FLOOD_CAPACITY_MIN_OK:-256}"
+DNS_FLOOD_CAPACITY_MAX_FAILURE_PCT="${DNS_FLOOD_CAPACITY_MAX_FAILURE_PCT:-5}"
+DNS_FLOOD_CAPACITY_BASELINE_FILE="${DNS_FLOOD_CAPACITY_BASELINE_FILE:-target/mock-dns-flood-capacity-baseline.json}"
+DNS_FLOOD_CAPACITY_STATUS="not_started"
+DNS_FLOOD_CAPACITY_LAST_OK=0
+DNS_FLOOD_CAPACITY_FIRST_BAD=0
+DNS_FLOOD_CAPACITY_LAST_QPS=0
+DNS_FLOOD_CAPACITY_LAST_REJECTED_DELTA=0
+DNS_FLOOD_CAPACITY_LAST_RSS_KB=0
+DNS_FLOOD_CAPACITY_LAST_THREADS=0
+DNS_FLOOD_CAPACITY_LAST_FDS=0
+
 
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
 STRESS_INSTALL_SQLITE3="${STRESS_INSTALL_SQLITE3:-true}"
@@ -965,14 +1002,16 @@ step
 VERSION_JSON=$("${CURL[@]}" "$BASE_URL/api/version")
 DEPLOYED_BUILD=$(echo "$VERSION_JSON" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p' | head -1)
 DEPLOYED_CACHE_SIZE=$(echo "$VERSION_JSON" | sed -n 's/.*"resolver_cache_size":\([0-9][0-9]*\).*/\1/p' | head -1)
+DEPLOYED_DNS_MAX=$(echo "$VERSION_JSON" | sed -n 's/.*"dns_max_in_flight":\([0-9][0-9]*\).*/\1/p' | head -1)
 if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ] \
-    && [ "${DEPLOYED_CACHE_SIZE:-0}" = "32768" ]; then
-    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID resolver_cache_size=$DEPLOYED_CACHE_SIZE"
+    && [ "${DEPLOYED_CACHE_SIZE:-0}" = "32768" ] \
+    && [ "${DEPLOYED_DNS_MAX:-0}" = "512" ]; then
+    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX"
 elif { [ "$SKIP_BUILD" = true ] || [ "$SKIP_DEPLOY" = true ]; } && [ -n "$DEPLOYED_BUILD" ] \
-    && [ -n "$DEPLOYED_CACHE_SIZE" ]; then
-    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD resolver_cache_size=$DEPLOYED_CACHE_SIZE"
+    && [ -n "$DEPLOYED_CACHE_SIZE" ] && [ -n "$DEPLOYED_DNS_MAX" ]; then
+    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX"
 else
-    fail "$STEP" "version" "unexpected version payload build='${DEPLOYED_BUILD:-missing}' cache='${DEPLOYED_CACHE_SIZE:-missing}' (expected build=$MOCK_BUILD_ID cache=32768; response: ${VERSION_JSON:-empty})"
+    fail "$STEP" "version" "unexpected version payload build='${DEPLOYED_BUILD:-missing}' cache='${DEPLOYED_CACHE_SIZE:-missing}' dns_max='${DEPLOYED_DNS_MAX:-missing}' (expected build=$MOCK_BUILD_ID cache=32768 dns_max=512; response: ${VERSION_JSON:-empty})"
 fi
 
 # Step: DB-backed API smoke checks.
@@ -1488,6 +1527,181 @@ if [ "$BURST_CLEANUP_OK" = true ]; then
 else
     fail "$STEP" "dns-burst-cleanup" "failed to remove one or more DNS burst entries"
 fi
+
+# DNS concurrency stress (finding 7): flood concurrent forward-path queries and
+write_dns_concurrency_stress_baseline() {
+    local dir note_escaped
+    dir=$(dirname "$DNS_CONCURRENCY_STRESS_BASELINE_FILE")
+    mkdir -p "$dir"
+    note_escaped=$(printf '%s' "$DNS_CONCURRENCY_STRESS_NOTE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "$DNS_CONCURRENCY_STRESS_BASELINE_FILE" <<EOF
+{
+  "status": "$DNS_CONCURRENCY_STRESS_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "dns_max_in_flight": 1,
+  "requests": $DNS_CONCURRENCY_STRESS_REQUESTS,
+  "ok": $DNS_CONCURRENCY_STRESS_OK,
+  "overload_or_fail": $DNS_CONCURRENCY_STRESS_FAILURES,
+  "rejected_before": ${REJECTED_BEFORE:-0},
+  "rejected_after": ${REJECTED_AFTER:-0},
+  "elapsed_ms": $DNS_CONCURRENCY_STRESS_ELAPSED_MS,
+  "note": "$note_escaped",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+if enabled "$MOCK_DNS_CONCURRENCY_STRESS"; then
+    DNS_CONCURRENCY_STRESS_STATUS="running"
+    DNS_CONCURRENCY_STRESS_NOTE="side process --dns-max-in-flight=1 + blackhole upstream; one-SSH flood proves rejected rises"
+    DNS_CONC_DNS_PORT=1953
+    DNS_CONC_WEB_PORT=1954
+    DNS_CONC_DB="/tmp/rb-dns-conc-$$.db"
+    DNS_CONC_LOG="/tmp/rb-dns-conc-slave.log"
+    DNS_CONC_PID=""
+    DNS_CONC_BASE="http://${SSH_HOST}:${DNS_CONC_WEB_PORT}"
+    DNS_CONC_DOMAIN_SUFFIX="${RUN_TAG}-dns-conc.example.com"
+
+    dns_conc_stop() {
+        if [ -n "${DNS_CONC_PID:-}" ]; then
+            remote_root "kill $DNS_CONC_PID 2>/dev/null || true; sleep 1; kill -9 $DNS_CONC_PID 2>/dev/null || true" || true
+        fi
+        remote_root "pkill -f 'rustblocker.*--dns-port ${DNS_CONC_DNS_PORT}' 2>/dev/null || true; fuser -k ${DNS_CONC_DNS_PORT}/udp ${DNS_CONC_DNS_PORT}/tcp ${DNS_CONC_WEB_PORT}/tcp 2>/dev/null || true" || true
+        DNS_CONC_PID=""
+    }
+
+    dns_conc_cleanup() {
+        dns_conc_stop
+        remote_root "rm -f $(shell_quote "$DNS_CONC_DB") $(shell_quote "${DNS_CONC_DB}-wal") $(shell_quote "${DNS_CONC_DB}-shm") $(shell_quote "$DNS_CONC_LOG")" || true
+        DNS_CONC_PID=""
+    }
+
+    step
+    dns_conc_cleanup
+    SLAVE_BIN="${REMOTE_INSTALL_DIR}/${BINARY_NAME}"
+    start_dns_conc_side() {
+        remote_root "nohup $(shell_quote "$SLAVE_BIN") \
+            --db-path $(shell_quote "$DNS_CONC_DB") \
+            --dns-port ${DNS_CONC_DNS_PORT} \
+            --web-port ${DNS_CONC_WEB_PORT} \
+            --force-http \
+            --dns-max-in-flight 1 \
+            >$(shell_quote "$DNS_CONC_LOG") 2>&1 & echo \$!" 2>/dev/null || true
+    }
+
+    START_OUT=$(start_dns_conc_side)
+    DNS_CONC_PID=$(printf '%s\n' "$START_OUT" | tr -d '[:space:]' | tail -1)
+    if [ -n "$DNS_CONC_PID" ] && [ "$DNS_CONC_PID" -gt 0 ] 2>/dev/null; then
+        HEALTHY=false
+        for _i in $(seq 1 20); do
+            if curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" \
+                "${DNS_CONC_BASE}/api/health" 2>/dev/null | grep -q '200'; then
+                HEALTHY=true
+                break
+            fi
+            sleep 0.5
+        done
+        if [ "$HEALTHY" = true ]; then
+            dns_conc_stop
+            if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1 \
+                || (enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1); then
+                remote_root "sqlite3 $(shell_quote "$DNS_CONC_DB") \"DELETE FROM upstreams; INSERT INTO upstreams(address, port) VALUES('192.0.2.1', 53); UPDATE settings SET value='5' WHERE key='upstream_timeout_secs';\"" >/dev/null 2>&1 || true
+            else
+                DNS_CONCURRENCY_STRESS_STATUS="start_failed"
+                fail "$STEP" "dns-concurrency-start" "sqlite3 unavailable; cannot seed blackhole upstream"
+                dns_conc_cleanup
+            fi
+            START_OUT=$(start_dns_conc_side)
+            DNS_CONC_PID=$(printf '%s\n' "$START_OUT" | tr -d '[:space:]' | tail -1)
+            HEALTHY=false
+            for _i in $(seq 1 20); do
+                if curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" \
+                    "${DNS_CONC_BASE}/api/health" 2>/dev/null | grep -q '200'; then
+                    HEALTHY=true
+                    break
+                fi
+                sleep 0.5
+            done
+        fi
+        if [ "$HEALTHY" = true ]; then
+            METRICS=$("${CURL[@]}" "${DNS_CONC_BASE}/api/dns/concurrency" 2>/dev/null || true)
+            MAX_IF=$(printf '%s\n' "$METRICS" | json_number "max_in_flight")
+            if [ "${MAX_IF:-0}" = "1" ]; then
+                ok "$STEP" "dns-concurrency-start" "side pid=$DNS_CONC_PID max_in_flight=1 blackhole_upstream=192.0.2.1 metrics=${METRICS}"
+            else
+                DNS_CONCURRENCY_STRESS_STATUS="start_failed"
+                fail "$STEP" "dns-concurrency-start" "expected max_in_flight=1 got metrics=${METRICS:-empty}"
+                dns_conc_cleanup
+            fi
+        else
+            DNS_CONCURRENCY_STRESS_STATUS="start_failed"
+            LOG_TAIL=$(remote_root "tail -n 40 $(shell_quote "$DNS_CONC_LOG") 2>/dev/null" 2>/dev/null || true)
+            fail "$STEP" "dns-concurrency-start" "health failed pid=${DNS_CONC_PID} log=${LOG_TAIL:-empty}"
+            dns_conc_cleanup
+        fi
+    else
+        DNS_CONCURRENCY_STRESS_STATUS="start_failed"
+        fail "$STEP" "dns-concurrency-start" "failed to launch side process out=${START_OUT:-empty}"
+    fi
+
+    step
+    if [ "$DNS_CONCURRENCY_STRESS_STATUS" = "running" ]; then
+        BEFORE_JSON=$("${CURL[@]}" "${DNS_CONC_BASE}/api/dns/concurrency" 2>/dev/null || true)
+        REJECTED_BEFORE=$(printf '%s\n' "$BEFORE_JSON" | json_number "rejected")
+        REJECTED_BEFORE=${REJECTED_BEFORE:-0}
+        if remote_resource_snapshot; then
+            # Snapshot main service resources (not side); side is isolated.
+            DNS_CONCURRENCY_STRESS_RSS_BEFORE_KB="$RESOURCE_RSS_KB"
+        fi
+
+        STARTED_MS=$(now_ms)
+        BURST_OUT=$(remote_root "ok=/tmp/rb-dns-conc-ok-$$; fail=/tmp/rb-dns-conc-fail-$$; : > \$ok; : > \$fail; i=1; while [ \$i -le $DNS_CONCURRENCY_STRESS_REQUESTS ]; do (d=\"q\${i}.$DNS_CONC_DOMAIN_SUFFIX\"; if command -v dig >/dev/null 2>&1; then ans=\$(dig @127.0.0.1 -p $DNS_CONC_DNS_PORT +time=2 +tries=1 +short A \"\$d\" 2>/dev/null || true); else ans=; fi; if printf '%s\\n' \"\$ans\" | grep -Eq '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'; then echo 1 >> \$ok; else echo 1 >> \$fail; fi) & i=\$((i + 1)); done; wait; printf '%s %s\\n' \"\$(wc -l < \$ok | tr -d '[:space:]')\" \"\$(wc -l < \$fail | tr -d '[:space:]')\"; rm -f \$ok \$fail" 2>/dev/null || true)
+        DNS_CONCURRENCY_STRESS_ELAPSED_MS=$(( $(now_ms) - STARTED_MS ))
+        DNS_CONCURRENCY_STRESS_OK=$(printf '%s\n' "$BURST_OUT" | awk '{print $1}' | tail -1)
+        DNS_CONCURRENCY_STRESS_FAILURES=$(printf '%s\n' "$BURST_OUT" | awk '{print $2}' | tail -1)
+        DNS_CONCURRENCY_STRESS_FAILURES=${DNS_CONCURRENCY_STRESS_FAILURES:-0}
+        DNS_CONCURRENCY_STRESS_OK=${DNS_CONCURRENCY_STRESS_OK:-0}
+
+        AFTER_JSON=$("${CURL[@]}" "${DNS_CONC_BASE}/api/dns/concurrency" 2>/dev/null || true)
+        REJECTED_AFTER=$(printf '%s\n' "$AFTER_JSON" | json_number "rejected")
+        REJECTED_AFTER=${REJECTED_AFTER:-0}
+        IN_FLIGHT_AFTER=$(printf '%s\n' "$AFTER_JSON" | json_number "in_flight")
+        HEALTH_CODE=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "${DNS_CONC_BASE}/api/health" 2>/dev/null || true)
+
+        FAIL_DETAIL=""
+        if [ "$HEALTH_CODE" != "200" ]; then
+            FAIL_DETAIL="side health HTTP ${HEALTH_CODE:-empty}"
+        elif [ "$REJECTED_AFTER" -le "$REJECTED_BEFORE" ]; then
+            FAIL_DETAIL="rejected did not rise (before=${REJECTED_BEFORE} after=${REJECTED_AFTER} metrics=${AFTER_JSON:-empty})"
+        elif [ "$DNS_CONCURRENCY_STRESS_ELAPSED_MS" -gt "$DNS_CONCURRENCY_STRESS_MAX_MS" ]; then
+            FAIL_DETAIL="elapsed=${DNS_CONCURRENCY_STRESS_ELAPSED_MS}ms > max ${DNS_CONCURRENCY_STRESS_MAX_MS}ms"
+        fi
+
+        if [ -z "$FAIL_DETAIL" ]; then
+            DNS_CONCURRENCY_STRESS_STATUS="passed"
+            ok "$STEP" "dns-concurrency-stress" "rejected ${REJECTED_BEFORE}->${REJECTED_AFTER} ok=${DNS_CONCURRENCY_STRESS_OK} overload_or_fail=${DNS_CONCURRENCY_STRESS_FAILURES} elapsed=${DNS_CONCURRENCY_STRESS_ELAPSED_MS}ms in_flight=${IN_FLIGHT_AFTER:-?} health=200"
+        else
+            DNS_CONCURRENCY_STRESS_STATUS="failed"
+            LOG_TAIL=$(remote_root "tail -n 30 $(shell_quote "$DNS_CONC_LOG") 2>/dev/null" 2>/dev/null || true)
+            fail "$STEP" "dns-concurrency-stress" "$FAIL_DETAIL (ok=${DNS_CONCURRENCY_STRESS_OK} failish=${DNS_CONCURRENCY_STRESS_FAILURES} log=${LOG_TAIL:-empty})"
+        fi
+    else
+        skip "$STEP" "dns-concurrency-stress" "skipped because side process failed to start"
+    fi
+
+    step
+    dns_conc_cleanup
+    write_dns_concurrency_stress_baseline
+    if [ "$DNS_CONCURRENCY_STRESS_STATUS" = "passed" ]; then
+        ok "$STEP" "dns-concurrency-report" "wrote $DNS_CONCURRENCY_STRESS_BASELINE_FILE status=passed"
+    else
+        fail "$STEP" "dns-concurrency-report" "wrote $DNS_CONCURRENCY_STRESS_BASELINE_FILE status=$DNS_CONCURRENCY_STRESS_STATUS"
+    fi
+else
+    step
+    skip "$STEP" "dns-concurrency-stress" "hardcoded off (MOCK_DNS_CONCURRENCY_STRESS=false)"
+fi
+
 
 # Step: Prove DNS and API hot-reload remain responsive under concurrent queries.
 HOT_RELOAD_DOMAIN="${RUN_TAG}-hot-reload.rustblocker.test"
@@ -3040,6 +3254,106 @@ if "${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/nul
 else
     fail "$STEP" "panic-free-health" "health check failed after password round-trip, worker may have panicked"
 fi
+
+# Step: Measure current target DNS flood capacity.
+write_dns_flood_capacity_baseline() {
+    local dir
+    dir=$(dirname "$DNS_FLOOD_CAPACITY_BASELINE_FILE")
+    mkdir -p "$dir"
+    cat > "$DNS_FLOOD_CAPACITY_BASELINE_FILE" <<EOF
+{
+  "status": "$DNS_FLOOD_CAPACITY_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "tiers": "$DNS_FLOOD_CAPACITY_TIERS",
+  "last_ok_queries": $DNS_FLOOD_CAPACITY_LAST_OK,
+  "first_bad_queries": $DNS_FLOOD_CAPACITY_FIRST_BAD,
+  "last_qps": $DNS_FLOOD_CAPACITY_LAST_QPS,
+  "last_rejected_delta": $DNS_FLOOD_CAPACITY_LAST_REJECTED_DELTA,
+  "rss_kb": $DNS_FLOOD_CAPACITY_LAST_RSS_KB,
+  "threads": $DNS_FLOOD_CAPACITY_LAST_THREADS,
+  "fds": $DNS_FLOOD_CAPACITY_LAST_FDS,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+if enabled "$MOCK_DNS_FLOOD_CAPACITY"; then
+    DNS_FLOOD_CAPACITY_STATUS="running"
+    step
+    CAP_METRICS_BEFORE=$("${CURL[@]}" "$BASE_URL/api/dns/concurrency" 2>/dev/null || true)
+    CAP_REJECTED_BEFORE=$(printf '%s\n' "$CAP_METRICS_BEFORE" | json_number "rejected")
+    CAP_REJECTED_BEFORE=${CAP_REJECTED_BEFORE:-0}
+    if ! remote_root "command -v dig >/dev/null 2>&1" >/dev/null 2>&1; then
+        DNS_FLOOD_CAPACITY_STATUS="failed"
+        fail "$STEP" "dns-flood-capacity" "dig missing on target; cannot run box-local flood"
+    else
+        ok "$STEP" "dns-flood-capacity" "starting tiers=$DNS_FLOOD_CAPACITY_TIERS rejected_before=$CAP_REJECTED_BEFORE"
+    fi
+
+    for tier in $DNS_FLOOD_CAPACITY_TIERS; do
+        [ "$DNS_FLOOD_CAPACITY_STATUS" = "running" ] || break
+        step
+        CAP_PREFIX="${RUN_TAG}-cap-${tier}.example.com"
+        CAP_STARTED_MS=$(now_ms)
+        CAP_OUT=$(remote_root "ok=/tmp/rb-dns-cap-ok-$$; fail=/tmp/rb-dns-cap-fail-$$; : > \$ok; : > \$fail; i=1; while [ \$i -le $tier ]; do (d=\"q\${i}.$CAP_PREFIX\"; dig @127.0.0.1 +time=2 +tries=1 +short A \"\$d\" >/tmp/rb-dns-cap-one-$$-\$i 2>/dev/null && echo 1 >> \$ok || echo 1 >> \$fail; rm -f /tmp/rb-dns-cap-one-$$-\$i) & i=\$((i + 1)); done; wait; printf '%s %s\\n' \"\$(wc -l < \$ok | tr -d '[:space:]')\" \"\$(wc -l < \$fail | tr -d '[:space:]')\"; rm -f \$ok \$fail" 2>/dev/null || true)
+        CAP_ELAPSED_MS=$(( $(now_ms) - CAP_STARTED_MS ))
+        CAP_OK=$(printf '%s\n' "$CAP_OUT" | awk '{print $1}' | tail -1)
+        CAP_FAIL=$(printf '%s\n' "$CAP_OUT" | awk '{print $2}' | tail -1)
+        CAP_OK=${CAP_OK:-0}
+        CAP_FAIL=${CAP_FAIL:-0}
+        [ "$CAP_ELAPSED_MS" -le 0 ] && CAP_ELAPSED_MS=1
+        CAP_QPS=$(( CAP_OK * 1000 / CAP_ELAPSED_MS ))
+        CAP_HEALTH=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null || true)
+        CAP_METRICS_AFTER=$("${CURL[@]}" "$BASE_URL/api/dns/concurrency" 2>/dev/null || true)
+        CAP_REJECTED_AFTER=$(printf '%s\n' "$CAP_METRICS_AFTER" | json_number "rejected")
+        CAP_REJECTED_AFTER=${CAP_REJECTED_AFTER:-0}
+        CAP_REJECTED_DELTA=$(( CAP_REJECTED_AFTER - CAP_REJECTED_BEFORE ))
+        CAP_IN_FLIGHT=$(printf '%s\n' "$CAP_METRICS_AFTER" | json_number "in_flight")
+        CAP_IN_FLIGHT=${CAP_IN_FLIGHT:-0}
+        if remote_resource_snapshot; then
+            DNS_FLOOD_CAPACITY_LAST_RSS_KB="$RESOURCE_RSS_KB"
+            DNS_FLOOD_CAPACITY_LAST_THREADS="$RESOURCE_THREADS"
+            DNS_FLOOD_CAPACITY_LAST_FDS="$RESOURCE_FDS"
+        fi
+
+        CAP_FAIL_PCT=$(( CAP_FAIL * 100 / tier ))
+        CAP_DETAIL="tier=$tier ok=$CAP_OK fail=$CAP_FAIL fail_pct=${CAP_FAIL_PCT}% elapsed=${CAP_ELAPSED_MS}ms qps=$CAP_QPS rejected_delta=$CAP_REJECTED_DELTA in_flight=$CAP_IN_FLIGHT rss=${DNS_FLOOD_CAPACITY_LAST_RSS_KB}KB threads=${DNS_FLOOD_CAPACITY_LAST_THREADS} fds=${DNS_FLOOD_CAPACITY_LAST_FDS} health=${CAP_HEALTH:-empty}"
+        if [ "$CAP_HEALTH" = "200" ] \
+            && [ "$CAP_OK" -ge "$DNS_FLOOD_CAPACITY_MIN_OK" ] \
+            && [ "$CAP_FAIL_PCT" -le "$DNS_FLOOD_CAPACITY_MAX_FAILURE_PCT" ] \
+            && [ "$CAP_ELAPSED_MS" -le "$DNS_FLOOD_CAPACITY_MAX_MS" ] \
+            && [ "${DNS_FLOOD_CAPACITY_LAST_RSS_KB:-0}" -le "$MEMORY_RSS_MAX_KB" ] \
+            && [ "${DNS_FLOOD_CAPACITY_LAST_THREADS:-0}" -le "$PROCESS_THREADS_MAX" ] \
+            && [ "${DNS_FLOOD_CAPACITY_LAST_FDS:-0}" -le "$PROCESS_FD_MAX" ]; then
+            DNS_FLOOD_CAPACITY_LAST_OK="$tier"
+            DNS_FLOOD_CAPACITY_LAST_QPS="$CAP_QPS"
+            DNS_FLOOD_CAPACITY_LAST_REJECTED_DELTA="$CAP_REJECTED_DELTA"
+            ok "$STEP" "dns-flood-capacity" "$CAP_DETAIL"
+        else
+            DNS_FLOOD_CAPACITY_FIRST_BAD="$tier"
+            DNS_FLOOD_CAPACITY_STATUS="passed"
+            ok "$STEP" "dns-flood-capacity" "capacity ceiling reached: $CAP_DETAIL"
+            break
+        fi
+        sleep 1
+    done
+
+    step
+    if [ "$DNS_FLOOD_CAPACITY_STATUS" = "running" ]; then
+        DNS_FLOOD_CAPACITY_STATUS="passed"
+    fi
+    write_dns_flood_capacity_baseline
+    if [ "$DNS_FLOOD_CAPACITY_LAST_OK" -gt 0 ]; then
+        ok "$STEP" "dns-flood-capacity-report" "last_ok=${DNS_FLOOD_CAPACITY_LAST_OK} qps=${DNS_FLOOD_CAPACITY_LAST_QPS} first_bad=${DNS_FLOOD_CAPACITY_FIRST_BAD} wrote $DNS_FLOOD_CAPACITY_BASELINE_FILE"
+    else
+        fail "$STEP" "dns-flood-capacity-report" "no passing tier; wrote $DNS_FLOOD_CAPACITY_BASELINE_FILE"
+    fi
+else
+    step
+    skip "$STEP" "dns-flood-capacity" "disabled"
+fi
+
 # --- Summary ---
 echo ""
 if [ "$FAILED" -eq 0 ]; then

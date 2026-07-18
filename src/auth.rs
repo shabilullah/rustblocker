@@ -132,6 +132,7 @@ pub fn is_public_path(path: &str) -> bool {
         || path == "/favicon.ico"
         || path == "/api/health"
         || path == "/api/version"
+        || path == "/api/dns/concurrency"
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
         || path == "/api/auth/check"
@@ -315,12 +316,13 @@ mod tests {
     }
 
     #[test]
-    fn public_paths_are_whitelisted() {
+    fn public_paths_do_not_require_auth() {
         assert!(is_public_path("/"));
         assert!(is_public_path("/tailwind.min.css"));
         assert!(is_public_path("/tailwind.min.css?v=1"));
         assert!(is_public_path("/api/health"));
         assert!(is_public_path("/api/version"));
+        assert!(is_public_path("/api/dns/concurrency"));
         assert!(is_public_path("/api/auth/login"));
         assert!(is_public_path("/api/auth/logout"));
         assert!(is_public_path("/api/auth/check"));

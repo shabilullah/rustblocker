@@ -62,6 +62,10 @@ struct Cli {
     /// Poll interval seconds (overrides DB setting, default: 30)
     #[arg(long, value_name = "SECS")]
     sync_interval: Option<u64>,
+
+    /// Max concurrent DNS request handlers (default: 512). Excess gets SERVFAIL.
+    #[arg(long, value_name = "N")]
+    dns_max_in_flight: Option<usize>,
 }
 
 impl Cli {
@@ -291,7 +295,15 @@ async fn run_server(cli: Cli) -> Result<()> {
     let sinkhole_ipv4 = Arc::new(RwLock::new(sinkhole_ipv4_raw));
     let sinkhole_ipv6 = Arc::new(RwLock::new(sinkhole_ipv6_raw));
 
-    let handler = DnsBlockerHandler::new(
+    let dns_max_in_flight = cli
+        .dns_max_in_flight
+        .unwrap_or(rustblocker::handler::DEFAULT_DNS_MAX_IN_FLIGHT);
+    let dns_concurrency = rustblocker::handler::DnsConcurrency::new(dns_max_in_flight);
+    info!(
+        "DNS concurrency limit: max_in_flight={}",
+        dns_concurrency.max_in_flight()
+    );
+    let handler = DnsBlockerHandler::with_concurrency(
         blocklist.clone(),
         allowlist.clone(),
         rewrites.clone(),
@@ -300,6 +312,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         sinkhole_ipv6.clone(),
         shared_acl.clone(),
         query_log.clone(),
+        dns_concurrency.clone(),
     );
 
     let mut server = hickory_server::server::Server::new(handler);
@@ -331,6 +344,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         rustblocker::sync::SyncState::default(),
     ));
     let sync_state_data = actix_web::web::Data::new(sync_state.clone());
+    let dns_concurrency_data = actix_web::web::Data::new(dns_concurrency.clone());
     let activity_log = actix_web::web::Data::new(rustblocker::activity::ActivityLog::new());
     let session_secret = db::get_setting(&pool, "session_secret")
         .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
@@ -401,6 +415,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
                 .app_data(activity_log.clone())
                 .app_data(sync_state_data.clone())
+                .app_data(dns_concurrency_data.clone())
                 .configure(api::configure)
                 .route(
                     "/",

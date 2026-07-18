@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
@@ -9,12 +10,62 @@ use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use parking_lot::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::acl::SharedAcl;
 use crate::forwarder::ParallelForwarder;
 use crate::lists::{AllowlistStore, BlocklistStore, RewriteMap, normalize_domain};
 use crate::stats::{QueryAction, QueryEntry, QueryLog};
+
+/// Default max concurrent DNS request handlers (UDP+TCP combined).
+/// Caps in-flight work under flood; excess gets immediate SERVFAIL.
+pub const DEFAULT_DNS_MAX_IN_FLIGHT: usize = 512;
+
+/// Shared DNS concurrency gate + counters (handler + HTTP metrics).
+#[derive(Clone)]
+pub struct DnsConcurrency {
+    semaphore: Arc<Semaphore>,
+    max_in_flight: usize,
+    rejected: Arc<AtomicU64>,
+}
+
+impl DnsConcurrency {
+    pub fn new(max_in_flight: usize) -> Self {
+        let max_in_flight = max_in_flight.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_in_flight)),
+            max_in_flight,
+            rejected: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
+    /// Approximate in-flight handlers = max - available permits.
+    pub fn in_flight(&self) -> usize {
+        self.max_in_flight
+            .saturating_sub(self.semaphore.available_permits())
+    }
+
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    pub fn record_reject(&self) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub struct DnsBlockerHandler {
     pub blocklist: BlocklistStore,
@@ -25,6 +76,7 @@ pub struct DnsBlockerHandler {
     sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
     acl: SharedAcl,
     query_log: Arc<QueryLog>,
+    concurrency: DnsConcurrency,
 }
 
 impl DnsBlockerHandler {
@@ -39,6 +91,56 @@ impl DnsBlockerHandler {
         acl: SharedAcl,
         query_log: Arc<QueryLog>,
     ) -> Self {
+        Self::with_concurrency(
+            blocklist,
+            allowlist,
+            rewrites,
+            forwarder,
+            sinkhole_ipv4,
+            sinkhole_ipv6,
+            acl,
+            query_log,
+            DnsConcurrency::new(DEFAULT_DNS_MAX_IN_FLIGHT),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_max_in_flight(
+        blocklist: BlocklistStore,
+        allowlist: AllowlistStore,
+        rewrites: Arc<RwLock<RewriteMap>>,
+        forwarder: Arc<RwLock<ParallelForwarder>>,
+        sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
+        sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+        acl: SharedAcl,
+        query_log: Arc<QueryLog>,
+        max_in_flight: usize,
+    ) -> Self {
+        Self::with_concurrency(
+            blocklist,
+            allowlist,
+            rewrites,
+            forwarder,
+            sinkhole_ipv4,
+            sinkhole_ipv6,
+            acl,
+            query_log,
+            DnsConcurrency::new(max_in_flight),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_concurrency(
+        blocklist: BlocklistStore,
+        allowlist: AllowlistStore,
+        rewrites: Arc<RwLock<RewriteMap>>,
+        forwarder: Arc<RwLock<ParallelForwarder>>,
+        sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
+        sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+        acl: SharedAcl,
+        query_log: Arc<QueryLog>,
+        concurrency: DnsConcurrency,
+    ) -> Self {
         Self {
             blocklist,
             allowlist,
@@ -48,7 +150,24 @@ impl DnsBlockerHandler {
             sinkhole_ipv6,
             acl,
             query_log,
+            concurrency,
         }
+    }
+
+    pub fn concurrency(&self) -> &DnsConcurrency {
+        &self.concurrency
+    }
+
+    pub fn max_in_flight(&self) -> usize {
+        self.concurrency.max_in_flight()
+    }
+
+    pub fn rejected_count(&self) -> u64 {
+        self.concurrency.rejected_count()
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.concurrency.in_flight()
     }
 }
 
@@ -85,6 +204,30 @@ impl RequestHandler for DnsBlockerHandler {
         'life1: 'async_trait,
     {
         Box::pin(async move {
+            // Bound concurrent work before any heavy path (finding 7).
+            // try_acquire: under flood, reject immediately instead of queueing
+            // unbounded futures that still hold memory.
+            let _permit: OwnedSemaphorePermit = match self.concurrency.try_acquire() {
+                Some(p) => p,
+                None => {
+                    self.concurrency.record_reject();
+                    warn!(
+                        "DNS concurrency limit reached (max_in_flight={}); rejecting",
+                        self.concurrency.max_in_flight()
+                    );
+                    let builder = MessageResponseBuilder::from_message_request(request);
+                    let response = builder.error_msg(&request.metadata, ResponseCode::ServFail);
+                    let mut rh = response_handle;
+                    return match rh.send_response(response).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            warn!("failed to send overload SERVFAIL: {}", e);
+                            serve_failed(request)
+                        }
+                    };
+                }
+            };
+
             // ACL check — extract bool, drop guard, then async
             let src_ip = request.src().ip();
             let is_blocked = {
@@ -246,5 +389,90 @@ impl RequestHandler for DnsBlockerHandler {
             });
             result.info
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::Acl;
+    use crate::config::UpstreamConfig;
+    use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
+    use crate::stats::QueryLog;
+    use std::sync::atomic::AtomicU64;
+
+    fn test_handler(max_in_flight: usize) -> DnsBlockerHandler {
+        let blocklist = BlocklistStore(Arc::new(RwLock::new(DomainStore::default())));
+        let allowlist = AllowlistStore(Arc::new(RwLock::new(DomainStore::default())));
+        let rewrites = Arc::new(RwLock::new(RewriteMap::default()));
+        let forwarder = Arc::new(RwLock::new(
+            ParallelForwarder::new(
+                &[UpstreamConfig {
+                    address: "127.0.0.1".to_string(),
+                    port: Some(99),
+                }],
+                1,
+            )
+            .expect("forwarder"),
+        ));
+        let db_path = std::env::temp_dir().join(format!("rb-sem-test-{}.db", std::process::id()));
+        let pool = crate::db::create_pool(db_path.to_str().unwrap()).expect("pool");
+        crate::db::seed_defaults(&pool).expect("seed");
+        let query_log = QueryLog::new(pool, Arc::new(AtomicU64::new(30))).0;
+        DnsBlockerHandler::with_max_in_flight(
+            blocklist,
+            allowlist,
+            rewrites,
+            forwarder,
+            Arc::new(RwLock::new(Ipv4Addr::UNSPECIFIED)),
+            Arc::new(RwLock::new(Ipv6Addr::UNSPECIFIED)),
+            Arc::new(RwLock::new(Acl::default())),
+            query_log,
+            max_in_flight,
+        )
+    }
+
+    #[tokio::test]
+    async fn default_max_in_flight_is_bounded() {
+        assert_eq!(DEFAULT_DNS_MAX_IN_FLIGHT, 512);
+        let h = test_handler(DEFAULT_DNS_MAX_IN_FLIGHT);
+        assert_eq!(h.max_in_flight(), 512);
+        assert_eq!(h.in_flight(), 0);
+        assert_eq!(h.rejected_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_max_clamped_to_one() {
+        let h = test_handler(0);
+        assert_eq!(h.max_in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn semaphore_exhaustion_tracks_capacity() {
+        let h = test_handler(2);
+        let p1 = h.concurrency().try_acquire().expect("first permit");
+        assert_eq!(h.in_flight(), 1);
+        let p2 = h.concurrency().try_acquire().expect("second permit");
+        assert_eq!(h.in_flight(), 2);
+        assert!(
+            h.concurrency().try_acquire().is_none(),
+            "third must fail at capacity"
+        );
+        drop(p1);
+        assert_eq!(h.in_flight(), 1);
+        assert!(h.concurrency().try_acquire().is_some());
+        drop(p2);
+    }
+
+    #[tokio::test]
+    async fn overload_increments_rejected_when_full() {
+        let h = test_handler(1);
+        let _hold = h.concurrency().try_acquire().expect("hold sole permit");
+        assert_eq!(h.rejected_count(), 0);
+        assert!(h.concurrency().try_acquire().is_none());
+        // Mirror handle_request reject path.
+        h.concurrency().record_reject();
+        assert_eq!(h.rejected_count(), 1);
+        assert_eq!(h.in_flight(), 1);
     }
 }

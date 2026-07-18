@@ -1464,6 +1464,23 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
 }
 
+/// GET /api/dns/concurrency — live DNS in-flight semaphore metrics.
+async fn get_dns_concurrency(
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    concurrency: web::Data<crate::handler::DnsConcurrency>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "max_in_flight": concurrency.max_in_flight(),
+        "in_flight": concurrency.in_flight(),
+        "available": concurrency.available_permits(),
+        "rejected": concurrency.rejected_count(),
+    }))
+}
+
 // --- Update ---
 
 /// GET /api/version — public, no ACL check.
@@ -1473,6 +1490,7 @@ async fn get_version() -> impl Responder {
         "build": update::build_id(),
         "target": env!("TARGET_TRIPLE"),
         "resolver_cache_size": crate::forwarder::ParallelForwarder::DEFAULT_CACHE_SIZE,
+        "dns_max_in_flight": crate::handler::DEFAULT_DNS_MAX_IN_FLIGHT,
     }))
 }
 
@@ -1725,6 +1743,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/api")
             .route("/health", web::get().to(health))
             .route("/version", web::get().to(get_version))
+            .route("/dns/concurrency", web::get().to(get_dns_concurrency))
             .route("/auth/check", web::get().to(auth_check))
             .route("/auth/login", web::post().to(login))
             .route("/auth/logout", web::post().to(logout))

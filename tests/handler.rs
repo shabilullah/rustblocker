@@ -34,6 +34,21 @@ async fn query(
     )
 }
 
+#[tokio::test]
+async fn overload_returns_servfail_and_increments_rejected() {
+    let (handler, _) = make_handler(&[], &[], &[]);
+    let mut permits = Vec::new();
+    for _ in 0..handler.max_in_flight() {
+        permits.push(handler.concurrency().try_acquire().expect("permit"));
+    }
+    let before = handler.rejected_count();
+    let (rcode, answers, _) = query(&handler, "overload.example", RecordType::A).await;
+    assert_eq!(rcode, ResponseCode::ServFail);
+    assert_eq!(answers, 0);
+    assert_eq!(handler.rejected_count(), before + 1);
+    drop(permits);
+}
+
 // --- Blocklist: exact match ---
 
 #[tokio::test]
