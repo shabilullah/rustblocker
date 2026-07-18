@@ -2261,8 +2261,6 @@ if enabled "$MOCK_SYNC_APPLY_BASELINE"; then
     SYNC_APPLY_SLAVE_DB="/tmp/rb-sync-apply-$$.db"
     SYNC_APPLY_SLAVE_LOG="/tmp/rb-sync-apply-slave.log"
     SYNC_APPLY_MASTER_URL="http://127.0.0.1:${WEB_PORT}"
-    SYNC_APPLY_SLAVE_BASE="http://${SSH_HOST}:${SYNC_APPLY_SLAVE_WEB_PORT}"
-    SYNC_APPLY_SLAVE_COOKIE=""
 
     if [ "$SYNC_APPLY_KEEP" -ge "$SYNC_APPLY_DOMAINS" ]; then
         step
