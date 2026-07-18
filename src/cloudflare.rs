@@ -79,21 +79,21 @@ impl CloudflareClient {
             .context("failed to query Cloudflare zones")?;
 
         let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
             anyhow::bail!("Cloudflare API error ({}): {}", status, body);
         }
 
-        let zone_list: ZoneListResponse = response
-            .json()
-            .await
-            .context("failed to parse zone list response")?;
+        let zone_list: ZoneListResponse =
+            serde_json::from_str(&body).context("failed to parse zone list response")?;
 
-        if !zone_list.success || zone_list.result.is_empty() {
-            anyhow::bail!("zone not found for domain: {}", domain);
+        if !zone_list.success {
+            anyhow::bail!("Cloudflare zone lookup failed (success=false): {body}");
         }
-
-        Ok(zone_list.result[0].id.clone())
+        match zone_list.result.first() {
+            Some(zone) => Ok(zone.id.clone()),
+            None => anyhow::bail!("zone not found for domain: {}", domain),
+        }
     }
 
     /// Create a TXT record for ACME DNS-01 challenge.

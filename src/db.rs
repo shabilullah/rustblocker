@@ -1,3 +1,30 @@
+/// Error type for database operations — covers both pool exhaustion and SQL failures.
+/// Used by all `pub fn` in this module so callers can map to HTTP 500 instead of panicking.
+#[derive(Debug)]
+pub enum DbError {
+    Pool(r2d2::Error),
+    Sql(rusqlite::Error),
+}
+impl From<r2d2::Error> for DbError {
+    fn from(e: r2d2::Error) -> Self {
+        DbError::Pool(e)
+    }
+}
+impl From<rusqlite::Error> for DbError {
+    fn from(e: rusqlite::Error) -> Self {
+        DbError::Sql(e)
+    }
+}
+impl std::fmt::Display for DbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbError::Pool(e) => write!(f, "database pool error: {e}"),
+            DbError::Sql(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+impl std::error::Error for DbError {}
+
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
@@ -21,25 +48,23 @@ pub struct SourceRefreshResult {
     pub store: DomainStore,
 }
 
-pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, r2d2::Error> {
+pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, DbError> {
     let path = db_path.as_ref();
     let manager = SqliteConnectionManager::file(path);
     let pool = Pool::new(manager)?;
     {
-        let conn = pool.get().expect("failed to get DB connection");
-        init_schema(&conn);
+        let conn = pool.get()?;
+        init_schema(&conn)?;
     }
     info!("SQLite database ready: {}", path.display());
     Ok(pool)
 }
 
-fn init_schema(conn: &rusqlite::Connection) {
+fn init_schema(conn: &rusqlite::Connection) -> Result<(), DbError> {
     // Use WAL mode so writes never block reads (critical for live stats during imports).
-    conn.execute_batch("PRAGMA journal_mode = WAL;")
-        .expect("failed to set WAL mode");
+    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
     // Let SQLite retry for up to 5s instead of immediately returning SQLITE_BUSY.
-    conn.execute_batch("PRAGMA busy_timeout = 5000;")
-        .expect("failed to set busy_timeout");
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -98,8 +123,7 @@ fn init_schema(conn: &rusqlite::Connection) {
         CREATE INDEX IF NOT EXISTS idx_query_log_domain ON query_log(domain);
         CREATE INDEX IF NOT EXISTS idx_query_log_action_domain ON query_log(action, domain);
         CREATE INDEX IF NOT EXISTS idx_query_log_resolver ON query_log(resolver);",
-    )
-    .expect("failed to init schema");
+    )?;
     // Migration: add columns that may be missing in databases created by older versions.
     // CREATE TABLE IF NOT EXISTS won't alter existing tables, so we do it explicitly.
     let _ = conn.execute("ALTER TABLE query_log ADD COLUMN resolver TEXT", []);
@@ -118,18 +142,19 @@ fn init_schema(conn: &rusqlite::Connection) {
             PRIMARY KEY (list_type, domain)
         );",
     );
+    Ok(())
 }
 
 /// Seed the database with sensible defaults (only if tables are empty).
-pub fn seed_defaults(pool: &DbPool) {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn seed_defaults(pool: &DbPool) -> Result<(), DbError> {
+    let conn = pool.get()?;
 
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
         .unwrap_or(0);
     if count > 0 {
         info!("Database already seeded");
-        return;
+        return Ok(());
     }
 
     info!("Seeding database with default settings...");
@@ -160,6 +185,7 @@ pub fn seed_defaults(pool: &DbPool) {
     .ok();
 
     info!("Database seeded with defaults (1 upstream: 8.8.8.8:53)");
+    Ok(())
 }
 
 /// Fetch content from a URL or read from a local file path.
@@ -187,7 +213,9 @@ pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize
     let pool = pool.clone();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        bulk_import_domains_with_entries(&pool, &table, &content).inserted
+        bulk_import_domains_with_entries(&pool, &table, &content)
+            .map(|r| r.inserted)
+            .unwrap_or(0)
     })
     .await
     .unwrap_or(0)
@@ -251,12 +279,11 @@ fn insert_domains_from_content(
 
 // --- Settings ---
 
-pub fn get_settings(pool: &DbPool) -> serde_json::Value {
-    let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn.prepare("SELECT key, value FROM settings").unwrap();
+pub fn get_settings(pool: &DbPool) -> Result<serde_json::Value, DbError> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
         .collect();
 
@@ -273,26 +300,25 @@ pub fn get_settings(pool: &DbPool) -> serde_json::Value {
         };
         map.insert(key, serde_json::Value::String(value));
     }
-    serde_json::Value::Object(map)
+    Ok(serde_json::Value::Object(map))
 }
 
-pub fn set_setting(pool: &DbPool, key: &str, value: &str) {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), DbError> {
+    let conn = pool.get()?;
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
         params![key, value],
-    )
-    .ok();
+    )?;
+    Ok(())
 }
 
 pub fn get_password_hash(pool: &DbPool) -> Option<String> {
     get_setting(pool, "admin_password_hash")
 }
 
-pub fn set_password_hash(pool: &DbPool, hash: &str) {
-    set_setting(pool, "admin_password_hash", hash);
+pub fn set_password_hash(pool: &DbPool, hash: &str) -> Result<(), DbError> {
+    set_setting(pool, "admin_password_hash", hash)
 }
-
 pub fn get_setting(pool: &DbPool, key: &str) -> Option<String> {
     let conn = pool.get().ok()?;
     conn.query_row(
@@ -373,7 +399,7 @@ pub fn get_certificate_status(pool: &DbPool, domain: &str) -> Option<serde_json:
         Ok((issued_at, expires_at, last_renewed)) => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs() as i64;
             let days_remaining = (expires_at - now) / 86400;
 
@@ -401,41 +427,34 @@ pub struct DbUpstream {
     pub port: i64,
 }
 
-pub fn get_upstreams(pool: &DbPool) -> Vec<DbUpstream> {
-    let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn
-        .prepare("SELECT id, address, port FROM upstreams ORDER BY id")
-        .unwrap();
-    stmt.query_map([], |row| {
-        Ok(DbUpstream {
-            id: row.get(0)?,
-            address: row.get(1)?,
-            port: row.get(2)?,
-        })
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect()
+pub fn get_upstreams(pool: &DbPool) -> Result<Vec<DbUpstream>, DbError> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT id, address, port FROM upstreams ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(DbUpstream {
+                id: row.get(0)?,
+                address: row.get(1)?,
+                port: row.get(2)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
 }
-
-pub fn add_upstream(pool: &DbPool, address: &str, port: i64) -> i64 {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn add_upstream(pool: &DbPool, address: &str, port: i64) -> Result<i64, DbError> {
+    let conn = pool.get()?;
     conn.execute(
         "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
         params![address, port],
-    )
-    .ok();
-    conn.last_insert_rowid()
+    )?;
+    Ok(conn.last_insert_rowid())
 }
-
-pub fn delete_upstream(pool: &DbPool, id: i64) -> bool {
-    let conn = pool.get().expect("failed to get DB connection");
-    let rows = conn
-        .execute("DELETE FROM upstreams WHERE id = ?1", params![id])
-        .unwrap();
-    rows > 0
+pub fn delete_upstream(pool: &DbPool, id: i64) -> Result<bool, DbError> {
+    let conn = pool.get()?;
+    let rows = conn.execute("DELETE FROM upstreams WHERE id = ?1", params![id])?;
+    Ok(rows > 0)
 }
-
 // --- Domains (blocklist / allowlist) ---
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -444,25 +463,26 @@ pub struct DbDomain {
     pub domain: String,
 }
 
-pub fn get_domains(pool: &DbPool, table: &str) -> Vec<DbDomain> {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn get_domains(pool: &DbPool, table: &str) -> Result<Vec<DbDomain>, DbError> {
+    let conn = pool.get()?;
     let sql = format!("SELECT id, domain FROM {} ORDER BY domain", table);
-    let mut stmt = conn.prepare(&sql).unwrap();
-    stmt.query_map([], |row| {
-        Ok(DbDomain {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-        })
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect()
+    let mut stmt = conn.prepare(&sql)?;
+    let v = stmt
+        .query_map([], |row| {
+            Ok(DbDomain {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }
 
-pub fn count_domains(pool: &DbPool, table: &str) -> i64 {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn count_domains(pool: &DbPool, table: &str) -> Result<i64, DbError> {
+    let conn = pool.get()?;
     let sql = format!("SELECT COUNT(*) FROM {}", table);
-    conn.query_row(&sql, [], |row| row.get(0)).unwrap_or(0)
+    Ok(conn.query_row(&sql, [], |row| row.get(0))?)
 }
 
 pub fn search_domains(
@@ -471,50 +491,49 @@ pub fn search_domains(
     search: &str,
     limit: i64,
     offset: i64,
-) -> Vec<DbDomain> {
-    let conn = pool.get().expect("failed to get DB connection");
+) -> Result<Vec<DbDomain>, DbError> {
+    let conn = pool.get()?;
     if search.is_empty() {
         let sql = format!(
             "SELECT id, domain FROM {} ORDER BY domain LIMIT ?1 OFFSET ?2",
             table
         );
-        let mut stmt = conn.prepare(&sql).unwrap();
-        stmt.query_map(rusqlite::params![limit, offset], |row| {
-            Ok(DbDomain {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
-    } else {
-        let sql = format!(
-            "SELECT id, domain FROM {} WHERE domain LIKE ?1 ORDER BY domain LIMIT ?2 OFFSET ?3",
-            table
-        );
-        let pattern = format!("%{}%", search);
-        let mut stmt = conn.prepare(&sql).unwrap();
-        stmt.query_map(rusqlite::params![pattern, limit, offset], |row| {
-            Ok(DbDomain {
-                id: row.get(0)?,
-                domain: row.get(1)?,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
+        let mut stmt = conn.prepare(&sql)?;
+        let v = stmt
+            .query_map(rusqlite::params![limit, offset], |row| {
+                Ok(DbDomain {
+                    id: row.get(0)?,
+                    domain: row.get(1)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        return Ok(v);
     }
+    let sql = format!(
+        "SELECT id, domain FROM {} WHERE domain LIKE ?1 ORDER BY domain LIMIT ?2 OFFSET ?3",
+        table
+    );
+    let pattern = format!("%{}%", search);
+    let mut stmt = conn.prepare(&sql)?;
+    let v = stmt
+        .query_map(rusqlite::params![pattern, limit, offset], |row| {
+            Ok(DbDomain {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }
 
-pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> Result<i64, DbError> {
+    let conn = pool.get()?;
     let normalized = domain.to_lowercase();
     let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
-    conn.execute(&sql, params![normalized]).ok();
-    // Resolve the real domain row id. Do not use last_insert_rowid() after the
-    // manual_domains insert — that would return the wrong table's rowid.
+    conn.execute(&sql, params![normalized])?;
     let id: i64 = conn
         .query_row(
             &format!("SELECT id FROM {} WHERE domain = ?1", table),
@@ -522,6 +541,7 @@ pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
             |row| row.get(0),
         )
         .unwrap_or(0);
+    // do NOT bump last_insert_rowid via a manual_domains insert; resolve via SELECT only.
     let list_type = match table {
         "allowlist_domains" => "allowlist",
         _ => "blocklist",
@@ -530,7 +550,7 @@ pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> i64 {
         "INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)",
         params![list_type, normalized],
     );
-    id
+    Ok(id)
 }
 
 pub fn get_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<DbDomain> {
@@ -545,11 +565,11 @@ pub fn get_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<DbDomain>
     .ok()
 }
 
-pub fn delete_domain(pool: &DbPool, table: &str, id: i64) -> bool {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn delete_domain(pool: &DbPool, table: &str, id: i64) -> Result<bool, DbError> {
+    let conn = pool.get()?;
     let sql = format!("DELETE FROM {} WHERE id = ?1", table);
-    let rows = conn.execute(&sql, params![id]).unwrap();
-    rows > 0
+    let rows = conn.execute(&sql, params![id])?;
+    Ok(rows > 0)
 }
 
 pub fn delete_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<String> {
@@ -576,15 +596,17 @@ pub fn delete_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<String
 }
 
 pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
-    bulk_import_domains_with_entries(pool, table, content).inserted
+    bulk_import_domains_with_entries(pool, table, content)
+        .map(|r| r.inserted)
+        .unwrap_or(0)
 }
 
 pub fn bulk_import_domains_with_entries(
     pool: &DbPool,
     table: &str,
     content: &str,
-) -> DomainImportResult {
-    let conn = pool.get().expect("failed to get DB connection");
+) -> Result<DomainImportResult, DbError> {
+    let conn = pool.get()?;
     let before: i64 = conn
         .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
             row.get(0)
@@ -596,10 +618,10 @@ pub fn bulk_import_domains_with_entries(
             row.get(0)
         })
         .unwrap_or(0);
-    DomainImportResult {
+    Ok(DomainImportResult {
         inserted: (after - before) as usize,
         store,
-    }
+    })
 }
 
 // --- Rewrites ---
@@ -612,22 +634,21 @@ pub struct DbRewrite {
     pub ipv6: Option<String>,
 }
 
-pub fn get_rewrites(pool: &DbPool) -> Vec<DbRewrite> {
-    let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn
-        .prepare("SELECT id, domain, ipv4, ipv6 FROM rewrites ORDER BY domain")
-        .unwrap();
-    stmt.query_map([], |row| {
-        Ok(DbRewrite {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            ipv4: row.get(2)?,
-            ipv6: row.get(3)?,
-        })
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect()
+pub fn get_rewrites(pool: &DbPool) -> Result<Vec<DbRewrite>, DbError> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT id, domain, ipv4, ipv6 FROM rewrites ORDER BY domain")?;
+    let v = stmt
+        .query_map([], |row| {
+            Ok(DbRewrite {
+                id: row.get(0)?,
+                domain: row.get(1)?,
+                ipv4: row.get(2)?,
+                ipv6: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }
 
 pub fn get_rewrite_by_id(pool: &DbPool, id: i64) -> Option<DbRewrite> {
@@ -647,24 +668,26 @@ pub fn get_rewrite_by_id(pool: &DbPool, id: i64) -> Option<DbRewrite> {
     .ok()
 }
 
-pub fn add_rewrite(pool: &DbPool, domain: &str, ipv4: Option<&str>, ipv6: Option<&str>) -> i64 {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn add_rewrite(
+    pool: &DbPool,
+    domain: &str,
+    ipv4: Option<&str>,
+    ipv6: Option<&str>,
+) -> Result<i64, DbError> {
+    let conn = pool.get()?;
     let normalized = domain.to_lowercase();
     let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
     conn.execute(
         "INSERT OR IGNORE INTO rewrites (domain, ipv4, ipv6) VALUES (?1, ?2, ?3)",
         params![normalized, ipv4, ipv6],
-    )
-    .ok();
-    conn.last_insert_rowid()
+    )?;
+    Ok(conn.last_insert_rowid())
 }
 
-pub fn delete_rewrite(pool: &DbPool, id: i64) -> bool {
-    let conn = pool.get().expect("failed to get DB connection");
-    let rows = conn
-        .execute("DELETE FROM rewrites WHERE id = ?1", params![id])
-        .unwrap();
-    rows > 0
+pub fn delete_rewrite(pool: &DbPool, id: i64) -> Result<bool, DbError> {
+    let conn = pool.get()?;
+    let rows = conn.execute("DELETE FROM rewrites WHERE id = ?1", params![id])?;
+    Ok(rows > 0)
 }
 
 pub fn delete_rewrite_by_id(pool: &DbPool, id: i64) -> Option<DbRewrite> {
@@ -722,41 +745,45 @@ pub fn get_source_by_id(pool: &DbPool, id: i64) -> Option<DbSource> {
     .ok()
 }
 
-pub fn get_sources(pool: &DbPool) -> Vec<DbSource> {
-    let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn
-        .prepare("SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status FROM sources ORDER BY id")
-        .unwrap();
-    stmt.query_map([], |row| {
-        Ok(DbSource {
-            id: row.get(0)?,
-            url: row.get(1)?,
-            list_type: row.get(2)?,
-            enabled: row.get::<_, i64>(3)? != 0,
-            update_interval_hours: row.get(4)?,
-            last_updated: row.get(5)?,
-            last_status: row.get(6)?,
-        })
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect()
+pub fn get_sources(pool: &DbPool) -> Result<Vec<DbSource>, DbError> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare("SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status FROM sources ORDER BY id")?;
+    let v = stmt
+        .query_map([], |row| {
+            Ok(DbSource {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                list_type: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
+                update_interval_hours: row.get(4)?,
+                last_updated: row.get(5)?,
+                last_status: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }
 
-pub fn add_source(pool: &DbPool, url: &str, list_type: &str, interval_hours: i64) -> i64 {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn add_source(
+    pool: &DbPool,
+    url: &str,
+    list_type: &str,
+    interval_hours: i64,
+) -> Result<i64, DbError> {
+    let conn = pool.get()?;
     conn.execute(
         "INSERT OR IGNORE INTO sources (url, list_type, enabled, update_interval_hours) VALUES (?1, ?2, 1, ?3)",
         params![url, list_type, interval_hours],
-    )
-    .ok();
-    // INSERT OR IGNORE does not update last_insert_rowid when the URL already exists.
-    conn.query_row(
-        "SELECT id FROM sources WHERE url = ?1",
-        params![url],
-        |row| row.get(0),
-    )
-    .unwrap_or(0)
+    )?;
+    let id = conn
+        .query_row(
+            "SELECT id FROM sources WHERE url = ?1",
+            params![url],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    Ok(id)
 }
 
 pub fn delete_source(pool: &DbPool, id: i64) -> bool {
@@ -851,42 +878,41 @@ pub fn delete_source_with_cleanup(pool: &DbPool, id: i64) -> Option<(String, Dom
     Some((list_type, load_domain_store_from_conn(&conn, table)))
 }
 
-pub fn update_source_status(pool: &DbPool, id: i64, status: &str) {
-    let conn = pool.get().expect("failed to get DB connection");
+pub fn update_source_status(pool: &DbPool, id: i64, status: &str) -> Result<(), DbError> {
+    let conn = pool.get()?;
     conn.execute(
         "UPDATE sources SET last_updated = datetime('now'), last_status = ?1 WHERE id = ?2",
         params![status, id],
-    )
-    .ok();
+    )?;
+    Ok(())
 }
 
-pub fn get_stale_sources(pool: &DbPool) -> Vec<DbSource> {
-    let conn = pool.get().expect("failed to get DB connection");
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status
-             FROM sources
-             WHERE enabled = 1 AND (
-                 last_updated IS NULL
-                 OR datetime(last_updated, '+' || update_interval_hours || ' hours') <= datetime('now')
-             )
-             ORDER BY id",
-        )
-        .unwrap();
-    stmt.query_map([], |row| {
-        Ok(DbSource {
-            id: row.get(0)?,
-            url: row.get(1)?,
-            list_type: row.get(2)?,
-            enabled: row.get::<_, i64>(3)? != 0,
-            update_interval_hours: row.get(4)?,
-            last_updated: row.get(5)?,
-            last_status: row.get(6)?,
-        })
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect()
+pub fn get_stale_sources(pool: &DbPool) -> Result<Vec<DbSource>, DbError> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, url, list_type, enabled, update_interval_hours, last_updated, last_status
+         FROM sources
+         WHERE enabled = 1 AND (
+             last_updated IS NULL
+             OR datetime(last_updated, '+' || update_interval_hours || ' hours') <= datetime('now')
+         )
+         ORDER BY id",
+    )?;
+    let v = stmt
+        .query_map([], |row| {
+            Ok(DbSource {
+                id: row.get(0)?,
+                url: row.get(1)?,
+                list_type: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
+                update_interval_hours: row.get(4)?,
+                last_updated: row.get(5)?,
+                last_status: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(v)
 }
 
 /// Replace one source's domain set, prune unreferenced domains, and rebuild the
@@ -1036,7 +1062,7 @@ pub async fn refresh_source(
         let status_for_db = status.clone();
         let source_id = source.id;
         let _ = tokio::task::spawn_blocking(move || {
-            update_source_status(&pool, source_id, &status_for_db);
+            let _ = update_source_status(&pool, source_id, &status_for_db);
         })
         .await;
         return status;
@@ -1058,7 +1084,7 @@ pub async fn refresh_source(
             let status_for_db = status.clone();
             let source_id = source.id;
             let _ = tokio::task::spawn_blocking(move || {
-                update_source_status(&pool, source_id, &status_for_db);
+                let _ = update_source_status(&pool, source_id, &status_for_db);
             })
             .await;
             return status;
@@ -1069,7 +1095,7 @@ pub async fn refresh_source(
             let status_for_db = status.clone();
             let source_id = source.id;
             let _ = tokio::task::spawn_blocking(move || {
-                update_source_status(&pool, source_id, &status_for_db);
+                let _ = update_source_status(&pool, source_id, &status_for_db);
             })
             .await;
             return status;
@@ -1095,24 +1121,22 @@ pub async fn refresh_source(
 /// detect what changed without fetching full payloads every poll cycle.
 ///
 /// Returns a map of category name → hex-encoded SHA-256 digest.
-pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String> {
+pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, String>, DbError> {
     use sha2::{Digest, Sha256};
 
-    let conn = pool.get().expect("failed to get DB connection");
+    let conn = pool.get()?;
     let mut map = std::collections::HashMap::new();
 
     // settings — sorted key=value pairs, excluding auth secrets
     {
         let mut stmt = conn
-            .prepare("SELECT key, value FROM settings WHERE key != 'admin_password_hash' AND key != 'session_secret' ORDER BY key")
-            .unwrap();
+            .prepare("SELECT key, value FROM settings WHERE key != 'admin_password_hash' AND key != 'session_secret' ORDER BY key")?;
         let pairs: Vec<String> = stmt
             .query_map([], |row| {
                 let k: String = row.get(0)?;
                 let v: String = row.get(1)?;
                 Ok(format!("{}={}", k, v))
-            })
-            .unwrap()
+            })?
             .filter_map(|r| r.ok())
             .collect();
         let mut h = Sha256::new();
@@ -1125,16 +1149,14 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
 
     // upstreams — sorted address:port
     {
-        let mut stmt = conn
-            .prepare("SELECT address, port FROM upstreams ORDER BY address, port")
-            .unwrap();
+        let mut stmt =
+            conn.prepare("SELECT address, port FROM upstreams ORDER BY address, port")?;
         let rows: Vec<String> = stmt
             .query_map([], |row| {
                 let a: String = row.get(0)?;
                 let p: i64 = row.get(1)?;
                 Ok(format!("{}:{}", a, p))
-            })
-            .unwrap()
+            })?
             .filter_map(|r| r.ok())
             .collect();
         let mut h = Sha256::new();
@@ -1147,9 +1169,7 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
 
     // rewrites — sorted domain
     {
-        let mut stmt = conn
-            .prepare("SELECT domain, ipv4, ipv6 FROM rewrites ORDER BY domain")
-            .unwrap();
+        let mut stmt = conn.prepare("SELECT domain, ipv4, ipv6 FROM rewrites ORDER BY domain")?;
         let rows: Vec<String> = stmt
             .query_map([], |row| {
                 let d: String = row.get(0)?;
@@ -1161,8 +1181,7 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
                     v4.as_deref().unwrap_or(""),
                     v6.as_deref().unwrap_or("")
                 ))
-            })
-            .unwrap()
+            })?
             .filter_map(|r| r.ok())
             .collect();
         let mut h = Sha256::new();
@@ -1175,11 +1194,9 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
 
     // sources — sorted url
     {
-        let mut stmt = conn
-            .prepare(
-                "SELECT url, list_type, enabled, update_interval_hours FROM sources ORDER BY url",
-            )
-            .unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT url, list_type, enabled, update_interval_hours FROM sources ORDER BY url",
+        )?;
         let rows: Vec<String> = stmt
             .query_map([], |row| {
                 let url: String = row.get(0)?;
@@ -1187,8 +1204,7 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
                 let en: i64 = row.get(2)?;
                 let ih: i64 = row.get(3)?;
                 Ok(format!("{}|{}|{}|{}", url, lt, en, ih))
-            })
-            .unwrap()
+            })?
             .filter_map(|r| r.ok())
             .collect();
         let mut h = Sha256::new();
@@ -1202,61 +1218,65 @@ pub fn sync_manifest(pool: &DbPool) -> std::collections::HashMap<String, String>
     // blocklist — sorted domain
     {
         let mut h = Sha256::new();
-        let mut stmt = conn
-            .prepare("SELECT domain FROM blocklist_domains ORDER BY domain")
-            .unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
+        let mut stmt = conn.prepare("SELECT domain FROM blocklist_domains ORDER BY domain")?;
+        let v: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
-            .for_each(|d| {
-                h.update(d.as_bytes());
-                h.update(b"\n");
-            });
+            .collect();
+        for d in &v {
+            h.update(d.as_bytes());
+            h.update(b"\n");
+        }
         map.insert("blocklist".to_string(), format!("{:x}", h.finalize()));
     }
 
     // allowlist — sorted domain
     {
         let mut h = Sha256::new();
-        let mut stmt = conn
-            .prepare("SELECT domain FROM allowlist_domains ORDER BY domain")
-            .unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
+        let mut stmt = conn.prepare("SELECT domain FROM allowlist_domains ORDER BY domain")?;
+        let v: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
-            .for_each(|d| {
-                h.update(d.as_bytes());
-                h.update(b"\n");
-            });
+            .collect();
+        for d in &v {
+            h.update(d.as_bytes());
+            h.update(b"\n");
+        }
         map.insert("allowlist".to_string(), format!("{:x}", h.finalize()));
     }
 
-    map
+    Ok(map)
 }
 
 /// Return a full snapshot of a single sync category as JSON.
 /// Used by the slave to fetch only categories whose hash changed.
-pub fn sync_snapshot(pool: &DbPool, category: &str) -> Option<serde_json::Value> {
+pub fn sync_snapshot(pool: &DbPool, category: &str) -> Result<Option<serde_json::Value>, DbError> {
     match category {
-        "settings" => Some(get_settings(pool)),
-        "upstreams" => Some(serde_json::to_value(get_upstreams(pool)).unwrap_or_default()),
-        "rewrites" => Some(serde_json::to_value(get_rewrites(pool)).unwrap_or_default()),
-        "sources" => Some(serde_json::to_value(get_sources(pool)).unwrap_or_default()),
+        "settings" => Ok(Some(get_settings(pool)?)),
+        "upstreams" => Ok(Some(
+            serde_json::to_value(get_upstreams(pool)?).unwrap_or_default(),
+        )),
+        "rewrites" => Ok(Some(
+            serde_json::to_value(get_rewrites(pool)?).unwrap_or_default(),
+        )),
+        "sources" => Ok(Some(
+            serde_json::to_value(get_sources(pool)?).unwrap_or_default(),
+        )),
         "blocklist" => {
-            let domains: Vec<String> = get_domains(pool, "blocklist_domains")
+            let domains: Vec<String> = get_domains(pool, "blocklist_domains")?
                 .into_iter()
                 .map(|d| d.domain)
                 .collect();
-            Some(serde_json::to_value(domains).unwrap_or_default())
+            Ok(Some(serde_json::to_value(domains).unwrap_or_default()))
         }
         "allowlist" => {
-            let domains: Vec<String> = get_domains(pool, "allowlist_domains")
+            let domains: Vec<String> = get_domains(pool, "allowlist_domains")?
                 .into_iter()
                 .map(|d| d.domain)
                 .collect();
-            Some(serde_json::to_value(domains).unwrap_or_default())
+            Ok(Some(serde_json::to_value(domains).unwrap_or_default()))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1281,7 +1301,7 @@ mod tests {
     #[test]
     fn delete_domain_by_id_returns_deleted_domain() {
         let pool = test_pool();
-        let id = add_domain(&pool, "blocklist_domains", "Delete-Me.Example.");
+        let id = add_domain(&pool, "blocklist_domains", "Delete-Me.Example.").unwrap();
 
         let deleted = delete_domain_by_id(&pool, "blocklist_domains", id);
 
@@ -1293,7 +1313,7 @@ mod tests {
     #[test]
     fn source_refresh_removes_domains_no_longer_in_source() {
         let pool = test_pool();
-        let id = add_source(&pool, "memory://sticky-source", "blocklist", 24);
+        let id = add_source(&pool, "memory://sticky-source", "blocklist", 24).unwrap();
 
         let full = "0.0.0.0 keep.example.com\n0.0.0.0 drop.example.com\n";
         let (full_count, full_store) =
@@ -1313,7 +1333,7 @@ mod tests {
         );
 
         // DB must also drop the unreferenced domain.
-        let domains = get_domains(&pool, "blocklist_domains");
+        let domains = get_domains(&pool, "blocklist_domains").unwrap_or_default();
         let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
         assert!(names.iter().any(|d| d == "keep.example.com"));
         assert!(!names.iter().any(|d| d == "drop.example.com"));
@@ -1323,7 +1343,7 @@ mod tests {
     fn source_refresh_preserves_manual_domains() {
         let pool = test_pool();
         let _manual_id = add_domain(&pool, "blocklist_domains", "manual.example.com");
-        let id = add_source(&pool, "memory://manual-overlap", "blocklist", 24);
+        let id = add_source(&pool, "memory://manual-overlap", "blocklist", 24).unwrap();
         replace_source_domains(
             &pool,
             id,
@@ -1343,7 +1363,7 @@ mod tests {
         // Source-only domain remains; manual domain must remain even though source dropped it.
         assert!(store.matches("source-only.example.com"));
         assert!(store.matches("manual.example.com"));
-        let domains = get_domains(&pool, "blocklist_domains");
+        let domains = get_domains(&pool, "blocklist_domains").unwrap_or_default();
         let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
         assert!(names.iter().any(|d| d == "manual.example.com"));
     }
@@ -1351,7 +1371,7 @@ mod tests {
     #[test]
     fn source_delete_prunes_owned_domains() {
         let pool = test_pool();
-        let id = add_source(&pool, "memory://delete-source", "blocklist", 24);
+        let id = add_source(&pool, "memory://delete-source", "blocklist", 24).unwrap();
         replace_source_domains(
             &pool,
             id,
@@ -1363,13 +1383,16 @@ mod tests {
         let (list_type, rebuilt) = delete_source_with_cleanup(&pool, id).expect("source deleted");
         assert_eq!(list_type, "blocklist");
         assert!(!rebuilt.matches("only-from-source.example.com"));
-        assert_eq!(count_domains(&pool, "blocklist_domains"), 0);
+        assert_eq!(
+            count_domains(&pool, "blocklist_domains").unwrap_or_default(),
+            0
+        );
     }
 
     #[test]
     fn delete_rewrite_by_id_returns_deleted_rewrite() {
         let pool = test_pool();
-        let id = add_rewrite(&pool, "Rewrite-Me.Example.", Some("192.0.2.77"), None);
+        let id = add_rewrite(&pool, "Rewrite-Me.Example.", Some("192.0.2.77"), None).unwrap();
 
         let deleted = delete_rewrite_by_id(&pool, id).expect("deleted rewrite");
 

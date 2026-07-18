@@ -183,7 +183,7 @@ pub fn make_handler(
     // to conn #2 (seed_defaults, QueryLog writer, etc.).
     let db_path = std::env::temp_dir().join(format!("rb-test-{}.db", unique_id()));
     let pool = rustblocker::db::create_pool(db_path.to_str().expect("path")).expect("db pool");
-    rustblocker::db::seed_defaults(&pool);
+    rustblocker::db::seed_defaults(&pool).expect("seed");
     let retention = Arc::new(AtomicU64::new(30));
     let query_log = rustblocker::stats::QueryLog::new(pool, retention).0;
 

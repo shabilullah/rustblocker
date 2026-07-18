@@ -62,7 +62,7 @@ pub type SharedAcl = Arc<RwLock<Acl>>;
 
 /// Load ACL from the `allowed_networks` setting in the database.
 pub fn load_acl_from_db(pool: &crate::db::DbPool) -> SharedAcl {
-    let settings = crate::db::get_settings(pool);
+    let settings = crate::db::get_settings(pool).unwrap_or_default();
     let cidr_list = settings
         .get("allowed_networks")
         .and_then(|v| v.as_str())

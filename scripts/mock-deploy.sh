@@ -2148,6 +2148,91 @@ else
     step; skip "$STEP" "cloudflare-https" "disabled; set ENABLE_CLOUDFLARE_HTTPS=true in .deployenv to run Cloudflare, ACME, and HTTPS checks"
 fi
 
+# --- Panic-free validation: auth.rs hash_password → Result --------------
+# change_password previously called AuthState::hash_password(...).expect,
+# which panics and kills the worker thread on bcrypt failure.
+# Now match Ok/Err and map Err to HTTP 500. Validate every branch.
+MOCK_NEW_PASSWORD="MockedNewPass-$(date +%s)$$"
+
+step
+REJECT_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/auth/password" \
+    -H "Content-Type: application/json" \
+    -d "{\"current_password\":\"wrong-password-$(date +%s)\",\"new_password\":\"ValidNewP1\"}")
+REJECT_HTTP=$(printf '%s\n' "$REJECT_RESPONSE" | tail -1)
+if [ "$REJECT_HTTP" = "401" ]; then
+    ok "$STEP" "auth-change-wrong-current" "wrong current password rejected (HTTP 401)"
+else
+    fail "$STEP" "auth-change-wrong-current" "expected 401 for wrong current password, got HTTP $REJECT_HTTP"
+fi
+
+step
+SHORT_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/auth/password" \
+    -H "Content-Type: application/json" \
+    -d "{\"current_password\":\"$WEBUI_PASSWORD\",\"new_password\":\"ab\"}")
+SHORT_HTTP=$(printf '%s\n' "$SHORT_RESPONSE" | tail -1)
+if [ "$SHORT_HTTP" = "400" ]; then
+    ok "$STEP" "auth-change-short" "short new password rejected (HTTP 400)"
+else
+    fail "$STEP" "auth-change-short" "expected 400 for short password, got HTTP $SHORT_HTTP"
+fi
+
+step
+CHANGE_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/auth/password" \
+    -H "Content-Type: application/json" \
+    -d "{\"current_password\":\"$WEBUI_PASSWORD\",\"new_password\":\"$MOCK_NEW_PASSWORD\"}")
+CHANGE_HTTP=$(printf '%s\n' "$CHANGE_RESPONSE" | tail -1)
+CHANGE_BODY=$(printf '%s\n' "$CHANGE_RESPONSE" | sed '$d')
+if [ "$CHANGE_HTTP" = "200" ]; then
+    ok "$STEP" "auth-change-valid" "password changed via hash_password Result path (HTTP 200)"
+else
+    fail "$STEP" "auth-change-valid" "expected 200 for valid password change, got HTTP $CHANGE_HTTP (body: ${CHANGE_BODY:-empty})"
+fi
+
+step
+RELOGIN_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -c "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"password\":\"$MOCK_NEW_PASSWORD\"}")
+RELOGIN_HTTP=$(printf '%s\n' "$RELOGIN_RESPONSE" | tail -1)
+if [ "$RELOGIN_HTTP" = "200" ]; then
+    ok "$STEP" "auth-change-relogin" "re-login with new password succeeded (HTTP 200)"
+else
+    fail "$STEP" "auth-change-relogin" "expected 200 re-login with new password, got HTTP $RELOGIN_HTTP"
+fi
+
+step
+REVERT_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/auth/password" \
+    -H "Content-Type: application/json" \
+    -d "{\"current_password\":\"$MOCK_NEW_PASSWORD\",\"new_password\":\"$WEBUI_PASSWORD\"}")
+REVERT_HTTP=$(printf '%s\n' "$REVERT_RESPONSE" | tail -1)
+if [ "$REVERT_HTTP" = "200" ]; then
+    ok "$STEP" "auth-change-revert" "password reverted to original (HTTP 200)"
+else
+    fail "$STEP" "auth-change-revert" "expected 200 revert, got HTTP $REVERT_HTTP"
+fi
+
+step
+RESTORE_RESPONSE=$("${CURL[@]}" -w "\n%{http_code}" -c "$COOKIE_JAR" \
+    -X POST "$BASE_URL/api/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"password\":\"$WEBUI_PASSWORD\"}")
+RESTORE_HTTP=$(printf '%s\n' "$RESTORE_RESPONSE" | tail -1)
+if [ "$RESTORE_HTTP" = "200" ]; then
+    ok "$STEP" "auth-change-restore" "session restored with original password (HTTP 200)"
+else
+    fail "$STEP" "auth-change-restore" "expected 200 restore login, got HTTP $RESTORE_HTTP"
+fi
+
+step
+if "${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null | grep -q '200'; then
+    ok "$STEP" "panic-free-health" "health ok after password round-trip, worker survived bcrypt + session rotation"
+else
+    fail "$STEP" "panic-free-health" "health check failed after password round-trip, worker may have panicked"
+fi
 # --- Summary ---
 echo ""
 if [ "$FAILED" -eq 0 ]; then

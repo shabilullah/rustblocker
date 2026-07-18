@@ -331,11 +331,16 @@ fn remove_from_index(
 
 fn domain_at(arena: &[u8], offset: u32) -> &str {
     let i = offset as usize;
-    debug_assert!(i + 2 <= arena.len());
-    let len = u16::from_le_bytes([arena[i], arena[i + 1]]) as usize;
-    debug_assert!(i + 2 + len <= arena.len());
-    // Domains are inserted from &str / normalize_domain, so bytes are valid UTF-8.
-    unsafe { std::str::from_utf8_unchecked(&arena[i + 2..i + 2 + len]) }
+    // Fallible slice: a bounds miss (corrupt arena offset) returns "" instead of
+    // panicking or feeding out-of-range bytes into from_utf8_unchecked (UB).
+    let Some(head) = arena.get(i..i + 2) else {
+        return "";
+    };
+    let len = u16::from_le_bytes([head[0], head[1]]) as usize;
+    match arena.get(i + 2..i + 2 + len) {
+        Some(bytes) => unsafe { std::str::from_utf8_unchecked(bytes) },
+        None => "",
+    }
 }
 
 fn domain_eq(arena: &[u8], offset: u32, domain: &str) -> bool {

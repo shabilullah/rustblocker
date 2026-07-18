@@ -282,11 +282,18 @@ impl ParallelForwarder {
         request: &hickory_server::server::Request,
         mut response_handle: impl hickory_server::server::ResponseHandler,
     ) -> Result<ResolveResult> {
-        let query = request
-            .queries
-            .queries()
-            .first()
-            .expect("request must have a query");
+        let query = match request.queries.queries().first() {
+            Some(q) => q,
+            None => {
+                warn!("DNS request has no query, sending SERVFAIL");
+                let info = send_servfail(request, &mut response_handle).await?;
+                return Ok(ResolveResult {
+                    info,
+                    resolver: "error".to_string(),
+                    latency_us: 0,
+                });
+            }
+        };
         let name = Name::from(query.name());
         let query_type = query.query_type();
 
@@ -643,7 +650,14 @@ async fn build_error_response(
         // be preserved for downstream negative caching.
         let no_records = match err {
             NetError::Dns(DnsError::NoRecordsFound(nr)) => nr,
-            _ => unreachable!(),
+            other => {
+                // classify_upstream_error already proved this is a "negative"
+                // response; this branch is defensive in case a future NetError
+                // variant is classified as negative but carries no NoRecords.
+                warn!("Unexpected non-NoRecords negative upstream error: {other}");
+                let info = send_servfail(request, response_handle).await?;
+                return Ok((info, "error".to_string()));
+            }
         };
         let ttl = no_records.negative_ttl.unwrap_or(0);
         let soa_records: Vec<Record> = no_records

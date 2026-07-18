@@ -77,8 +77,8 @@ impl AuthState {
     }
 
     /// Hash a plaintext password with bcrypt for storage in the database.
-    pub fn hash_password(password: &str) -> String {
-        hash(password, DEFAULT_COST).expect("failed to hash password")
+    pub fn hash_password(password: &str) -> Result<String, bcrypt::BcryptError> {
+        hash(password, DEFAULT_COST)
     }
 
     /// Verify a plaintext password against a bcrypt hash.
@@ -278,11 +278,10 @@ mod tests {
     fn password_hash_round_trip() {
         let password = AuthState::generate_password();
         assert_eq!(password.len(), 24);
-        let hash = AuthState::hash_password(&password);
+        let hash = AuthState::hash_password(&password).unwrap();
         assert!(AuthState::verify_password(&password, &hash));
         assert!(!AuthState::verify_password("wrong-password", &hash));
     }
-
     #[test]
     fn session_validates_and_expires() {
         let auth = AuthState::new();

@@ -11,7 +11,7 @@ use crate::acl::SharedAcl;
 use crate::activity::ActivityLog;
 use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret};
 use crate::config::UpstreamConfig;
-use crate::db::{self, DbPool};
+use crate::db::{self, DbError, DbPool};
 use crate::forwarder::{ForwardStrategy, ParallelForwarder};
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
@@ -115,13 +115,20 @@ async fn resolve_import_content(body: &BulkImport) -> String {
 async fn db_blocking<T, F>(f: F) -> Result<T, HttpResponse>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce() -> Result<T, DbError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.map_err(|e| {
-        HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("database task failed: {}", e)
-        }))
-    })
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| {
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("database task failed: {}", e)
+            }))
+        })?
+        .map_err(|e| {
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("database error: {}", e)
+            }))
+        })
 }
 
 /// Insert a domain into the correct set (exact or wildcard) of a DomainStore.
@@ -228,7 +235,9 @@ async fn request_certificate(
     tokio::spawn(async move {
         let log_ref: &ActivityLog = &log_clone;
         // Clear any stale error from previous attempts
-        db::set_setting(&pool_clone, "acme_error", "");
+        if let Err(e) = db::set_setting(&pool_clone, "acme_error", "") {
+            tracing::warn!("db set_setting failed: {e}");
+        }
         match request_certificate_impl(
             &pool_clone,
             &domain,
@@ -242,7 +251,9 @@ async fn request_certificate(
         .await
         {
             Ok(_) => {
-                db::set_setting(&pool_clone, "acme_error", "");
+                if let Err(e) = db::set_setting(&pool_clone, "acme_error", "") {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
                 log_clone.success(
                     &op_id_for_spawn,
                     "Request Certificate",
@@ -257,7 +268,9 @@ async fn request_certificate(
             }
             Err(e) => {
                 let msg = format!("{}", e);
-                db::set_setting(&pool_clone, "acme_error", &msg);
+                if let Err(e) = db::set_setting(&pool_clone, "acme_error", &msg) {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
                 log_clone.error(
                     &op_id_for_spawn,
                     "Request Certificate",
@@ -336,7 +349,9 @@ async fn renew_certificate(
     tokio::spawn(async move {
         let log_ref: &ActivityLog = &log_clone;
         // Clear any stale error from previous attempts
-        db::set_setting(&pool_clone, "acme_error", "");
+        if let Err(e) = db::set_setting(&pool_clone, "acme_error", "") {
+            tracing::warn!("db set_setting failed: {e}");
+        }
         match request_certificate_impl(
             &pool_clone,
             &domain,
@@ -350,7 +365,9 @@ async fn renew_certificate(
         .await
         {
             Ok(_) => {
-                db::set_setting(&pool_clone, "acme_error", "");
+                if let Err(e) = db::set_setting(&pool_clone, "acme_error", "") {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
                 log_clone.success(
                     &op_id_for_spawn,
                     "Force Renewal",
@@ -368,7 +385,9 @@ async fn renew_certificate(
             }
             Err(e) => {
                 let msg = format!("{}", e);
-                db::set_setting(&pool_clone, "acme_error", &msg);
+                if let Err(e) = db::set_setting(&pool_clone, "acme_error", &msg) {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
                 log_clone.error(&op_id_for_spawn, "Force Renewal", &format!("Failed: {}", e));
             }
         }
@@ -617,7 +636,9 @@ async fn update_setting(
     if body.key == "forward_strategy" {
         match body.value.parse::<ForwardStrategy>() {
             Ok(strategy) => {
-                db::set_setting(&pool, &body.key, strategy.as_str());
+                if let Err(e) = db::set_setting(&pool, &body.key, strategy.as_str()) {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
                 forwarder.write().set_strategy(strategy);
                 activity_log.info(
                     "settings",
@@ -656,7 +677,9 @@ async fn update_setting(
                 "error": format!("invalid {}: {}", body.key, body.value)
             }));
         }
-        db::set_setting(&pool, &body.key, &body.value);
+        if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
+            tracing::warn!("db set_setting failed: {e}");
+        }
         let reason = format!("{} changed to {}", body.key, body.value);
         activity_log.info(
             "settings",
@@ -670,7 +693,9 @@ async fn update_setting(
         }));
     }
 
-    db::set_setting(&pool, &body.key, &body.value);
+    if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
+        tracing::warn!("db set_setting failed: {e}");
+    }
     activity_log.info(
         "settings",
         "Save Settings",
@@ -730,7 +755,7 @@ async fn get_upstreams(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let upstreams = db::get_upstreams(&pool);
+    let upstreams = db::get_upstreams(&pool).unwrap_or_default();
     HttpResponse::Ok().json(upstreams)
 }
 async fn add_upstream(
@@ -743,7 +768,10 @@ async fn add_upstream(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53));
+    let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53)).unwrap_or_else(|e| {
+        tracing::warn!("add_upstream failed: {e}");
+        0
+    });
     reload_forwarder(&pool, &forwarder);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
@@ -759,7 +787,7 @@ async fn delete_upstream(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
-    let ok = db::delete_upstream(&pool, id);
+    let ok = db::delete_upstream(&pool, id).unwrap_or_default();
     if ok {
         reload_forwarder(&pool, &forwarder);
         HttpResponse::Ok().json(serde_json::json!({"ok": true}))
@@ -769,7 +797,7 @@ async fn delete_upstream(
 }
 
 fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
-    let db_upstreams = db::get_upstreams(pool);
+    let db_upstreams = db::get_upstreams(pool).unwrap_or_default();
     let upstreams: Vec<UpstreamConfig> = db_upstreams
         .iter()
         .map(|u| UpstreamConfig {
@@ -805,10 +833,9 @@ async fn get_blocklist(
     let search = search.to_string();
     let pool = pool.get_ref().clone();
     let (total, domains) = match db_blocking(move || {
-        (
-            db::count_domains(&pool, "blocklist_domains"),
-            db::search_domains(&pool, "blocklist_domains", &search, limit, offset),
-        )
+        let total = db::count_domains(&pool, "blocklist_domains")?;
+        let domains = db::search_domains(&pool, "blocklist_domains", &search, limit, offset)?;
+        Ok((total, domains))
     })
     .await
     {
@@ -831,7 +858,10 @@ async fn add_blocklist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_domain(&pool, "blocklist_domains", &body.domain);
+    let id = db::add_domain(&pool, "blocklist_domains", &body.domain).unwrap_or_else(|e| {
+        tracing::warn!("add_domain failed: {e}");
+        0
+    });
     insert_domain(&mut blocklist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
@@ -848,11 +878,14 @@ async fn delete_blocklist_domain(
     }
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
-    let domain =
-        match db_blocking(move || db::delete_domain_by_id(&pool, "blocklist_domains", id)).await {
-            Ok(domain) => domain,
-            Err(resp) => return resp,
-        };
+    let domain = match db_blocking(move || {
+        Ok(db::delete_domain_by_id(&pool, "blocklist_domains", id))
+    })
+    .await
+    {
+        Ok(domain) => domain,
+        Err(resp) => return resp,
+    };
     match domain {
         Some(domain) => {
             remove_domain(&mut blocklist.write(), &domain);
@@ -911,10 +944,9 @@ async fn get_allowlist(
     let search = search.to_string();
     let pool = pool.get_ref().clone();
     let (total, domains) = match db_blocking(move || {
-        (
-            db::count_domains(&pool, "allowlist_domains"),
-            db::search_domains(&pool, "allowlist_domains", &search, limit, offset),
-        )
+        let total = db::count_domains(&pool, "allowlist_domains")?;
+        let domains = db::search_domains(&pool, "allowlist_domains", &search, limit, offset)?;
+        Ok((total, domains))
     })
     .await
     {
@@ -937,7 +969,10 @@ async fn add_allowlist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_domain(&pool, "allowlist_domains", &body.domain);
+    let id = db::add_domain(&pool, "allowlist_domains", &body.domain).unwrap_or_else(|e| {
+        tracing::warn!("add_domain failed: {e}");
+        0
+    });
     insert_domain(&mut allowlist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
@@ -954,11 +989,14 @@ async fn delete_allowlist_domain(
     }
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
-    let domain =
-        match db_blocking(move || db::delete_domain_by_id(&pool, "allowlist_domains", id)).await {
-            Ok(domain) => domain,
-            Err(resp) => return resp,
-        };
+    let domain = match db_blocking(move || {
+        Ok(db::delete_domain_by_id(&pool, "allowlist_domains", id))
+    })
+    .await
+    {
+        Ok(domain) => domain,
+        Err(resp) => return resp,
+    };
     match domain {
         Some(domain) => {
             remove_domain(&mut allowlist.write(), &domain);
@@ -1010,7 +1048,7 @@ async fn get_rewrites(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let rewrites = db::get_rewrites(&pool);
+    let rewrites = db::get_rewrites(&pool).unwrap_or_default();
     HttpResponse::Ok().json(rewrites)
 }
 
@@ -1029,7 +1067,11 @@ async fn add_rewrite(
         &body.domain,
         body.ipv4.as_deref(),
         body.ipv6.as_deref(),
-    );
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!("add_rewrite failed: {e}");
+        0
+    });
     let rule = crate::config::RewriteRule {
         domain: body.domain.clone(),
         ipv4: body.ipv4.clone(),
@@ -1051,7 +1093,7 @@ async fn delete_rewrite(
     }
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
-    let rewrite = match db_blocking(move || db::delete_rewrite_by_id(&pool, id)).await {
+    let rewrite = match db_blocking(move || Ok(db::delete_rewrite_by_id(&pool, id))).await {
         Ok(rewrite) => rewrite,
         Err(resp) => return resp,
     };
@@ -1142,7 +1184,7 @@ async fn delete_source(
     let id = path.into_inner();
     let pool_for_delete = pool.get_ref().clone();
     let result =
-        match db_blocking(move || db::delete_source_with_cleanup(&pool_for_delete, id)).await {
+        match db_blocking(move || Ok(db::delete_source_with_cleanup(&pool_for_delete, id))).await {
             Ok(result) => result,
             Err(resp) => return resp,
         };
@@ -1198,7 +1240,7 @@ async fn refresh_one_source(
     }
     let id = path.into_inner();
     let pool_for_lookup = pool.get_ref().clone();
-    let source = match db_blocking(move || db::get_source_by_id(&pool_for_lookup, id)).await {
+    let source = match db_blocking(move || Ok(db::get_source_by_id(&pool_for_lookup, id))).await {
         Ok(source) => source,
         Err(resp) => return resp,
     };
@@ -1226,7 +1268,7 @@ async fn get_stats(
     }
     let limit = query.limit.unwrap_or(10);
     let pool = pool.get_ref().clone();
-    let stats = match db_blocking(move || QueryLog::get_stats(&pool, limit)).await {
+    let stats = match db_blocking(move || Ok(QueryLog::get_stats(&pool, limit))).await {
         Ok(stats) => stats,
         Err(resp) => return resp,
     };
@@ -1245,7 +1287,7 @@ async fn get_queries(
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
     let pool = pool.get_ref().clone();
-    let queries = match db_blocking(move || QueryLog::get_queries(&pool, limit, offset)).await {
+    let queries = match db_blocking(move || Ok(QueryLog::get_queries(&pool, limit, offset))).await {
         Ok(queries) => queries,
         Err(resp) => return resp,
     };
@@ -1261,7 +1303,12 @@ async fn clear_stats(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let pool = pool.get_ref().clone();
-    if let Err(resp) = db_blocking(move || QueryLog::clear(&pool)).await {
+    if let Err(resp) = db_blocking(move || {
+        QueryLog::clear(&pool);
+        Ok(())
+    })
+    .await
+    {
         return resp;
     }
     HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
@@ -1390,13 +1437,21 @@ async fn change_password(
         return HttpResponse::BadRequest()
             .json(serde_json::json!({"error": "new password must be at least 6 characters"}));
     }
-    let new_hash = AuthState::hash_password(&body.new_password);
-    db::set_password_hash(&pool, &new_hash);
-
+    let new_hash = match AuthState::hash_password(&body.new_password) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!("failed to hash new password: {e}");
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({"error": "failed to process password"}));
+        }
+    };
+    let _ = db::set_password_hash(&pool, &new_hash);
     // Rotate the session signing secret so existing sessions are invalidated.
     // Issue a new session cookie for the current user so they stay logged in.
     let new_secret = auth.rotate_secret();
-    db::set_setting(&pool, "session_secret", &encode_secret(&new_secret));
+    if let Err(e) = db::set_setting(&pool, "session_secret", &encode_secret(&new_secret)) {
+        tracing::warn!("db set_setting failed: {e}");
+    }
     let session = auth.create_session(SESSION_MAX_AGE_SECS);
     HttpResponse::Ok()
         .cookie(auth_cookie(session, SESSION_MAX_AGE_SECS as i64))
@@ -1517,16 +1572,24 @@ async fn put_sync_config(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    db::set_setting(
+    if let Err(e) = db::set_setting(
         &pool,
         "sync_enabled",
         if body.enabled { "true" } else { "false" },
-    );
-    db::set_setting(&pool, "sync_master", &body.master_url);
-    db::set_setting(&pool, "sync_interval_secs", &body.interval_secs.to_string());
+    ) {
+        tracing::warn!("db set_setting failed: {e}");
+    }
+    if let Err(e) = db::set_setting(&pool, "sync_master", &body.master_url) {
+        tracing::warn!("db set_setting failed: {e}");
+    }
+    if let Err(e) = db::set_setting(&pool, "sync_interval_secs", &body.interval_secs.to_string()) {
+        tracing::warn!("db set_setting failed: {e}");
+    }
     // Only update password if a non-empty value was sent (empty = keep existing).
-    if !body.password.is_empty() {
-        db::set_setting(&pool, "sync_password", &body.password);
+    if !body.password.is_empty()
+        && let Err(e) = db::set_setting(&pool, "sync_password", &body.password)
+    {
+        tracing::warn!("db set_setting failed: {e}");
     }
     HttpResponse::Ok().json(serde_json::json!({"ok": true, "restart_required": true}))
 }

@@ -11,14 +11,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
-use serde::Deserialize;
-use tracing::{info, warn};
-
 use crate::config::{RewriteRule, UpstreamConfig};
 use crate::db::{self, DbPool};
 use crate::forwarder::{ForwardStrategy, ParallelForwarder};
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore, RewriteMap};
+use parking_lot::RwLock;
+use serde::Deserialize;
+use std::result::Result;
+use tracing::{error, info, warn};
 
 #[derive(Debug, Deserialize)]
 struct ManifestResponse {
@@ -69,10 +69,13 @@ pub fn spawn(
     state: SharedSyncState,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(
+        if let Err(e) = run(
             config, pool, blocklist, allowlist, rewrites, forwarder, state,
         )
-        .await;
+        .await
+        {
+            error!("Sync: failed to start: {e}");
+        }
     })
 }
 
@@ -84,13 +87,12 @@ async fn run(
     rewrites: Arc<RwLock<RewriteMap>>,
     forwarder: Arc<RwLock<ParallelForwarder>>,
     state: SharedSyncState,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     let client = reqwest::Client::builder()
         .cookie_store(true)
         .timeout(Duration::from_secs(30))
         .build()
-        .expect("failed to build sync HTTP client");
-
+        .map_err(|e| anyhow::anyhow!("failed to build sync HTTP client: {e}"))?;
     let base = config.master_url.trim_end_matches('/');
     let mut known_hashes: HashMap<String, String> = HashMap::new();
 
@@ -327,8 +329,10 @@ fn apply_settings(
         if SKIP.contains(&key.as_str()) {
             continue;
         }
-        if let Some(v) = val.as_str() {
-            db::set_setting(pool, key, v);
+        if let Some(v) = val.as_str()
+            && let Err(e) = db::set_setting(pool, key, v)
+        {
+            tracing::warn!("db set_setting failed: {e}");
         }
     }
 
@@ -351,6 +355,7 @@ fn reload_forwarder_from_db(
         .unwrap_or(5);
     let strategy = forward_strategy_from_db(pool);
     let configs: Vec<UpstreamConfig> = db::get_upstreams(pool)
+        .unwrap_or_default()
         .iter()
         .map(|u| UpstreamConfig {
             address: u.address.clone(),
@@ -383,7 +388,13 @@ fn apply_upstreams(
     };
 
     // Replace all upstreams atomically.
-    let mut conn = pool.get().expect("failed to get DB connection");
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Sync: failed to get DB connection for upstreams: {e}");
+            return;
+        }
+    };
     let result: rusqlite::Result<()> = (|| {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM upstreams", [])?;
@@ -436,7 +447,13 @@ fn apply_rewrites(data: &serde_json::Value, pool: &DbPool, rewrites: &Arc<RwLock
     };
 
     // Replace rewrites atomically in DB first, then update in-memory map.
-    let mut conn = pool.get().expect("failed to get DB connection");
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Sync: failed to get DB connection for rewrites: {e}");
+            return;
+        }
+    };
     let result: rusqlite::Result<()> = (|| {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM rewrites", [])?;
@@ -484,7 +501,13 @@ fn apply_sources(data: &serde_json::Value, pool: &DbPool) {
         }
     };
 
-    let mut conn = pool.get().expect("failed to get DB connection");
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Sync: failed to get DB connection for sources: {e}");
+            return;
+        }
+    };
     let result: rusqlite::Result<()> = (|| {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM sources", [])?;
@@ -533,7 +556,13 @@ fn apply_domains_inner(
 
     // Replace entire table atomically inside a real transaction so a failure
     // between DELETE and INSERT doesn't leave the table empty.
-    let mut conn = pool.get().expect("failed to get DB connection");
+    let mut conn = match pool.get() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Sync: failed to get DB connection for domains: {e}");
+            return;
+        }
+    };
     let result: rusqlite::Result<()> = (|| {
         let tx = conn.transaction()?;
         // Table name is a &'static str from a closed match in apply_snapshot — not user input.

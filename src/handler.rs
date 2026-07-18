@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use hickory_proto::op::{Metadata, ResponseCode};
+use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -58,6 +58,18 @@ fn build_rdata(query_type: RecordType, ipv4: Ipv4Addr, ipv6: Ipv6Addr) -> RData 
         _ => RData::A(A::from(ipv4)),
     }
 }
+/// Construct a fallback `ResponseInfo` (SERVFAIL) when the response cannot be
+/// sent (client disconnect, IO error). Mirrors hickory's internal
+/// `ResponseInfo::serve_failed`, which is `pub(crate)`. Built via the public
+/// `From<Header>` impl with the same fields hickory sets.
+fn serve_failed(request: &Request) -> ResponseInfo {
+    let mut metadata = Metadata::response_from_request(&request.metadata);
+    metadata.response_code = ResponseCode::ServFail;
+    ResponseInfo::from(Header {
+        metadata,
+        counts: HeaderCounts::default(),
+    })
+}
 
 impl RequestHandler for DnsBlockerHandler {
     fn handle_request<'life0, 'life1, 'async_trait, R, T>(
@@ -84,10 +96,13 @@ impl RequestHandler for DnsBlockerHandler {
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let response = builder.error_msg(&request.metadata, ResponseCode::Refused);
                 let mut rh = response_handle;
-                return rh
-                    .send_response(response)
-                    .await
-                    .expect("failed to send REFUSED");
+                return match rh.send_response(response).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!("failed to send REFUSED response: {}", e);
+                        serve_failed(request)
+                    }
+                };
             }
             let query = match request.queries.queries().first() {
                 Some(q) => q,
@@ -96,10 +111,13 @@ impl RequestHandler for DnsBlockerHandler {
                     let builder = MessageResponseBuilder::from_message_request(request);
                     let response = builder.error_msg(&request.metadata, ResponseCode::FormErr);
                     let mut rh = response_handle;
-                    return rh
-                        .send_response(response)
-                        .await
-                        .expect("failed to send FormErr response");
+                    return match rh.send_response(response).await {
+                        Ok(info) => info,
+                        Err(e) => {
+                            warn!("failed to send FormErr response: {}", e);
+                            serve_failed(request)
+                        }
+                    };
                 }
             };
 
@@ -138,10 +156,13 @@ impl RequestHandler for DnsBlockerHandler {
                 let response =
                     builder.build(metadata, answers.iter(), [].iter(), [].iter(), [].iter());
                 let mut rh = response_handle;
-                return rh
-                    .send_response(response)
-                    .await
-                    .expect("failed to send rewrite response");
+                return match rh.send_response(response).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!("failed to send rewrite response: {}", e);
+                        serve_failed(request)
+                    }
+                };
             }
 
             // 2. Check allowlist, then blocklist
@@ -180,19 +201,37 @@ impl RequestHandler for DnsBlockerHandler {
                 let response =
                     builder.build(metadata, answers.iter(), [].iter(), [].iter(), [].iter());
                 let mut rh = response_handle;
-                return rh
-                    .send_response(response)
-                    .await
-                    .expect("failed to send sinkhole response");
+                return match rh.send_response(response).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!("failed to send sinkhole response: {}", e);
+                        serve_failed(request)
+                    }
+                };
             }
 
             // 3. Forward to upstream
             let forwarder = self.forwarder.read().clone();
             // Lock guard dropped here — safe to .await below.
-            let result = forwarder
-                .resolve(request, response_handle)
-                .await
-                .expect("forwarder failed to send response");
+            let result = match forwarder.resolve(request, response_handle).await {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("forwarder failed to send response: {}", e);
+                    self.query_log.record(QueryEntry {
+                        client_ip: src_ip,
+                        domain: domain.clone(),
+                        query_type,
+                        action: if allowlisted {
+                            QueryAction::Allowed
+                        } else {
+                            QueryAction::Forwarded
+                        },
+                        resolver: None,
+                        latency_us: None,
+                    });
+                    return serve_failed(request);
+                }
+            };
             self.query_log.record(QueryEntry {
                 client_ip: src_ip,
                 domain,

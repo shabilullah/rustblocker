@@ -86,10 +86,10 @@ fn main() -> Result<()> {
     if cli.genpass {
         let db_path = cli.db_path();
         let pool = db::create_pool(&db_path).context("Failed to create SQLite database")?;
-        db::seed_defaults(&pool);
+        db::seed_defaults(&pool).context("Failed to seed defaults")?;
         let password = rustblocker::auth::AuthState::generate_password();
-        let hash = rustblocker::auth::AuthState::hash_password(&password);
-        db::set_password_hash(&pool, &hash);
+        let hash = rustblocker::auth::AuthState::hash_password(&password)
+            .map_err(|e| anyhow::anyhow!("failed to hash password: {e}"))?;
 
         // Verify the write actually landed. Silent failures (e.g. permission
         // denied on a root-owned DB) produce the same "invalid password"
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
         // Rotate session secret so old sessions are invalidated on the next server start.
         let session_secret = rustblocker::auth::AuthState::generate_secret();
         let encoded_secret = rustblocker::auth::encode_secret(&session_secret);
-        db::set_setting(&pool, "session_secret", &encoded_secret);
+        let _ = db::set_setting(&pool, "session_secret", &encoded_secret);
         let stored_secret = db::get_setting(&pool, "session_secret");
         if stored_secret.as_deref() != Some(encoded_secret.as_str()) {
             return Err(anyhow::anyhow!(
@@ -178,7 +178,7 @@ fn restart_service_if_running() -> bool {
 }
 
 fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
-    let domains = db::get_domains(pool, table);
+    let domains = db::get_domains(pool, table).unwrap_or_default();
     let mut store = DomainStore::default();
     for d in &domains {
         store.insert(&d.domain);
@@ -187,7 +187,7 @@ fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
 }
 
 fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
-    let rewrites = db::get_rewrites(pool);
+    let rewrites = db::get_rewrites(pool).unwrap_or_default();
     let rules = rewrites
         .iter()
         .map(|r| rustblocker::config::RewriteRule {
@@ -200,7 +200,7 @@ fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
 }
 
 fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
-    let settings = db::get_settings(pool);
+    let settings = db::get_settings(pool).unwrap_or_default();
     settings
         .get(key)
         .and_then(|v| v.as_str())
@@ -213,8 +213,7 @@ const CSP_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self
 async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool(cli.db_path()).context("Failed to create SQLite database")?;
 
-    db::seed_defaults(&pool);
-
+    db::seed_defaults(&pool).context("Failed to seed defaults")?;
     if db::get_password_hash(&pool).is_none() {
         warn!("No admin password set. Use `rustblocker --genpass` before accessing the web UI.");
     }
@@ -231,7 +230,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         .unwrap_or_default();
 
     let dns_port = cli.dns_port.unwrap_or(db_dns_port);
-    let web_port = cli.web_port.unwrap_or(dns_port + 1);
+    let web_port = cli.web_port.unwrap_or_else(|| dns_port.saturating_add(1));
 
     let listen_addr: SocketAddr = format!("{}:{}", listen_address, dns_port)
         .parse()
@@ -261,7 +260,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         rewrites.read().rules.len(),
     );
 
-    let db_upstreams = db::get_upstreams(&pool);
+    let db_upstreams = db::get_upstreams(&pool).unwrap_or_default();
     let upstreams: Vec<UpstreamConfig> = db_upstreams
         .iter()
         .map(|u| UpstreamConfig {
@@ -337,7 +336,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         .and_then(|s| rustblocker::auth::decode_secret(&s).ok())
         .unwrap_or_else(|| {
             let secret = rustblocker::auth::AuthState::generate_secret();
-            db::set_setting(
+            let _ = db::set_setting(
                 &pool,
                 "session_secret",
                 &rustblocker::auth::encode_secret(&secret),
@@ -514,7 +513,7 @@ async fn run_server(cli: Cli) -> Result<()> {
             })
             .await
             {
-                Ok(stale) => stale,
+                Ok(stale) => stale.unwrap_or_default(),
                 Err(e) => {
                     warn!("Failed to load stale sources: {}", e);
                     continue;
