@@ -23,6 +23,8 @@ pub struct DomainStore {
     wildcards: HashMap<u64, Vec<u32>>,
     exact_count: usize,
     wildcard_count: usize,
+    /// Bytes left unreachable in `arena` after removes (length prefix + domain).
+    dead_bytes: usize,
 }
 
 /// Newtype wrapper so actix can distinguish blocklist from allowlist in app data.
@@ -139,13 +141,13 @@ impl DomainStore {
         self.len() == 0
     }
 
-    /// Drop all entries and reclaim the arena.
     pub fn clear(&mut self) {
         self.arena.clear();
         self.exact.clear();
         self.wildcards.clear();
         self.exact_count = 0;
         self.wildcard_count = 0;
+        self.dead_bytes = 0;
     }
 
     /// Merge another store into this one (used by bulk import / source refresh).
@@ -192,24 +194,75 @@ impl DomainStore {
 
     /// Remove a domain from the store, normalizing it first.
     ///
-    /// Arena bytes for removed domains are intentionally not reclaimed; removes
-    /// are rare relative to inserts and full rebuilds clear the arena.
+    /// Index entries drop immediately. Arena holes accumulate as `dead_bytes`
+    /// and are reclaimed lazily when waste exceeds ~25% of the arena (or the
+    /// store becomes empty). Avoids O(n) rebuild on every single DELETE.
     pub fn remove(&mut self, domain: &str) {
         let normalized = normalize_domain(domain);
+        let mut freed = 0usize;
         if let Some(stripped) = normalized.strip_prefix("*.") {
-            remove_from_index(
+            freed = freed.saturating_add(remove_from_index(
                 &self.arena,
                 &mut self.wildcards,
                 &mut self.wildcard_count,
                 stripped,
-            );
+            ));
         }
-        remove_from_index(
+        freed = freed.saturating_add(remove_from_index(
             &self.arena,
             &mut self.exact,
             &mut self.exact_count,
             &normalized,
-        );
+        ));
+        if freed > 0 {
+            self.dead_bytes = self.dead_bytes.saturating_add(freed);
+            self.maybe_compact();
+        }
+    }
+
+    /// Rebuild when holes are empty-store or waste > ~25% of arena length.
+    fn maybe_compact(&mut self) {
+        if self.is_empty() {
+            self.compact();
+            return;
+        }
+        // dead > arena/4  <=>  4*dead > arena
+        if self.dead_bytes > 0 && self.dead_bytes.saturating_mul(4) > self.arena.len() {
+            self.compact();
+        }
+    }
+
+    /// Rebuild arena + indexes from live entries, dropping holes left by removes.
+    fn compact(&mut self) {
+        if self.is_empty() {
+            self.arena.clear();
+            self.arena.shrink_to_fit();
+            self.exact.clear();
+            self.exact.shrink_to_fit();
+            self.wildcards.clear();
+            self.wildcards.shrink_to_fit();
+            self.dead_bytes = 0;
+            return;
+        }
+
+        let mut fresh = Self::default();
+        // Pre-size to live payload so compact does not thrash on large stores.
+        let approx_bytes = self.arena.len().saturating_sub(self.dead_bytes);
+        fresh.arena.reserve(approx_bytes);
+
+        for offsets in self.exact.values() {
+            for &offset in offsets {
+                let domain = domain_at(&self.arena, offset);
+                fresh.insert_normalized(domain, false);
+            }
+        }
+        for offsets in self.wildcards.values() {
+            for &offset in offsets {
+                let domain = domain_at(&self.arena, offset);
+                fresh.insert_normalized(domain, true);
+            }
+        }
+        *self = fresh;
     }
 
     /// Check if a normalized domain matches this store.
@@ -313,20 +366,31 @@ fn remove_from_index(
     index: &mut HashMap<u64, Vec<u32>>,
     count: &mut usize,
     domain: &str,
-) {
+) -> usize {
     let hash = domain_hash(domain);
     let Some(offsets) = index.get_mut(&hash) else {
-        return;
+        return 0;
     };
+    let mut freed = 0usize;
     let before = offsets.len();
-    offsets.retain(|&offset| !domain_eq(arena, offset, domain));
+    offsets.retain(|&offset| {
+        if domain_eq(arena, offset, domain) {
+            // length prefix (2) + domain bytes
+            freed = freed.saturating_add(2 + domain_at(arena, offset).len());
+            false
+        } else {
+            true
+        }
+    });
     let removed = before - offsets.len();
-    if removed > 0 {
-        *count = count.saturating_sub(removed);
+    if removed == 0 {
+        return 0;
     }
+    *count = count.saturating_sub(removed);
     if offsets.is_empty() {
         index.remove(&hash);
     }
+    freed
 }
 
 fn domain_at(arena: &[u8], offset: u32) -> &str {
@@ -520,6 +584,61 @@ plain.example.com
         assert!(!store.matches("ads.example.com"));
         assert!(!store.matches("x.tracker.example.com"));
         assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_compacts_arena() {
+        let mut store = DomainStore::default();
+        // Seed enough live payload that a few deletes stay under the 25% threshold,
+        // then force reclaim via empty-store and threshold paths.
+        for i in 0..20 {
+            store.insert(&format!("keep-{i}.example.com"));
+        }
+        store.insert("drop.example.com");
+        store.insert("*.wild.example.com");
+
+        let before = store.arena.len();
+        store.remove("drop.example.com");
+        store.remove("*.wild.example.com");
+        // Two small removes on a larger arena: still live; dead tracked, not yet compacted.
+        assert!(store.dead_bytes > 0);
+        assert_eq!(store.arena.len(), before);
+        assert!(store.matches("keep-0.example.com"));
+        assert!(!store.matches("drop.example.com"));
+        assert!(!store.matches("x.wild.example.com"));
+
+        // Drop most of the store so dead/live crosses the 25% threshold.
+        for i in 1..20 {
+            store.remove(&format!("keep-{i}.example.com"));
+        }
+        assert!(
+            store.arena.len() < before,
+            "arena should shrink after threshold compact: before={before} after={}",
+            store.arena.len()
+        );
+        assert_eq!(store.dead_bytes, 0);
+        assert_eq!(store.len(), 1);
+        assert!(store.matches("keep-0.example.com"));
+
+        // Churn: insert+remove unique names; threshold keeps arena from unbounded growth.
+        let baseline = store.arena.len();
+        for i in 0..50 {
+            let d = format!("tmp-{i}.example.com");
+            store.insert(&d);
+            store.remove(&d);
+        }
+        assert_eq!(store.len(), 1);
+        assert!(store.matches("keep-0.example.com"));
+        assert!(
+            store.arena.len() <= baseline + baseline / 2,
+            "remove churn must not grow arena unbound: baseline={baseline} after={}",
+            store.arena.len()
+        );
+        // Force empty compact path.
+        store.remove("keep-0.example.com");
+        assert!(store.is_empty());
+        assert_eq!(store.arena.len(), 0);
+        assert_eq!(store.dead_bytes, 0);
     }
 
     #[test]

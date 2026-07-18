@@ -106,6 +106,31 @@ STICKY_BASELINE_REMOVED_DOMAIN=""
 STICKY_BASELINE_KEEP_DOMAIN=""
 STICKY_FULL_COUNT=0
 STICKY_SHRINK_COUNT=0
+
+# DomainStore::remove (finding 4): always-on agent smoke.
+# Proves API DELETE unsticks DNS (removed/wild) while keep stays sinkholed, and
+# insert/delete churn leaves no residue. Arena reclaim is unit-tested in lists.rs
+# (remote smoke cannot see arena.len()). RSS is observational only.
+MOCK_REMOVE_COMPACT_BASELINE=true
+REMOVE_COMPACT_DOMAINS=100
+REMOVE_COMPACT_KEEP=10
+REMOVE_COMPACT_CHURN=40
+REMOVE_COMPACT_SETTLE_SECS=1
+REMOVE_COMPACT_BASELINE_FILE="target/mock-remove-compact-baseline.json"
+REMOVE_COMPACT_STATUS="not_started"
+REMOVE_COMPACT_NOTE=""
+REMOVE_COMPACT_RSS_BEFORE_KB=0
+REMOVE_COMPACT_RSS_FULL_KB=0
+REMOVE_COMPACT_RSS_AFTER_DELETE_KB=0
+REMOVE_COMPACT_RSS_AFTER_CHURN_KB=0
+REMOVE_COMPACT_RSS_CHURN_GROWTH_KB=0
+REMOVE_COMPACT_IMPORTED=0
+REMOVE_COMPACT_DELETED=0
+REMOVE_COMPACT_CHURN_OK=0
+REMOVE_COMPACT_STICKY_DNS=0
+REMOVE_COMPACT_KEEP_DNS_OK=0
+REMOVE_COMPACT_REMOVED_DOMAIN=""
+REMOVE_COMPACT_KEEP_DOMAIN=""
 MOCK_RESOLVER_CACHE_BASELINE="${MOCK_RESOLVER_CACHE_BASELINE:-true}"
 RESOLVER_CACHE_BASELINE_FILE="${RESOLVER_CACHE_BASELINE_FILE:-target/mock-resolver-cache-baseline.json}"
 RESOLVER_CACHE_BASELINE_UPSTREAMS="${RESOLVER_CACHE_BASELINE_UPSTREAMS:-2}"
@@ -620,6 +645,48 @@ sticky_cleanup() {
         wait_for_health 15 2 || true
     fi
     remote_root "rm -f /tmp/${prefix}-full.list /tmp/${prefix}-shrink.list" || true
+}
+
+write_remove_compact_baseline() {
+    local dir note_escaped
+    dir=$(dirname "$REMOVE_COMPACT_BASELINE_FILE")
+    mkdir -p "$dir"
+    note_escaped=$(printf '%s' "$REMOVE_COMPACT_NOTE" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    cat > "$REMOVE_COMPACT_BASELINE_FILE" <<EOF
+{
+  "status": "$REMOVE_COMPACT_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "domains": $REMOVE_COMPACT_DOMAINS,
+  "keep": $REMOVE_COMPACT_KEEP,
+  "churn": $REMOVE_COMPACT_CHURN,
+  "imported": $REMOVE_COMPACT_IMPORTED,
+  "deleted": $REMOVE_COMPACT_DELETED,
+  "churn_ok": $REMOVE_COMPACT_CHURN_OK,
+  "sticky_dns": $REMOVE_COMPACT_STICKY_DNS,
+  "keep_dns_ok": $REMOVE_COMPACT_KEEP_DNS_OK,
+  "removed_domain": "$REMOVE_COMPACT_REMOVED_DOMAIN",
+  "keep_domain": "$REMOVE_COMPACT_KEEP_DOMAIN",
+  "rss_before_kb": $REMOVE_COMPACT_RSS_BEFORE_KB,
+  "rss_full_kb": $REMOVE_COMPACT_RSS_FULL_KB,
+  "rss_after_delete_kb": $REMOVE_COMPACT_RSS_AFTER_DELETE_KB,
+  "rss_after_churn_kb": $REMOVE_COMPACT_RSS_AFTER_CHURN_KB,
+  "rss_churn_growth_kb": $REMOVE_COMPACT_RSS_CHURN_GROWTH_KB,
+  "note": "$note_escaped",
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+}
+
+remove_compact_cleanup() {
+    local prefix="$1"
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1 \
+        || (enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1); then
+        STRESS_CLEANUP_METHOD="sqlite"
+        stress_cleanup_blocklist "$prefix" || true
+    else
+        api_cleanup_blocklist_prefix "$prefix" 250 40 || true
+    fi
 }
 
 
@@ -1838,6 +1905,277 @@ else
     step
     skip "$STEP" "sticky-baseline" "disabled; set MOCK_STICKY_BASELINE=true to measure sticky source refresh"
 fi
+
+# DomainStore::remove (finding 4): API DELETE drops DNS match for removed/wild
+# domains; keep stays sinkholed; insert/delete churn leaves no residue.
+# Arena reclaim verified by unit tests, not this remote smoke.
+if enabled "$MOCK_REMOVE_COMPACT_BASELINE"; then
+    REMOVE_COMPACT_PREFIX="${RUN_TAG}-rmcompact.rustblocker.test"
+    REMOVE_COMPACT_STATUS="running"
+    REMOVE_COMPACT_NOTE="post-fix DomainStore::remove compact via API DELETE"
+    REMOVE_COMPACT_KEEP_DOMAIN="rmc-1.${REMOVE_COMPACT_PREFIX}"
+    REMOVE_COMPACT_REMOVED_DOMAIN="rmc-${REMOVE_COMPACT_DOMAINS}.${REMOVE_COMPACT_PREFIX}"
+
+    if [ "$REMOVE_COMPACT_KEEP" -ge "$REMOVE_COMPACT_DOMAINS" ]; then
+        step
+        fail "$STEP" "remove-compact-prereq" "REMOVE_COMPACT_KEEP ($REMOVE_COMPACT_KEEP) must be < REMOVE_COMPACT_DOMAINS ($REMOVE_COMPACT_DOMAINS)"
+        REMOVE_COMPACT_STATUS="invalid_config"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ] && remote_resource_snapshot; then
+        REMOVE_COMPACT_RSS_BEFORE_KB="$RESOURCE_RSS_KB"
+        ok "$STEP" "remove-compact-before" "rss=${REMOVE_COMPACT_RSS_BEFORE_KB}KB domains=$REMOVE_COMPACT_DOMAINS keep=$REMOVE_COMPACT_KEEP churn=$REMOVE_COMPACT_CHURN"
+    elif [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        REMOVE_COMPACT_STATUS="resource_failed"
+        fail "$STEP" "remove-compact-before" "could not read process resources before import"
+    else
+        skip "$STEP" "remove-compact-before" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        REMOVE_COMPACT_CONTENT=""
+        for i in $(seq 1 "$REMOVE_COMPACT_DOMAINS"); do
+            REMOVE_COMPACT_CONTENT="${REMOVE_COMPACT_CONTENT}0.0.0.0 rmc-${i}.${REMOVE_COMPACT_PREFIX}\\n"
+        done
+        # Also exercise wildcard remove path.
+        REMOVE_COMPACT_CONTENT="${REMOVE_COMPACT_CONTENT}*.wild.${REMOVE_COMPACT_PREFIX}\\n"
+        REMOVE_COMPACT_IMPORT=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+            -X POST "$BASE_URL/api/blocklist/import" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\":\"$REMOVE_COMPACT_CONTENT\"}")
+        REMOVE_COMPACT_IMPORT_HTTP=$(printf '%s\n' "$REMOVE_COMPACT_IMPORT" | tail -1)
+        REMOVE_COMPACT_IMPORT_BODY=$(printf '%s\n' "$REMOVE_COMPACT_IMPORT" | sed '$d')
+        REMOVE_COMPACT_IMPORTED=$(printf '%s\n' "$REMOVE_COMPACT_IMPORT_BODY" | json_number "imported")
+        if [ "$REMOVE_COMPACT_IMPORT_HTTP" = "200" ] && [ "${REMOVE_COMPACT_IMPORTED:-0}" -ge "$REMOVE_COMPACT_DOMAINS" ]; then
+            sleep "$REMOVE_COMPACT_SETTLE_SECS"
+            if remote_resource_snapshot; then
+                REMOVE_COMPACT_RSS_FULL_KB="$RESOURCE_RSS_KB"
+            fi
+            ok "$STEP" "remove-compact-import" "imported ${REMOVE_COMPACT_IMPORTED} entries rss_full=${REMOVE_COMPACT_RSS_FULL_KB}KB"
+        else
+            REMOVE_COMPACT_STATUS="import_failed"
+            fail "$STEP" "remove-compact-import" "import failed HTTP=$REMOVE_COMPACT_IMPORT_HTTP body=${REMOVE_COMPACT_IMPORT_BODY:-empty}"
+        fi
+    else
+        skip "$STEP" "remove-compact-import" "skipped because prerequisite failed"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        REMOVE_COMPACT_FULL_DNS=$(target_dns_a "$REMOVE_COMPACT_REMOVED_DOMAIN" 2>/dev/null || true)
+        REMOVE_COMPACT_KEEP_DNS=$(target_dns_a "$REMOVE_COMPACT_KEEP_DOMAIN" 2>/dev/null || true)
+        REMOVE_COMPACT_WILD_DNS=$(target_dns_a "sub.wild.${REMOVE_COMPACT_PREFIX}" 2>/dev/null || true)
+        if echo "$REMOVE_COMPACT_FULL_DNS" | grep -Fxq "$SINKHOLE_IPV4" \
+            && echo "$REMOVE_COMPACT_KEEP_DNS" | grep -Fxq "$SINKHOLE_IPV4" \
+            && echo "$REMOVE_COMPACT_WILD_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+            ok "$STEP" "remove-compact-full-dns" "keep/removed/wildcard all sinkholed before delete"
+        else
+            REMOVE_COMPACT_STATUS="dns_failed"
+            fail "$STEP" "remove-compact-full-dns" "expected sinkhole $SINKHOLE_IPV4; keep=${REMOVE_COMPACT_KEEP_DNS:-empty} removed=${REMOVE_COMPACT_FULL_DNS:-empty} wild=${REMOVE_COMPACT_WILD_DNS:-empty}"
+        fi
+    else
+        skip "$STEP" "remove-compact-full-dns" "skipped because import did not complete"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        REMOVE_COMPACT_DELETED=0
+        REMOVE_COMPACT_DELETE_OK=true
+        # Page prefix and DELETE every non-keep entry (exact + wildcard).
+        # Lazy compact in DomainStore makes bulk DELETE cheap enough for default curl timeout.
+        for _pass in $(seq 1 40); do
+            page=$("${CURL[@]}" -b "$COOKIE_JAR" \
+                "$BASE_URL/api/blocklist?search=$REMOVE_COMPACT_PREFIX&limit=250")
+            if printf '%s\n' "$page" | grep -q '"domains":\[\]'; then
+                break
+            fi
+            deleted_this_pass=0
+            while IFS= read -r obj; do
+                [ -z "$obj" ] && continue
+                domain=$(printf '%s\n' "$obj" | sed -n 's/.*"domain":"\([^"]*\)".*/\1/p' | head -1)
+                id=$(printf '%s\n' "$obj" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p' | head -1)
+                [ -n "$domain" ] && [ -n "$id" ] || continue
+                # Keep rmc-1..KEEP.<prefix> only.
+                case "$domain" in
+                    rmc-*.${REMOVE_COMPACT_PREFIX})
+                        n=${domain#rmc-}
+                        n=${n%%.*}
+                        if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$REMOVE_COMPACT_KEEP" ] 2>/dev/null; then
+                            continue
+                        fi
+                        ;;
+                esac
+                http_code=$("${CURL[@]}" --max-time 30 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                    -X DELETE "$BASE_URL/api/blocklist/$id")
+                if [ "$http_code" = "200" ]; then
+                    REMOVE_COMPACT_DELETED=$((REMOVE_COMPACT_DELETED + 1))
+                    deleted_this_pass=$((deleted_this_pass + 1))
+                else
+                    REMOVE_COMPACT_DELETE_OK=false
+                fi
+            done < <(printf '%s\n' "$page" | tr '{' '\n' | grep -F '"domain":' || true)
+
+            leftover_non_keep=0
+            check_page=$("${CURL[@]}" -b "$COOKIE_JAR" \
+                "$BASE_URL/api/blocklist?search=$REMOVE_COMPACT_PREFIX&limit=250")
+            while IFS= read -r obj; do
+                [ -z "$obj" ] && continue
+                domain=$(printf '%s\n' "$obj" | sed -n 's/.*"domain":"\([^"]*\)".*/\1/p' | head -1)
+                [ -n "$domain" ] || continue
+                case "$domain" in
+                    rmc-*.${REMOVE_COMPACT_PREFIX})
+                        n=${domain#rmc-}
+                        n=${n%%.*}
+                        if [ "$n" -ge 1 ] 2>/dev/null && [ "$n" -le "$REMOVE_COMPACT_KEEP" ] 2>/dev/null; then
+                            continue
+                        fi
+                        ;;
+                esac
+                leftover_non_keep=$((leftover_non_keep + 1))
+            done < <(printf '%s\n' "$check_page" | tr '{' '\n' | grep -F '"domain":' || true)
+            if [ "$leftover_non_keep" -eq 0 ]; then
+                break
+            fi
+            if [ "$deleted_this_pass" -eq 0 ]; then
+                REMOVE_COMPACT_DELETE_OK=false
+                break
+            fi
+        done
+        sleep "$REMOVE_COMPACT_SETTLE_SECS"
+        if remote_resource_snapshot; then
+            REMOVE_COMPACT_RSS_AFTER_DELETE_KB="$RESOURCE_RSS_KB"
+        fi
+        expected_deleted=$((REMOVE_COMPACT_DOMAINS - REMOVE_COMPACT_KEEP + 1))
+        if [ "$REMOVE_COMPACT_DELETE_OK" = true ] && [ "$REMOVE_COMPACT_DELETED" -ge "$expected_deleted" ]; then
+            ok "$STEP" "remove-compact-delete" "deleted ${REMOVE_COMPACT_DELETED} entries via API (expected>=${expected_deleted}) rss_after=${REMOVE_COMPACT_RSS_AFTER_DELETE_KB}KB"
+        else
+            REMOVE_COMPACT_STATUS="delete_failed"
+            fail "$STEP" "remove-compact-delete" "delete incomplete deleted=${REMOVE_COMPACT_DELETED} expected>=${expected_deleted} ok=$REMOVE_COMPACT_DELETE_OK"
+        fi
+    else
+        skip "$STEP" "remove-compact-delete" "skipped because full DNS check failed"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        REMOVE_COMPACT_STICKY_DNS=0
+        REMOVE_COMPACT_KEEP_DNS_OK=0
+        REMOVE_COMPACT_WILD_STICKY=0
+        REMOVE_COMPACT_REMOVED_DNS=""
+        REMOVE_COMPACT_KEEP_DNS2=""
+        REMOVE_COMPACT_WILD_DNS2=""
+        for _try in 1 2 3 4 5; do
+            sleep "$REMOVE_COMPACT_SETTLE_SECS"
+            REMOVE_COMPACT_REMOVED_DNS=$(target_dns_a "$REMOVE_COMPACT_REMOVED_DOMAIN" 2>/dev/null || true)
+            REMOVE_COMPACT_KEEP_DNS2=$(target_dns_a "$REMOVE_COMPACT_KEEP_DOMAIN" 2>/dev/null || true)
+            REMOVE_COMPACT_WILD_DNS2=$(target_dns_a "sub.wild.${REMOVE_COMPACT_PREFIX}" 2>/dev/null || true)
+            if echo "$REMOVE_COMPACT_KEEP_DNS2" | grep -Fxq "$SINKHOLE_IPV4"; then
+                REMOVE_COMPACT_KEEP_DNS_OK=1
+            else
+                REMOVE_COMPACT_KEEP_DNS_OK=0
+            fi
+            if echo "$REMOVE_COMPACT_REMOVED_DNS" | grep -Fxq "$SINKHOLE_IPV4"; then
+                REMOVE_COMPACT_STICKY_DNS=1
+            else
+                REMOVE_COMPACT_STICKY_DNS=0
+            fi
+            if echo "$REMOVE_COMPACT_WILD_DNS2" | grep -Fxq "$SINKHOLE_IPV4"; then
+                REMOVE_COMPACT_WILD_STICKY=1
+            else
+                REMOVE_COMPACT_WILD_STICKY=0
+            fi
+            if [ "$REMOVE_COMPACT_KEEP_DNS_OK" -eq 1 ] \
+                && [ "$REMOVE_COMPACT_STICKY_DNS" -eq 0 ] \
+                && [ "$REMOVE_COMPACT_WILD_STICKY" -eq 0 ]; then
+                break
+            fi
+        done
+        if [ "$REMOVE_COMPACT_KEEP_DNS_OK" -ne 1 ]; then
+            REMOVE_COMPACT_STATUS="dns_failed"
+            fail "$STEP" "remove-compact-after-delete" "keep domain no longer sinkholed (got=${REMOVE_COMPACT_KEEP_DNS2:-empty})"
+        elif [ "$REMOVE_COMPACT_STICKY_DNS" -ne 0 ] || [ "$REMOVE_COMPACT_WILD_STICKY" -ne 0 ]; then
+            REMOVE_COMPACT_STATUS="sticky_dns"
+            fail "$STEP" "remove-compact-after-delete" "removed still sinkholed sticky_dns=$REMOVE_COMPACT_STICKY_DNS wild_sticky=$REMOVE_COMPACT_WILD_STICKY removed=${REMOVE_COMPACT_REMOVED_DNS:-empty} wild=${REMOVE_COMPACT_WILD_DNS2:-empty}"
+        else
+            ok "$STEP" "remove-compact-after-delete" "sticky_dns=0 keep_ok=1 wild_sticky=0 removed_dns=${REMOVE_COMPACT_REMOVED_DNS:-empty}"
+        fi
+    else
+        skip "$STEP" "remove-compact-after-delete" "skipped because delete did not complete"
+    fi
+
+    step
+    if [ "$REMOVE_COMPACT_STATUS" = "running" ]; then
+        # Churn unique insert+delete pairs; compact path must leave no residue.
+        # RSS growth is observational only (arena holes << page noise at this scale).
+        REMOVE_COMPACT_CHURN_OK=1
+        CHURN_BASE="${REMOVE_COMPACT_PREFIX}.churn"
+        for i in $(seq 1 "$REMOVE_COMPACT_CHURN"); do
+            domain="churn-${i}.${CHURN_BASE}"
+            add_resp=$("${CURL[@]}" -w "\n%{http_code}" -b "$COOKIE_JAR" \
+                -X POST "$BASE_URL/api/blocklist" \
+                -H "Content-Type: application/json" \
+                -d "{\"domain\":\"$domain\"}")
+            add_http=$(printf '%s\n' "$add_resp" | tail -1)
+            add_body=$(printf '%s\n' "$add_resp" | sed '$d')
+            add_id=$(printf '%s\n' "$add_body" | json_number "id")
+            if [ "$add_http" != "201" ] || [ -z "$add_id" ]; then
+                REMOVE_COMPACT_CHURN_OK=0
+                break
+            fi
+            del_http=$("${CURL[@]}" --max-time 30 -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+                -X DELETE "$BASE_URL/api/blocklist/$add_id")
+            if [ "$del_http" != "200" ]; then
+                REMOVE_COMPACT_CHURN_OK=0
+                break
+            fi
+        done
+        sleep "$REMOVE_COMPACT_SETTLE_SECS"
+        churn_keep_dns=$(target_dns_a "$REMOVE_COMPACT_KEEP_DOMAIN" 2>/dev/null || true)
+        if ! echo "$churn_keep_dns" | grep -Fxq "$SINKHOLE_IPV4"; then
+            REMOVE_COMPACT_CHURN_OK=0
+        fi
+        if remote_resource_snapshot; then
+            REMOVE_COMPACT_RSS_AFTER_CHURN_KB="$RESOURCE_RSS_KB"
+            if [ "$REMOVE_COMPACT_RSS_AFTER_DELETE_KB" -gt 0 ]; then
+                REMOVE_COMPACT_RSS_CHURN_GROWTH_KB=$((REMOVE_COMPACT_RSS_AFTER_CHURN_KB - REMOVE_COMPACT_RSS_AFTER_DELETE_KB))
+                [ "$REMOVE_COMPACT_RSS_CHURN_GROWTH_KB" -lt 0 ] && REMOVE_COMPACT_RSS_CHURN_GROWTH_KB=0
+            fi
+        fi
+        leftover=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/blocklist?search=$CHURN_BASE&limit=1")
+        if ! printf '%s\n' "$leftover" | grep -q '"domains":\[\]'; then
+            REMOVE_COMPACT_CHURN_OK=0
+        fi
+        if [ "$REMOVE_COMPACT_CHURN_OK" -ne 1 ]; then
+            REMOVE_COMPACT_STATUS="churn_failed"
+            fail "$STEP" "remove-compact-churn" "insert/delete churn failed or left residue (rss_note_growth=${REMOVE_COMPACT_RSS_CHURN_GROWTH_KB}KB)"
+        else
+            REMOVE_COMPACT_STATUS="passed"
+            ok "$STEP" "remove-compact-churn" "${REMOVE_COMPACT_CHURN} insert/delete cycles ok keep_sinkholed residue=0 rss_note_growth=${REMOVE_COMPACT_RSS_CHURN_GROWTH_KB}KB rss_after=${REMOVE_COMPACT_RSS_AFTER_CHURN_KB}KB"
+        fi
+    else
+        skip "$STEP" "remove-compact-churn" "skipped because after-delete DNS check failed"
+    fi
+
+    step
+    remove_compact_cleanup "$REMOVE_COMPACT_PREFIX"
+    # Churn used nested prefix; clean that too if residue somehow remains.
+    remove_compact_cleanup "${REMOVE_COMPACT_PREFIX}.churn"
+    ok "$STEP" "remove-compact-cleanup" "removed temporary domains for $REMOVE_COMPACT_PREFIX"
+
+    step
+    write_remove_compact_baseline
+    if [ "$REMOVE_COMPACT_STATUS" = "passed" ]; then
+        ok "$STEP" "remove-compact-report" "wrote $REMOVE_COMPACT_BASELINE_FILE status=passed deleted=$REMOVE_COMPACT_DELETED churn=$REMOVE_COMPACT_CHURN growth=${REMOVE_COMPACT_RSS_CHURN_GROWTH_KB}KB"
+    else
+        fail "$STEP" "remove-compact-report" "wrote $REMOVE_COMPACT_BASELINE_FILE status=$REMOVE_COMPACT_STATUS sticky_dns=$REMOVE_COMPACT_STICKY_DNS growth=${REMOVE_COMPACT_RSS_CHURN_GROWTH_KB}KB"
+    fi
+else
+    step
+    skip "$STEP" "remove-compact" "hardcoded off (MOCK_REMOVE_COMPACT_BASELINE=false)"
+fi
+
 
 
 
