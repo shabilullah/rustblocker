@@ -155,18 +155,40 @@ SYNC_APPLY_KEEP_DNS_OK=0
 SYNC_APPLY_FULL_DNS_OK=0
 SYNC_APPLY_REMOVED_DOMAIN=""
 SYNC_APPLY_KEEP_DOMAIN=""
-MOCK_RESOLVER_CACHE_BASELINE="${MOCK_RESOLVER_CACHE_BASELINE:-true}"
-RESOLVER_CACHE_BASELINE_FILE="${RESOLVER_CACHE_BASELINE_FILE:-target/mock-resolver-cache-baseline.json}"
-RESOLVER_CACHE_BASELINE_UPSTREAMS="${RESOLVER_CACHE_BASELINE_UPSTREAMS:-2}"
-RESOLVER_CACHE_BASELINE_DNS_SAMPLES="${RESOLVER_CACHE_BASELINE_DNS_SAMPLES:-48}"
-RESOLVER_CACHE_BASELINE_SETTLE_SECS="${RESOLVER_CACHE_BASELINE_SETTLE_SECS:-2}"
+# Resolver cache floor (finding 6): always-on agent smoke + measurements.
+# Measures:
+#   1) hit-rate proxy: warm-pass p95 vs first-pass p95 on same domain set
+#   2) heavy unique-domain p95 (many one-shot names → forced misses)
+#   3) RSS before/after unique fill (observational; allocator may keep pages)
+# Gates fail on SERVFAIL, absolute p95, warm slower than cold, or hit-proxy collapse.
+# Unit test locks DEFAULT_CACHE_SIZE=32768; /api/version exposes it.
+MOCK_RESOLVER_CACHE_BASELINE=true
+RESOLVER_CACHE_BASELINE_FILE="target/mock-resolver-cache-baseline.json"
+RESOLVER_CACHE_BASELINE_UNIQUE_SAMPLES=200
+RESOLVER_CACHE_BASELINE_WARM_SAMPLES=48
+RESOLVER_CACHE_BASELINE_HIT_ROUNDS=3
+# Absolute p95 gates (ms).
+RESOLVER_CACHE_P95_MAX_MS=300
+RESOLVER_CACHE_WARM_P95_MAX_MS=150
+RESOLVER_CACHE_HEAVY_P95_MAX_MS=350
+# Warm p95 must stay at/under first-pass p95 + climb budget (hit-rate proxy).
+RESOLVER_CACHE_P95_CLIMB_MAX_MS=50
+# Hit proxy: warm_p95 / first_p95 must be <= this ratio (lower = more hit benefit).
+# 1.0 means warm no worse than first; allow small noise via climb budget instead.
+RESOLVER_CACHE_HIT_RATIO_MAX_PCT=110
 RESOLVER_CACHE_BASELINE_STATUS="not_started"
-RESOLVER_CACHE_BASELINE_RSS_PRE_KB=0
-RESOLVER_CACHE_BASELINE_RSS_POST_KB=0
-RESOLVER_CACHE_BASELINE_QUERY_COUNT=0
-RESOLVER_CACHE_BASELINE_DNS_FAILURES=0
-RESOLVER_CACHE_BASELINE_DNS_P95_MS=0
 RESOLVER_CACHE_BASELINE_NOTE=""
+RESOLVER_CACHE_BASELINE_COLD_P95_MS=0
+RESOLVER_CACHE_BASELINE_WARM_P95_MS=0
+RESOLVER_CACHE_BASELINE_FIRST_P95_MS=0
+RESOLVER_CACHE_BASELINE_HEAVY_P95_MS=0
+RESOLVER_CACHE_BASELINE_P95_MS=0
+RESOLVER_CACHE_BASELINE_MAX_MS=0
+RESOLVER_CACHE_BASELINE_PREV_P95_MS=""
+RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT=0
+RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB=0
+RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB=0
+RESOLVER_CACHE_BASELINE_RSS_DELTA_KB=0
 
 
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
@@ -942,12 +964,15 @@ fi
 step
 VERSION_JSON=$("${CURL[@]}" "$BASE_URL/api/version")
 DEPLOYED_BUILD=$(echo "$VERSION_JSON" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p' | head -1)
-if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ]; then
-    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID"
-elif { [ "$SKIP_BUILD" = true ] || [ "$SKIP_DEPLOY" = true ]; } && [ -n "$DEPLOYED_BUILD" ]; then
-    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD"
+DEPLOYED_CACHE_SIZE=$(echo "$VERSION_JSON" | sed -n 's/.*"resolver_cache_size":\([0-9][0-9]*\).*/\1/p' | head -1)
+if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ] \
+    && [ "${DEPLOYED_CACHE_SIZE:-0}" = "32768" ]; then
+    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID resolver_cache_size=$DEPLOYED_CACHE_SIZE"
+elif { [ "$SKIP_BUILD" = true ] || [ "$SKIP_DEPLOY" = true ]; } && [ -n "$DEPLOYED_BUILD" ] \
+    && [ -n "$DEPLOYED_CACHE_SIZE" ]; then
+    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD resolver_cache_size=$DEPLOYED_CACHE_SIZE"
 else
-    fail "$STEP" "version" "unexpected deployed build id '${DEPLOYED_BUILD:-missing}' (expected $MOCK_BUILD_ID; response: ${VERSION_JSON:-empty})"
+    fail "$STEP" "version" "unexpected version payload build='${DEPLOYED_BUILD:-missing}' cache='${DEPLOYED_CACHE_SIZE:-missing}' (expected build=$MOCK_BUILD_ID cache=32768; response: ${VERSION_JSON:-empty})"
 fi
 
 # Step: DB-backed API smoke checks.
@@ -1719,82 +1744,198 @@ else
     skip "$STEP" "domainstore-baseline" "disabled; set MOCK_DOMAINSTORE_BASELINE=true to measure DomainStore RSS"
 fi
 
-# Resolver cache baseline: verify that tuned resolver cache (256K per upstream,
-# 3 concurrent requests) maintains DNS correctness and latency without regressions.
-# Proof points: 100% queries reach upstream (no SERVFAIL), p95 latency stable.
-# RSS not measured — jemalloc won't return memory after cache shrink.
+# Resolver cache floor (finding 6): DEFAULT_CACHE_SIZE=32_768 per upstream.
+# Measures hit-rate proxy, heavy unique p95, RSS delta; gates on climb/SERVFAIL.
 if enabled "$MOCK_RESOLVER_CACHE_BASELINE"; then
+    step
     RESOLVER_CACHE_BASELINE_STATUS="running"
     RESOLVER_CACHE_BASELINE_SERVFAIL=0
     RESOLVER_CACHE_BASELINE_EMPTY=0
     RESOLVER_CACHE_BASELINE_UPSTREAM=0
-    RESOLVER_CACHE_BASELINE_LATENCIES=()
+    RESOLVER_CACHE_HEAVY_LAT=()
+    RESOLVER_CACHE_FIRST_LAT=()
+    RESOLVER_CACHE_WARM_LAT=()
+    RESOLVER_CACHE_ALL_LAT=()
 
-    # Use real domains that actually resolve to exercise the forwarder resolver cache.
-    # Repeating 6 domains × 8 = 48 queries. NXDOMAIN from upstream is valid;
-    # SERVFAIL or empty output indicates a forwarder problem.
-    REAL_DOMAINS=(example.com cloudflare.com google.com github.com mozilla.org rust-lang.org)
+    RESOLVER_CACHE_BASELINE_PREV_P95_MS=""
+    if [ -f "$RESOLVER_CACHE_BASELINE_FILE" ]; then
+        # Prefer prior warm p95 when present (new schema); else overall.
+        RESOLVER_CACHE_BASELINE_PREV_P95_MS=$(sed -n 's/.*"dns_warm_p95_ms":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$RESOLVER_CACHE_BASELINE_FILE" | head -1)
+        if [ -z "$RESOLVER_CACHE_BASELINE_PREV_P95_MS" ]; then
+            RESOLVER_CACHE_BASELINE_PREV_P95_MS=$(sed -n 's/.*"dns_p95_ms":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$RESOLVER_CACHE_BASELINE_FILE" | head -1)
+        fi
+    fi
 
-    for i in $(seq 1 48); do
-        DOMAIN_IDX=$(( (i - 1) % 6 ))
-        DOMAIN="${REAL_DOMAINS[$DOMAIN_IDX]}"
+    p95_of() {
+        local sorted count idx
+        sorted=$(sort -n)
+        count=$(printf '%s\n' "$sorted" | grep -c . || true)
+        [ "${count:-0}" -lt 1 ] && { echo 0; return; }
+        idx=$(( (count * 95 + 99) / 100 ))
+        [ "$idx" -lt 1 ] && idx=1
+        printf '%s\n' "$sorted" | sed -n "${idx}p"
+    }
+    max_of() { sort -n | tail -1; }
+
+    # RSS before heavy unique fill.
+    if remote_resource_snapshot; then
+        RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB="$RESOURCE_RSS_KB"
+    else
+        RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB=0
+    fi
+
+    # --- Heavy unique miss path (forced upstream / NXDOMAIN). ---
+    for i in $(seq 1 "$RESOLVER_CACHE_BASELINE_UNIQUE_SAMPLES"); do
+        DOMAIN="rb-cache-heavy-${RUN_TAG}-${i}.example.com"
         START_MS=$(now_ms)
         RESULT=$(target_dns_a "$DOMAIN" 2>/dev/null || true)
         END_MS=$(now_ms)
         LATENCY=$((END_MS - START_MS))
-        RESOLVER_CACHE_BASELINE_LATENCIES+=("$LATENCY")
-
-        # Empty output = forwarder/connection failure (no response at all)
-        if [ -z "$RESULT" ]; then
-            RESOLVER_CACHE_BASELINE_EMPTY=$((RESOLVER_CACHE_BASELINE_EMPTY + 1))
-        # SERVFAIL / error / connection refused = upstream forwarding problem
-        elif echo "$RESULT" | grep -qi "servfail\|error\|connection refused\|timed out"; then
+        RESOLVER_CACHE_HEAVY_LAT+=("$LATENCY")
+        RESOLVER_CACHE_ALL_LAT+=("$LATENCY")
+        if echo "$RESULT" | grep -qi "servfail\|error\|connection refused\|timed out"; then
             RESOLVER_CACHE_BASELINE_SERVFAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + 1))
         else
-            # Any other response (A record, NXDOMAIN, CNAME chain) = upstream reached
+            # dig +short silent on NXDOMAIN → empty is success for unique cold names.
             RESOLVER_CACHE_BASELINE_UPSTREAM=$((RESOLVER_CACHE_BASELINE_UPSTREAM + 1))
         fi
     done
 
-    # Calculate p95 latency
-    RESOLVER_CACHE_BASELINE_P95_MS=0
-    RESOLVER_CACHE_BASELINE_MAX_MS=0
-    if [ ${#RESOLVER_CACHE_BASELINE_LATENCIES[@]} -gt 0 ]; then
-        SORTED_LAT=$(printf '%s\n' "${RESOLVER_CACHE_BASELINE_LATENCIES[@]}" | sort -n)
-        LAT_COUNT=${#RESOLVER_CACHE_BASELINE_LATENCIES[@]}
-        P95_IDX=$(( (LAT_COUNT * 95 + 99) / 100 ))
-        [ "$P95_IDX" -lt 1 ] && P95_IDX=1
-        RESOLVER_CACHE_BASELINE_P95_MS=$(printf '%s\n' "$SORTED_LAT" | sed -n "${P95_IDX}p")
-        RESOLVER_CACHE_BASELINE_MAX_MS=$(printf '%s\n' "$SORTED_LAT" | tail -1)
-    fi
-
-    RESOLVER_CACHE_BASELINE_NOTE="cache_size=256K_per_resolver num_concurrent=3 negative_ttl=10m"
-    RESOLVER_CACHE_BASELINE_TOTAL_FAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY))
-    if [ "$RESOLVER_CACHE_BASELINE_TOTAL_FAIL" -eq 0 ]; then
-        ok "$STEP" "resolver-cache-baseline" "upstream=${RESOLVER_CACHE_BASELINE_UPSTREAM} p95=${RESOLVER_CACHE_BASELINE_P95_MS}ms max=${RESOLVER_CACHE_BASELINE_MAX_MS}ms note="$RESOLVER_CACHE_BASELINE_NOTE""
+    if remote_resource_snapshot; then
+        RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB="$RESOURCE_RSS_KB"
+        RESOLVER_CACHE_BASELINE_RSS_DELTA_KB=$((RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB - RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB))
+        [ "$RESOLVER_CACHE_BASELINE_RSS_DELTA_KB" -lt 0 ] && RESOLVER_CACHE_BASELINE_RSS_DELTA_KB=0
     else
-        fail "$STEP" "resolver-cache-baseline" "failures=empty=${RESOLVER_CACHE_BASELINE_EMPTY} servfail=${RESOLVER_CACHE_BASELINE_SERVFAIL} upstream=${RESOLVER_CACHE_BASELINE_UPSTREAM}"
+        RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB=0
+        RESOLVER_CACHE_BASELINE_RSS_DELTA_KB=0
     fi
 
-    # Write baseline JSON (shell-based, no python dependency)
+    # --- Hit-rate proxy on real domains: first pass (miss/fill) then warm rounds. ---
+    REAL_DOMAINS=(example.com cloudflare.com google.com github.com mozilla.org rust-lang.org wikipedia.org amazon.com microsoft.com apple.com)
+    REAL_N=${#REAL_DOMAINS[@]}
+
+    # First pass over the set (populate cache).
+    for idx in $(seq 0 $((REAL_N - 1))); do
+        DOMAIN="${REAL_DOMAINS[$idx]}"
+        START_MS=$(now_ms)
+        RESULT=$(target_dns_a "$DOMAIN" 2>/dev/null || true)
+        END_MS=$(now_ms)
+        LATENCY=$((END_MS - START_MS))
+        RESOLVER_CACHE_FIRST_LAT+=("$LATENCY")
+        RESOLVER_CACHE_ALL_LAT+=("$LATENCY")
+        if [ -z "$RESULT" ]; then
+            RESOLVER_CACHE_BASELINE_EMPTY=$((RESOLVER_CACHE_BASELINE_EMPTY + 1))
+        elif echo "$RESULT" | grep -qi "servfail\|error\|connection refused\|timed out"; then
+            RESOLVER_CACHE_BASELINE_SERVFAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + 1))
+        else
+            RESOLVER_CACHE_BASELINE_UPSTREAM=$((RESOLVER_CACHE_BASELINE_UPSTREAM + 1))
+        fi
+    done
+
+    # Warm rounds: repeats should hit LRU (latency should not climb).
+    for r in $(seq 1 "$RESOLVER_CACHE_BASELINE_HIT_ROUNDS"); do
+        for i in $(seq 1 "$RESOLVER_CACHE_BASELINE_WARM_SAMPLES"); do
+            DOMAIN_IDX=$(( (i - 1) % REAL_N ))
+            DOMAIN="${REAL_DOMAINS[$DOMAIN_IDX]}"
+            START_MS=$(now_ms)
+            RESULT=$(target_dns_a "$DOMAIN" 2>/dev/null || true)
+            END_MS=$(now_ms)
+            LATENCY=$((END_MS - START_MS))
+            RESOLVER_CACHE_WARM_LAT+=("$LATENCY")
+            RESOLVER_CACHE_ALL_LAT+=("$LATENCY")
+            if [ -z "$RESULT" ]; then
+                RESOLVER_CACHE_BASELINE_EMPTY=$((RESOLVER_CACHE_BASELINE_EMPTY + 1))
+            elif echo "$RESULT" | grep -qi "servfail\|error\|connection refused\|timed out"; then
+                RESOLVER_CACHE_BASELINE_SERVFAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + 1))
+            else
+                RESOLVER_CACHE_BASELINE_UPSTREAM=$((RESOLVER_CACHE_BASELINE_UPSTREAM + 1))
+            fi
+        done
+    done
+
+    RESOLVER_CACHE_BASELINE_HEAVY_P95_MS=$(printf '%s\n' "${RESOLVER_CACHE_HEAVY_LAT[@]}" | p95_of)
+    RESOLVER_CACHE_BASELINE_FIRST_P95_MS=$(printf '%s\n' "${RESOLVER_CACHE_FIRST_LAT[@]}" | p95_of)
+    RESOLVER_CACHE_BASELINE_WARM_P95_MS=$(printf '%s\n' "${RESOLVER_CACHE_WARM_LAT[@]}" | p95_of)
+    RESOLVER_CACHE_BASELINE_P95_MS=$(printf '%s\n' "${RESOLVER_CACHE_ALL_LAT[@]}" | p95_of)
+    RESOLVER_CACHE_BASELINE_MAX_MS=$(printf '%s\n' "${RESOLVER_CACHE_ALL_LAT[@]}" | max_of)
+    RESOLVER_CACHE_BASELINE_HEAVY_P95_MS=${RESOLVER_CACHE_BASELINE_HEAVY_P95_MS:-0}
+    RESOLVER_CACHE_BASELINE_FIRST_P95_MS=${RESOLVER_CACHE_BASELINE_FIRST_P95_MS:-0}
+    RESOLVER_CACHE_BASELINE_WARM_P95_MS=${RESOLVER_CACHE_BASELINE_WARM_P95_MS:-0}
+    RESOLVER_CACHE_BASELINE_P95_MS=${RESOLVER_CACHE_BASELINE_P95_MS:-0}
+    RESOLVER_CACHE_BASELINE_MAX_MS=${RESOLVER_CACHE_BASELINE_MAX_MS:-0}
+    # Alias cold=heavy for gates/compat with prior field names.
+    RESOLVER_CACHE_BASELINE_COLD_P95_MS=$RESOLVER_CACHE_BASELINE_HEAVY_P95_MS
+
+    if [ "$RESOLVER_CACHE_BASELINE_FIRST_P95_MS" -gt 0 ]; then
+        RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT=$(( RESOLVER_CACHE_BASELINE_WARM_P95_MS * 100 / RESOLVER_CACHE_BASELINE_FIRST_P95_MS ))
+    else
+        RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT=0
+    fi
+
+    RESOLVER_CACHE_BASELINE_NOTE="cache_size=32768 heavy_unique=${RESOLVER_CACHE_BASELINE_UNIQUE_SAMPLES} warm_rounds=${RESOLVER_CACHE_BASELINE_HIT_ROUNDS}x${RESOLVER_CACHE_BASELINE_WARM_SAMPLES}"
+    RESOLVER_CACHE_BASELINE_TOTAL_FAIL=$((RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY))
+    RESOLVER_CACHE_BASELINE_QUERY_COUNT=$((RESOLVER_CACHE_BASELINE_UPSTREAM + RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY))
+
+    FAIL_DETAIL=""
+    if [ "$RESOLVER_CACHE_BASELINE_TOTAL_FAIL" -ne 0 ]; then
+        FAIL_DETAIL="failures empty=${RESOLVER_CACHE_BASELINE_EMPTY} servfail=${RESOLVER_CACHE_BASELINE_SERVFAIL}"
+    elif [ "$RESOLVER_CACHE_BASELINE_HEAVY_P95_MS" -gt "$RESOLVER_CACHE_HEAVY_P95_MAX_MS" ]; then
+        FAIL_DETAIL="heavy_unique_p95=${RESOLVER_CACHE_BASELINE_HEAVY_P95_MS}ms exceeded max ${RESOLVER_CACHE_HEAVY_P95_MAX_MS}ms"
+    elif [ "$RESOLVER_CACHE_BASELINE_WARM_P95_MS" -gt "$RESOLVER_CACHE_WARM_P95_MAX_MS" ]; then
+        FAIL_DETAIL="warm_p95=${RESOLVER_CACHE_BASELINE_WARM_P95_MS}ms exceeded max ${RESOLVER_CACHE_WARM_P95_MAX_MS}ms"
+    elif [ "$RESOLVER_CACHE_BASELINE_WARM_P95_MS" -gt $((RESOLVER_CACHE_BASELINE_FIRST_P95_MS + RESOLVER_CACHE_P95_CLIMB_MAX_MS)) ]; then
+        FAIL_DETAIL="warm_p95=${RESOLVER_CACHE_BASELINE_WARM_P95_MS}ms climbed above first_p95=${RESOLVER_CACHE_BASELINE_FIRST_P95_MS}ms + ${RESOLVER_CACHE_P95_CLIMB_MAX_MS}ms (hit proxy collapsed)"
+    elif [ "$RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT" -gt "$RESOLVER_CACHE_HIT_RATIO_MAX_PCT" ]; then
+        FAIL_DETAIL="hit_ratio_pct=${RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT} (warm/first) exceeded max ${RESOLVER_CACHE_HIT_RATIO_MAX_PCT}"
+    elif [ -n "$RESOLVER_CACHE_BASELINE_PREV_P95_MS" ] \
+        && [ "$RESOLVER_CACHE_BASELINE_WARM_P95_MS" -gt $((RESOLVER_CACHE_BASELINE_PREV_P95_MS + RESOLVER_CACHE_P95_CLIMB_MAX_MS)) ]; then
+        FAIL_DETAIL="warm_p95=${RESOLVER_CACHE_BASELINE_WARM_P95_MS}ms climbed from prior ${RESOLVER_CACHE_BASELINE_PREV_P95_MS}ms by more than ${RESOLVER_CACHE_P95_CLIMB_MAX_MS}ms"
+    fi
+
+    if [ -z "$FAIL_DETAIL" ]; then
+        RESOLVER_CACHE_BASELINE_STATUS="passed"
+        ok "$STEP" "resolver-cache-baseline" "ok q=${RESOLVER_CACHE_BASELINE_QUERY_COUNT} heavy_p95=${RESOLVER_CACHE_BASELINE_HEAVY_P95_MS}ms first_p95=${RESOLVER_CACHE_BASELINE_FIRST_P95_MS}ms warm_p95=${RESOLVER_CACHE_BASELINE_WARM_P95_MS}ms hit_ratio=${RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT}% rss_delta=${RESOLVER_CACHE_BASELINE_RSS_DELTA_KB}KB prev_warm=${RESOLVER_CACHE_BASELINE_PREV_P95_MS:-none}"
+    else
+        RESOLVER_CACHE_BASELINE_STATUS="failed"
+        fail "$STEP" "resolver-cache-baseline" "$FAIL_DETAIL (heavy=${RESOLVER_CACHE_BASELINE_HEAVY_P95_MS} first=${RESOLVER_CACHE_BASELINE_FIRST_P95_MS} warm=${RESOLVER_CACHE_BASELINE_WARM_P95_MS} hit_ratio=${RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT}% rss_delta=${RESOLVER_CACHE_BASELINE_RSS_DELTA_KB}KB)"
+    fi
+
     cat > "$RESOLVER_CACHE_BASELINE_FILE" <<JSONEOF
 {
-  "status": "$([ "$RESOLVER_CACHE_BASELINE_TOTAL_FAIL" -eq 0 ] && echo passed || echo failed)",
+  "status": "$RESOLVER_CACHE_BASELINE_STATUS",
   "build_id": "$MOCK_BUILD_ID",
   "git_rev": "$GIT_REV",
-  "query_count": $((RESOLVER_CACHE_BASELINE_UPSTREAM + RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY)),
+  "cache_size_per_resolver": 32768,
+  "query_count": $RESOLVER_CACHE_BASELINE_QUERY_COUNT,
   "upstream_success": $RESOLVER_CACHE_BASELINE_UPSTREAM,
   "servfail": $RESOLVER_CACHE_BASELINE_SERVFAIL,
   "empty": $RESOLVER_CACHE_BASELINE_EMPTY,
+  "heavy_unique_samples": $RESOLVER_CACHE_BASELINE_UNIQUE_SAMPLES,
+  "warm_repeat_samples": $((RESOLVER_CACHE_BASELINE_WARM_SAMPLES * RESOLVER_CACHE_BASELINE_HIT_ROUNDS)),
+  "first_pass_samples": $REAL_N,
+  "dns_heavy_unique_p95_ms": $RESOLVER_CACHE_BASELINE_HEAVY_P95_MS,
+  "dns_first_p95_ms": $RESOLVER_CACHE_BASELINE_FIRST_P95_MS,
+  "dns_warm_p95_ms": $RESOLVER_CACHE_BASELINE_WARM_P95_MS,
+  "dns_cold_p95_ms": $RESOLVER_CACHE_BASELINE_COLD_P95_MS,
   "dns_p95_ms": $RESOLVER_CACHE_BASELINE_P95_MS,
   "dns_max_ms": $RESOLVER_CACHE_BASELINE_MAX_MS,
+  "hit_ratio_pct": $RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT,
+  "rss_before_kb": $RESOLVER_CACHE_BASELINE_RSS_BEFORE_KB,
+  "rss_after_heavy_kb": $RESOLVER_CACHE_BASELINE_RSS_AFTER_HEAVY_KB,
+  "rss_delta_kb": $RESOLVER_CACHE_BASELINE_RSS_DELTA_KB,
+  "prev_dns_p95_ms": ${RESOLVER_CACHE_BASELINE_PREV_P95_MS:-null},
+  "heavy_p95_max_ms": $RESOLVER_CACHE_HEAVY_P95_MAX_MS,
+  "warm_p95_max_ms": $RESOLVER_CACHE_WARM_P95_MAX_MS,
+  "p95_climb_max_ms": $RESOLVER_CACHE_P95_CLIMB_MAX_MS,
+  "hit_ratio_max_pct": $RESOLVER_CACHE_HIT_RATIO_MAX_PCT,
   "note": "$RESOLVER_CACHE_BASELINE_NOTE",
   "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 JSONEOF
-    echo "wrote baseline queries=$((RESOLVER_CACHE_BASELINE_UPSTREAM + RESOLVER_CACHE_BASELINE_SERVFAIL + RESOLVER_CACHE_BASELINE_EMPTY)) p95=${RESOLVER_CACHE_BASELINE_P95_MS}ms"
+    echo "wrote $RESOLVER_CACHE_BASELINE_FILE status=$RESOLVER_CACHE_BASELINE_STATUS heavy_p95=${RESOLVER_CACHE_BASELINE_HEAVY_P95_MS} first_p95=${RESOLVER_CACHE_BASELINE_FIRST_P95_MS} warm_p95=${RESOLVER_CACHE_BASELINE_WARM_P95_MS} hit_ratio=${RESOLVER_CACHE_BASELINE_HIT_RATIO_PCT}% rss_delta=${RESOLVER_CACHE_BASELINE_RSS_DELTA_KB}KB"
 else
-    skip "$STEP" "resolver-cache-baseline" "disabled by MOCK_RESOLVER_CACHE_BASELINE=false"
+    step
+    skip "$STEP" "resolver-cache-baseline" "hardcoded off (MOCK_RESOLVER_CACHE_BASELINE=false)"
 fi
 
 # Sticky-domain baseline (issue 1b): source refresh that shrinks a list must drop

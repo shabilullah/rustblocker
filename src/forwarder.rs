@@ -155,11 +155,16 @@ impl Clone for ParallelForwarder {
 }
 
 impl ParallelForwarder {
-    /// Default cache size per resolver: 256K responses (was 1M).
-    /// All upstreams query the same domain space, so most entries overlap.
-    /// Reducing per-resolver cache cuts total memory ~4× with negligible
-    /// cache-miss penalty (queries still hit the fastest upstream first).
-    const DEFAULT_CACHE_SIZE: u64 = 256_000;
+    /// Default cache size per resolver: 32K responses (was 256K, earlier 1M).
+    /// Each upstream owns a separate LRU; N upstreams ⇒ N×cache_size entries.
+    /// Shared domain space means most hits overlap, so a smaller per-resolver
+    /// cache cuts RAM floor sharply with little miss cost on the hot path.
+    pub const DEFAULT_CACHE_SIZE: u64 = 32_768;
+
+    /// Configured per-upstream response cache size (entries).
+    pub fn cache_size(&self) -> u64 {
+        Self::DEFAULT_CACHE_SIZE
+    }
     /// More aggressive hedging: fan out to 3 upstreams simultaneously.
     const DEFAULT_NUM_CONCURRENT_REQS: usize = 3;
     /// Shorter negative TTL to avoid caching stale NXDOMAIN/NODATA too long.
@@ -724,6 +729,17 @@ mod tests {
 
     fn record(name: &str, ttl: u32, data: RData) -> Record {
         Record::from_rdata(Name::from_ascii(format!("{}.", name)).unwrap(), ttl, data)
+    }
+
+    #[test]
+    fn default_cache_size_is_bounded_per_upstream() {
+        // Finding 6: N upstreams each hold DEFAULT_CACHE_SIZE entries.
+        // Keep this well below the old 256K floor and above hickory's 8K default.
+        assert_eq!(ParallelForwarder::DEFAULT_CACHE_SIZE, 32_768);
+        const {
+            assert!(ParallelForwarder::DEFAULT_CACHE_SIZE < 256_000);
+            assert!(ParallelForwarder::DEFAULT_CACHE_SIZE >= 8_192);
+        }
     }
 
     /// Regression: an A query for a CNAME-chained domain (e.g.

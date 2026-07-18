@@ -1472,6 +1472,7 @@ async fn get_version() -> impl Responder {
         "version": update::current_version(),
         "build": update::build_id(),
         "target": env!("TARGET_TRIPLE"),
+        "resolver_cache_size": crate::forwarder::ParallelForwarder::DEFAULT_CACHE_SIZE,
     }))
 }
 
