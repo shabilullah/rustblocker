@@ -1,6 +1,6 @@
 # AGENTS.md
 ## Before Changes
-- Performance/optimization/resource work: if `scripts/mock-deploy.sh` lacks claimed-gain metric, update it; capture baseline before edits; claim gains only with before/after same target/config.
+- Performance/optimization/resource work: if `cargo run --bin xtask -- mock-deploy` lacks claimed-gain metric, update it; capture baseline before edits; claim gains only with before/after same target/config.
 ## Verify
 - MUST pass: `cargo fmt --all -- --check`; `cargo clippy --all-targets -- -D warnings`; `cargo test`.
 - Fmt fail: run `cargo fmt --all`, recheck. Windows lock: `cargo test --target-dir target/codex-test`, report.
@@ -8,8 +8,8 @@
 - JS change (`static/app.js`): `node --check static/app.js`.
 - Never commit failing checks.
 ## Runtime Proof
-- Default proof: `bash -n scripts/mock-deploy.sh`; `bash scripts/mock-deploy.sh`.
-- Any implementation change MUST add/update `scripts/mock-deploy.sh` proof.
+- Default proof: `cargo run --bin xtask -- mock-deploy`.
+- Any implementation change MUST add/update `cargo run --bin xtask -- mock-deploy` proof.
 - Proof MUST verify outcome and stress changed runtime path; performance/resource claims MUST measure.
 - Unit tests never replace runtime proof.
 - Any change MUST use full build/deploy proof; never use `--skip-build --skip-deploy`.

@@ -315,23 +315,25 @@ sudo ./scripts/install.sh
 
 ## Agent Mock Deploy Test
 
-`scripts/mock-deploy.sh` is the agent-friendly end-to-end test for a designated deploy machine.
+`cargo run --bin xtask -- mock-deploy` is the native end-to-end deploy proof for a designated test machine. It replaces the old `scripts/mock-deploy.sh` shell runner.
 
 ```bash
 cp scripts/.deployenv.example scripts/.deployenv
 # Fill SSH_HOST, SSH_USER, SSH_PASSWORD, WEBUI_PASSWORD, DOMAIN, ACME_EMAIL, and CF_TOKEN.
 
-bash scripts/mock-deploy.sh --timeout=45
+cargo run --bin xtask -- mock-deploy --report-dir=target/mock-report --timeout=45
 ```
 
 Useful options:
 
 ```bash
-bash scripts/mock-deploy.sh --skip-build
-bash scripts/mock-deploy.sh --skip-deploy
-FORCE_ACME=true bash scripts/mock-deploy.sh --timeout=45
-ACME_POLL_ATTEMPTS=30 bash scripts/mock-deploy.sh --timeout=45
+cargo run --bin xtask -- mock-deploy --skip-build
+cargo run --bin xtask -- mock-deploy --skip-deploy
+cargo run --bin xtask -- mock-deploy --compare=target/mock-report/summary.json
+ACME_POLL_ATTEMPTS=30 cargo run --bin xtask -- mock-deploy --timeout=45
 ```
+
+The runner reads `scripts/.deployenv`, writes JSON-lines to `<report-dir>/run.jsonl`, writes `<report-dir>/summary.json`, and exits non-zero if any step fails. Process environment values override `.deployenv` values, which lets CI pin gates such as `MEMORY_RSS_GROWTH_MAX_KB` or `QUERY_LOG_PRUNE_WAL_MAX_BYTES` without editing secrets.
 
 ## Docker Multi-Stage Build
 

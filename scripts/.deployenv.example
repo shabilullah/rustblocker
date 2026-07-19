@@ -1,5 +1,6 @@
 # Deploy + mock test credentials (keep this file local — gitignored)
-# Copy this file to .deployenv, fill in your values, then run ./scripts/deploy.sh
+# Copy this file to .deployenv, fill in your values, then run:
+#   cargo run --bin xtask -- mock-deploy --report-dir=target/mock-report
 
 # SSH connection
 SSH_HOST=192.168.0.4
@@ -12,15 +13,15 @@ WEBUI_PASSWORD=
 # Web UI port (default: 54)
 WEB_PORT=54
 
-# Number of concurrent DB-heavy snapshot requests used by mock-deploy.sh to
+# Number of concurrent DB-heavy snapshot requests used by xtask mock-deploy to
 # prove health/DNS responsiveness while SQLite work is active.
 DB_CONCURRENCY_REQUESTS=16
 
-# Number of concurrent /api/stats requests used by mock-deploy.sh to prove the
+# Number of concurrent /api/stats requests used by xtask mock-deploy to prove the
 # stats endpoint remains responsive with retained query logs.
 STATS_CONCURRENCY_REQUESTS=8
 
-# Number of concurrent DNS hot-path queries used by mock-deploy.sh for exact
+# Number of concurrent DNS hot-path queries used by xtask mock-deploy for exact
 # blocklist, wildcard blocklist, and rewrite regression checks.
 DNS_BURST_REQUESTS=96
 DNS_BURST_MAX_MS=8000
@@ -38,9 +39,12 @@ MEMORY_IMPORT_DOMAINS=100
 
 # Process resource guardrails for the deployed rustblocker process.
 MEMORY_RSS_MAX_KB=262144
-MEMORY_RSS_GROWTH_MAX_KB=65536
+MEMORY_RSS_GROWTH_MAX_KB=131072
 PROCESS_FD_MAX=1024
 PROCESS_THREADS_MAX=128
+
+# Query log prune storage guardrail. Larger targets can retain a small WAL briefly.
+QUERY_LOG_PRUNE_WAL_MAX_BYTES=262144
 
 # Optional blocklist capacity stress mode. This grows a temporary blocklist by
 # tiers until DNS latency/resource thresholds reject a tier, writes the last
