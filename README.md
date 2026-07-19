@@ -6,12 +6,12 @@ For build, test, REST API, SQLite, architecture, source import, and API setup de
 
 ## Installation Quick Start
 
-Tested platform: Alpine Linux `x86_64` only.
+Tested manual smoke target: Alpine Linux `x86_64`.
 
-One-line install for Alpine, Ubuntu, Debian, and other Linux systems:
+Installer supports Linux `x86_64`/`aarch64` with systemd or OpenRC:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo sh
 ```
 
 This installs the binary, sets up an OpenRC or systemd service, and starts RustBlocker. Re-run the same command to update.
@@ -19,7 +19,7 @@ This installs the binary, sets up an OpenRC or systemd service, and starts RustB
 Uninstall:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo bash -s -- --uninstall
+curl -sSL https://raw.githubusercontent.com/shabilullah/rustblocker/main/scripts/install.sh | sudo sh -s -- --uninstall
 ```
 
 Defaults after installation:
@@ -47,9 +47,10 @@ sudo rustblocker --genpass                       # Generate/reset admin password
 rustblocker --genpass --db-path /path/to/db      # Use an explicit database path
 rustblocker --https-port 8443                    # Custom HTTPS port when a valid cert exists
 rustblocker --force-http                         # Force HTTP-only even if HTTPS is configured
+rustblocker --dns-max-in-flight 1024             # DNS concurrency cap; excess gets SERVFAIL
 ```
 
-`--genpass` auto-detects the service database at `/var/lib/rustblocker/rustblocker.db` when it exists. When run as root, it restarts the `rustblocker` service so existing Web UI sessions are invalidated immediately.
+Installed wrapper uses `/var/lib/rustblocker/rustblocker.db`; raw binary auto-detects that service database when it exists. When `--genpass` runs as root, it restarts the `rustblocker` service so existing Web UI sessions are invalidated immediately.
 
 Replica sync CLI overrides:
 
