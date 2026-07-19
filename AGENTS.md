@@ -12,7 +12,7 @@
 - Any implementation change MUST add/update `scripts/mock-deploy.sh` proof.
 - Proof MUST verify outcome and stress changed runtime path; performance/resource claims MUST measure.
 - Unit tests never replace runtime proof.
-- Use `bash scripts/mock-deploy.sh --skip-build --skip-deploy` only for changes with no build/deploy/service/startup impact; say why.
+- Any change MUST use full build/deploy proof; never use `--skip-build --skip-deploy`.
 - Cloudflare/ACME/HTTPS off unless `.deployenv` enables them.
 ## Architecture
 - UI embedded via `include_str!` / `include_bytes!`; no runtime UI files.
