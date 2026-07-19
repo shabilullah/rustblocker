@@ -330,25 +330,19 @@ impl ParallelForwarder {
         query_type: RecordType,
         start: Instant,
     ) -> Result<ResolveResult> {
-        let futures: Vec<_> = self
-            .resolvers
-            .iter()
-            .enumerate()
-            .map(|(idx, resolver)| {
-                let name = name.clone();
-                let rtype = query_type;
-                async move { (idx, resolver.lookup(name, rtype).await) }
-            })
-            .collect();
-
         let result = timeout(self.timeout, async {
             let mut last_err: Option<NetError> = None;
-            let mut futs: Vec<_> = futures.into_iter().map(Box::pin).collect();
-            while !futs.is_empty() {
-                let (resolved, _idx, remaining) = futures::future::select_all(futs).await;
-                futs = remaining;
-                match resolved {
-                    (idx, Ok(lookup)) => {
+            let mut futs: FuturesUnordered<LookupFuture> = self
+                .resolvers
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(idx, resolver)| lookup_future(idx, resolver, name.clone(), query_type))
+                .collect();
+
+            while let Some((idx, result)) = futs.next().await {
+                match result {
+                    Ok(lookup) => {
                         let latency_us = start.elapsed().as_micros() as u64;
                         self.record_success(idx, latency_us);
                         return self
@@ -363,7 +357,7 @@ impl ParallelForwarder {
                             .await
                             .map_err(ForwardAttemptError::Response);
                     }
-                    (idx, Err(e)) => {
+                    Err(e) => {
                         debug!("Upstream resolver failed: {}", e);
                         if is_negative_response(&e) {
                             let latency_us = start.elapsed().as_micros() as u64;
