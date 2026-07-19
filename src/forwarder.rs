@@ -20,7 +20,7 @@ use tracing::{debug, warn};
 
 use crate::config::UpstreamConfig;
 
-const DEFAULT_HEDGE_DELAY_MS: u64 = 75;
+pub const DEFAULT_HEDGE_DELAY_MS: u64 = 75;
 const DEFAULT_MAX_ADAPTIVE_PARALLEL: usize = 2;
 const DEFAULT_LATENCY_SCORE_US: u64 = 50_000;
 const FAILURE_PENALTY_US: u64 = 500_000;
@@ -171,13 +171,27 @@ impl ParallelForwarder {
     const DEFAULT_NEGATIVE_MIN_TTL_SECS: u64 = 600; // 10 minutes
 
     pub fn new(upstreams: &[UpstreamConfig], timeout_secs: u64) -> Result<Self> {
-        Self::new_with_strategy(upstreams, timeout_secs, ForwardStrategy::default())
+        Self::new_with_options(
+            upstreams,
+            timeout_secs,
+            ForwardStrategy::default(),
+            DEFAULT_HEDGE_DELAY_MS,
+        )
     }
 
     pub fn new_with_strategy(
         upstreams: &[UpstreamConfig],
         timeout_secs: u64,
         strategy: ForwardStrategy,
+    ) -> Result<Self> {
+        Self::new_with_options(upstreams, timeout_secs, strategy, DEFAULT_HEDGE_DELAY_MS)
+    }
+
+    pub fn new_with_options(
+        upstreams: &[UpstreamConfig],
+        timeout_secs: u64,
+        strategy: ForwardStrategy,
+        hedge_delay_ms: u64,
     ) -> Result<Self> {
         let mut resolvers = Vec::with_capacity(upstreams.len());
         let mut addresses = Vec::with_capacity(upstreams.len());
@@ -214,7 +228,7 @@ impl ParallelForwarder {
             addresses: Arc::new(addresses),
             timeout: Duration::from_secs(timeout_secs),
             strategy,
-            hedge_delay: Duration::from_millis(DEFAULT_HEDGE_DELAY_MS),
+            hedge_delay: Duration::from_millis(hedge_delay_ms),
             max_adaptive_parallel: DEFAULT_MAX_ADAPTIVE_PARALLEL,
         })
     }
@@ -225,13 +239,15 @@ impl ParallelForwarder {
         upstreams: &[UpstreamConfig],
         timeout_secs: u64,
         strategy: ForwardStrategy,
+        hedge_delay_ms: u64,
     ) -> Result<()> {
-        let fresh = Self::new_with_strategy(upstreams, timeout_secs, strategy)?;
+        let fresh = Self::new_with_options(upstreams, timeout_secs, strategy, hedge_delay_ms)?;
         self.resolvers = fresh.resolvers;
         self.addresses = fresh.addresses;
         self.health = fresh.health;
         self.timeout = Duration::from_secs(timeout_secs);
         self.strategy = strategy;
+        self.hedge_delay = fresh.hedge_delay;
         Ok(())
     }
 
@@ -244,8 +260,16 @@ impl ParallelForwarder {
         self.strategy = strategy;
     }
 
+    pub fn set_hedge_delay_ms(&mut self, hedge_delay_ms: u64) {
+        self.hedge_delay = Duration::from_millis(hedge_delay_ms);
+    }
+
     pub fn strategy(&self) -> ForwardStrategy {
         self.strategy
+    }
+
+    pub fn hedge_delay_ms(&self) -> u64 {
+        self.hedge_delay.as_millis() as u64
     }
 
     fn adaptive_order(&self) -> Vec<usize> {
@@ -310,6 +334,12 @@ impl ParallelForwarder {
         );
 
         let start = Instant::now();
+        if self.resolvers.len() == 1 {
+            return self
+                .resolve_one(request, &mut response_handle, name, query_type, start)
+                .await;
+        }
+
         match self.strategy {
             ForwardStrategy::Adaptive => {
                 self.resolve_adaptive(request, &mut response_handle, name, query_type, start)
@@ -318,6 +348,62 @@ impl ParallelForwarder {
             ForwardStrategy::Parallel => {
                 self.resolve_parallel(request, &mut response_handle, name, query_type, start)
                     .await
+            }
+        }
+    }
+
+    async fn resolve_one(
+        &self,
+        request: &hickory_server::server::Request,
+        response_handle: &mut impl ResponseHandler,
+        name: Name,
+        query_type: RecordType,
+        start: Instant,
+    ) -> Result<ResolveResult> {
+        let Some(resolver) = self.resolvers.first().cloned() else {
+            warn!("No upstream resolvers configured");
+            return Ok(ResolveResult {
+                info: send_servfail(request, response_handle).await?,
+                resolver: "error".to_string(),
+                latency_us: start.elapsed().as_micros() as u64,
+            });
+        };
+
+        match timeout(self.timeout, resolver.lookup(name, query_type)).await {
+            Ok(Ok(lookup)) => {
+                let latency_us = start.elapsed().as_micros() as u64;
+                self.record_success(0, latency_us);
+                self.send_lookup_response(
+                    request,
+                    response_handle,
+                    0,
+                    query_type,
+                    &lookup,
+                    latency_us,
+                )
+                .await
+            }
+            Ok(Err(e)) => {
+                let latency_us = start.elapsed().as_micros() as u64;
+                if is_negative_response(&e) {
+                    self.record_success(0, latency_us);
+                } else {
+                    self.record_failure(0);
+                }
+                let (info, resolver) = build_error_response(request, response_handle, &e).await?;
+                Ok(ResolveResult {
+                    info,
+                    resolver,
+                    latency_us,
+                })
+            }
+            Err(_) => {
+                warn!("Upstream resolver timed out, sending SERVFAIL");
+                Ok(ResolveResult {
+                    info: send_servfail(request, response_handle).await?,
+                    resolver: "timeout".to_string(),
+                    latency_us: start.elapsed().as_micros() as u64,
+                })
             }
         }
     }
@@ -859,6 +945,19 @@ mod tests {
         .expect("forwarder construction");
 
         assert_eq!(forwarder.strategy(), ForwardStrategy::Adaptive);
+        assert_eq!(forwarder.hedge_delay_ms(), DEFAULT_HEDGE_DELAY_MS);
+
+        let custom = ParallelForwarder::new_with_options(
+            &[UpstreamConfig {
+                address: "1.1.1.1".to_string(),
+                port: Some(53),
+            }],
+            5,
+            ForwardStrategy::Adaptive,
+            25,
+        )
+        .expect("custom forwarder construction");
+        assert_eq!(custom.hedge_delay_ms(), 25);
     }
 
     #[test]

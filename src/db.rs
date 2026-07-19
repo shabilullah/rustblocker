@@ -167,6 +167,7 @@ pub fn seed_defaults(pool: &DbPool) -> Result<(), DbError> {
         ("log_level", "info"),
         ("upstream_timeout_secs", "5"),
         ("forward_strategy", "adaptive"),
+        ("adaptive_hedge_delay_ms", "75"),
         ("allowed_networks", ""),
         ("stats_retention_days", "30"),
     ];

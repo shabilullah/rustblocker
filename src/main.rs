@@ -232,6 +232,9 @@ async fn run_server(cli: Cli) -> Result<()> {
     let forward_strategy: ForwardStrategy = get_setting_string(&pool, "forward_strategy")
         .parse()
         .unwrap_or_default();
+    let adaptive_hedge_delay_ms: u64 = get_setting_string(&pool, "adaptive_hedge_delay_ms")
+        .parse()
+        .unwrap_or(rustblocker::forwarder::DEFAULT_HEDGE_DELAY_MS);
 
     let dns_port = cli.dns_port.unwrap_or(db_dns_port);
     let web_port = cli.web_port.unwrap_or_else(|| dns_port.saturating_add(1));
@@ -274,8 +277,13 @@ async fn run_server(cli: Cli) -> Result<()> {
         .collect();
 
     let forwarder = Arc::new(RwLock::new(
-        ParallelForwarder::new_with_strategy(&upstreams, upstream_timeout, forward_strategy)
-            .context("Failed to create upstream forwarder")?,
+        ParallelForwarder::new_with_options(
+            &upstreams,
+            upstream_timeout,
+            forward_strategy,
+            adaptive_hedge_delay_ms,
+        )
+        .context("Failed to create upstream forwarder")?,
     ));
 
     let retention_days: u64 = get_setting_string(&pool, "stats_retention_days")

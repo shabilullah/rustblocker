@@ -345,6 +345,12 @@ fn forward_strategy_from_db(pool: &DbPool) -> ForwardStrategy {
         .unwrap_or_default()
 }
 
+fn hedge_delay_from_db(pool: &DbPool) -> u64 {
+    db::get_setting(pool, "adaptive_hedge_delay_ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::forwarder::DEFAULT_HEDGE_DELAY_MS)
+}
+
 fn reload_forwarder_from_db(
     pool: &DbPool,
     forwarder: &Arc<RwLock<ParallelForwarder>>,
@@ -354,6 +360,7 @@ fn reload_forwarder_from_db(
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
     let strategy = forward_strategy_from_db(pool);
+    let hedge_delay_ms = hedge_delay_from_db(pool);
     let configs: Vec<UpstreamConfig> = db::get_upstreams(pool)
         .unwrap_or_default()
         .iter()
@@ -363,7 +370,10 @@ fn reload_forwarder_from_db(
         })
         .collect();
 
-    if let Err(e) = forwarder.write().reload(&configs, timeout_secs, strategy) {
+    if let Err(e) = forwarder
+        .write()
+        .reload(&configs, timeout_secs, strategy, hedge_delay_ms)
+    {
         warn!("Sync: forwarder reload failed after {}: {}", reason, e);
     }
 }
@@ -425,7 +435,11 @@ fn apply_upstreams(
         })
         .collect();
     let strategy = forward_strategy_from_db(pool);
-    if let Err(e) = forwarder.write().reload(&configs, timeout_secs, strategy) {
+    let hedge_delay_ms = hedge_delay_from_db(pool);
+    if let Err(e) = forwarder
+        .write()
+        .reload(&configs, timeout_secs, strategy, hedge_delay_ms)
+    {
         warn!("Sync: forwarder reload failed: {}", e);
     }
 }

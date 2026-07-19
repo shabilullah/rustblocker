@@ -55,6 +55,8 @@ STATS_CONCURRENCY_REQUESTS="${STATS_CONCURRENCY_REQUESTS:-8}"
 DNS_BURST_REQUESTS="${DNS_BURST_REQUESTS:-96}"
 DNS_BURST_MAX_MS="${DNS_BURST_MAX_MS:-8000}"
 DNS_BURST_MAX_FAILURES="${DNS_BURST_MAX_FAILURES:-0}"
+DNS_BURST_SPLIT_SAMPLES="${DNS_BURST_SPLIT_SAMPLES:-24}"
+DNS_BURST_SPLIT_MAX_MS="${DNS_BURST_SPLIT_MAX_MS:-2000}"
 HOT_RELOAD_DNS_REQUESTS="${HOT_RELOAD_DNS_REQUESTS:-60}"
 FORWARD_PROBE_DOMAIN="${FORWARD_PROBE_DOMAIN:-example.com}"
 MEMORY_IMPORT_LOOPS="${MEMORY_IMPORT_LOOPS:-3}"
@@ -313,11 +315,65 @@ target_dns_a() {
     fi
 }
 
+target_dns_a_retry() {
+    local domain="$1" expected="$2" answer i
+    for i in 1 2 3 4 5; do
+        answer=$(target_dns_a "$domain" 2>/dev/null || true)
+        if printf '%s\n' "$answer" | grep -Fxq "$expected"; then
+            printf '%s\n' "$answer"
+            return 0
+        fi
+        sleep 0.05
+    done
+    printf '%s\n' "$answer"
+}
+
 now_ms() {
     date +%s%3N 2>/dev/null || python3 - <<'PY'
 import time
 print(int(time.time() * 1000))
 PY
+}
+latency_file_stats() {
+    local file="$1" sorted count idx95 min max avg
+    if [ ! -s "$file" ]; then
+        printf '0 0 0 0 0'
+        return
+    fi
+    sorted=$(sort -n "$file")
+    count=$(printf '%s\n' "$sorted" | grep -c . || true)
+    idx95=$(( (count * 95 + 99) / 100 ))
+    [ "$idx95" -lt 1 ] && idx95=1
+    min=$(printf '%s\n' "$sorted" | sed -n '1p')
+    max=$(printf '%s\n' "$sorted" | tail -1)
+    avg=$(awk '{sum += $1; count += 1} END {if (count > 0) printf "%d", sum / count; else print 0}' "$file")
+    printf '%s %s %s %s %s' "$count" "$min" "$(printf '%s\n' "$sorted" | sed -n "${idx95}p")" "$max" "$avg"
+}
+
+measure_dns_path_latency() {
+    local label="$1" domain="$2" expected="$3" samples="$4" lat_file fail_file i start_ms end_ms elapsed answer count min p95 max avg failures sample
+    lat_file=$(mktemp)
+    fail_file=$(mktemp)
+    for i in $(seq 1 "$samples"); do
+        start_ms=$(now_ms)
+        answer=$(target_dns_a_retry "$domain" "$expected")
+        end_ms=$(now_ms)
+        elapsed=$((end_ms - start_ms))
+        printf '%s\n' "$elapsed" >> "$lat_file"
+        if ! printf '%s\n' "$answer" | grep -Fxq "$expected"; then
+            printf '%s expected=%s got=%s\n' "$domain" "$expected" "${answer:-empty}" >> "$fail_file"
+        fi
+    done
+    set -- $(latency_file_stats "$lat_file")
+    count="$1"; min="$2"; p95="$3"; max="$4"; avg="$5"
+    failures=$(wc -l < "$fail_file" 2>/dev/null || echo 0)
+    sample=$(head -1 "$fail_file" 2>/dev/null || true)
+    rm -f "$lat_file" "$fail_file"
+    if [ "$failures" -eq 0 ] && [ "$p95" -le "$DNS_BURST_SPLIT_MAX_MS" ]; then
+        ok "$STEP" "dns-latency-$label" "samples=$count min=${min}ms p95=${p95}ms max=${max}ms avg=${avg}ms failures=$failures"
+    else
+        fail "$STEP" "dns-latency-$label" "samples=$count min=${min}ms p95=${p95}ms max=${max}ms avg=${avg}ms failures=$failures sample=${sample:-none}"
+    fi
 }
 
 json_number() {
@@ -1037,6 +1093,28 @@ else
 fi
 
 step
+ORIGINAL_HEDGE_DELAY=$(echo "$SETTINGS" | sed -n 's/.*"adaptive_hedge_delay_ms":"\([0-9][0-9]*\)".*/\1/p' | head -1)
+ORIGINAL_HEDGE_DELAY="${ORIGINAL_HEDGE_DELAY:-75}"
+HTTP_CODE_HEDGE_25=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d '{"key":"adaptive_hedge_delay_ms","value":"25"}')
+SETTINGS_HEDGE_25=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/settings")
+HTTP_CODE_HEDGE_RESTORE=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+    -X PUT "$BASE_URL/api/settings" \
+    -H "Content-Type: application/json" \
+    -d "{\"key\":\"adaptive_hedge_delay_ms\",\"value\":\"$ORIGINAL_HEDGE_DELAY\"}")
+SETTINGS_HEDGE_RESTORE=$("${CURL[@]}" -b "$COOKIE_JAR" "$BASE_URL/api/settings")
+if [ "$HTTP_CODE_HEDGE_25" = "200" ] \
+    && [ "$HTTP_CODE_HEDGE_RESTORE" = "200" ] \
+    && echo "$SETTINGS_HEDGE_25" | grep -q '"adaptive_hedge_delay_ms":"25"' \
+    && echo "$SETTINGS_HEDGE_RESTORE" | grep -q "\"adaptive_hedge_delay_ms\":\"$ORIGINAL_HEDGE_DELAY\""; then
+    ok "$STEP" "adaptive-hedge-delay" "setting switched 25ms and restored ${ORIGINAL_HEDGE_DELAY}ms"
+else
+    fail "$STEP" "adaptive-hedge-delay" "hedge delay setting did not round-trip (25 HTTP $HTTP_CODE_HEDGE_25 restore HTTP $HTTP_CODE_HEDGE_RESTORE)"
+fi
+
+step
 HTTP_CODE_PARALLEL=$("${CURL[@]}" -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
     -X PUT "$BASE_URL/api/settings" \
     -H "Content-Type: application/json" \
@@ -1067,15 +1145,17 @@ VERSION_JSON=$("${CURL[@]}" "$BASE_URL/api/version")
 DEPLOYED_BUILD=$(echo "$VERSION_JSON" | sed -n 's/.*"build":"\([^"]*\)".*/\1/p' | head -1)
 DEPLOYED_CACHE_SIZE=$(echo "$VERSION_JSON" | sed -n 's/.*"resolver_cache_size":\([0-9][0-9]*\).*/\1/p' | head -1)
 DEPLOYED_DNS_MAX=$(echo "$VERSION_JSON" | sed -n 's/.*"dns_max_in_flight":\([0-9][0-9]*\).*/\1/p' | head -1)
+DEPLOYED_HEDGE_DELAY=$(echo "$VERSION_JSON" | sed -n 's/.*"adaptive_hedge_delay_ms":\([0-9][0-9]*\).*/\1/p' | head -1)
 if [ "$SKIP_BUILD" != true ] && [ "$SKIP_DEPLOY" != true ] && [ "$DEPLOYED_BUILD" = "$MOCK_BUILD_ID" ] \
     && [ "${DEPLOYED_CACHE_SIZE:-0}" = "32768" ] \
-    && [ "${DEPLOYED_DNS_MAX:-0}" = "512" ]; then
-    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX"
+    && [ "${DEPLOYED_DNS_MAX:-0}" = "512" ] \
+    && [ "${DEPLOYED_HEDGE_DELAY:-0}" = "75" ]; then
+    ok "$STEP" "version" "deployed mock build id matches $MOCK_BUILD_ID resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX adaptive_hedge_delay_ms=$DEPLOYED_HEDGE_DELAY"
 elif { [ "$SKIP_BUILD" = true ] || [ "$SKIP_DEPLOY" = true ]; } && [ -n "$DEPLOYED_BUILD" ] \
-    && [ -n "$DEPLOYED_CACHE_SIZE" ] && [ -n "$DEPLOYED_DNS_MAX" ]; then
-    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX"
+    && [ -n "$DEPLOYED_CACHE_SIZE" ] && [ -n "$DEPLOYED_DNS_MAX" ] && [ -n "$DEPLOYED_HEDGE_DELAY" ]; then
+    ok "$STEP" "version" "deployed build id is $DEPLOYED_BUILD resolver_cache_size=$DEPLOYED_CACHE_SIZE dns_max_in_flight=$DEPLOYED_DNS_MAX adaptive_hedge_delay_ms=$DEPLOYED_HEDGE_DELAY"
 else
-    fail "$STEP" "version" "unexpected version payload build='${DEPLOYED_BUILD:-missing}' cache='${DEPLOYED_CACHE_SIZE:-missing}' dns_max='${DEPLOYED_DNS_MAX:-missing}' (expected build=$MOCK_BUILD_ID cache=32768 dns_max=512; response: ${VERSION_JSON:-empty})"
+    fail "$STEP" "version" "unexpected version payload build='${DEPLOYED_BUILD:-missing}' cache='${DEPLOYED_CACHE_SIZE:-missing}' dns_max='${DEPLOYED_DNS_MAX:-missing}' hedge='${DEPLOYED_HEDGE_DELAY:-missing}' (expected build=$MOCK_BUILD_ID cache=32768 dns_max=512 hedge=75; response: ${VERSION_JSON:-empty})"
 fi
 
 # Step: DB-backed API smoke checks.
@@ -1173,6 +1253,13 @@ if enabled "$MOCK_QUERY_LOG_PRUNE_BASELINE"; then
         done
         QUERY_LOG_PRUNE_TOTAL_ROWS_AFTER=$(remote_sqlite_scalar "SELECT COUNT(*) FROM query_log;" || echo 0)
         query_log_prune_measure_storage
+        if [ "${QUERY_LOG_PRUNE_WAL_BYTES_AFTER:-999999999}" -gt "$QUERY_LOG_PRUNE_WAL_MAX_BYTES" ]; then
+            for _ in $(seq 1 5); do
+                sleep 1
+                query_log_prune_measure_storage
+                [ "${QUERY_LOG_PRUNE_WAL_BYTES_AFTER:-999999999}" -le "$QUERY_LOG_PRUNE_WAL_MAX_BYTES" ] && break
+            done
+        fi
         PRUNE_HEALTH=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null || true)
         if [ "${QUERY_LOG_PRUNE_OLD_ROWS_BEFORE:-0}" -ge "$QUERY_LOG_PRUNE_ROWS" ] \
             && [ "${QUERY_LOG_PRUNE_OLD_ROWS_AFTER:-1}" = "0" ] \
@@ -1594,35 +1681,42 @@ if [ -n "${BURST_EXACT_ID:-}" ] && [ -n "${BURST_WILDCARD_ID:-}" ] && [ -n "${BU
     if [ "$BURST_READY" != true ]; then
         fail "$STEP" "dns-burst" "burst entries were not visible before concurrent test (exact=${BURST_EXACT_READY:-empty}, wildcard=${BURST_WILDCARD_READY:-empty}, rewrite=${BURST_REWRITE_READY:-empty})"
     else
-    BURST_FAILURES_FILE=$(mktemp)
-    BURST_STARTED_MS=$(now_ms)
-    BURST_PIDS=()
-    for i in $(seq 1 "$DNS_BURST_REQUESTS"); do
-        case $((i % 3)) in
-            0) BURST_DOMAIN="$BURST_EXACT"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
-            1) BURST_DOMAIN="$BURST_WILDCARD_SUBDOMAIN"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
-            *) BURST_DOMAIN="$BURST_REWRITE"; BURST_EXPECT="$BURST_REWRITE_IPV4" ;;
-        esac
-        (
-            BURST_DNS=$(target_dns_a "$BURST_DOMAIN" 2>/dev/null || true)
-            if ! printf '%s\n' "$BURST_DNS" | grep -Fxq "$BURST_EXPECT"; then
-                printf '%s expected=%s got=%s\n' "$BURST_DOMAIN" "$BURST_EXPECT" "${BURST_DNS:-empty}" >> "$BURST_FAILURES_FILE"
-            fi
-        ) &
-        BURST_PIDS+=("$!")
-    done
-    for pid in "${BURST_PIDS[@]}"; do
-        wait "$pid" || true
-    done
-    BURST_ELAPSED_MS=$(( $(now_ms) - BURST_STARTED_MS ))
-    BURST_FAILURES=$(wc -l < "$BURST_FAILURES_FILE" 2>/dev/null || echo 0)
-    BURST_SAMPLE=$(head -1 "$BURST_FAILURES_FILE" 2>/dev/null || true)
-    rm -f "$BURST_FAILURES_FILE"
-    if [ "$BURST_FAILURES" -le "$DNS_BURST_MAX_FAILURES" ] && [ "$BURST_ELAPSED_MS" -le "$DNS_BURST_MAX_MS" ]; then
-        ok "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries completed in ${BURST_ELAPSED_MS}ms with ${BURST_FAILURES} failures"
-    else
-        fail "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries had ${BURST_FAILURES} failures in ${BURST_ELAPSED_MS}ms (max failures ${DNS_BURST_MAX_FAILURES}, max ${DNS_BURST_MAX_MS}ms, sample: ${BURST_SAMPLE:-none})"
-    fi
+        step
+        measure_dns_path_latency "exact" "$BURST_EXACT" "$SINKHOLE_IPV4" "$DNS_BURST_SPLIT_SAMPLES"
+        step
+        measure_dns_path_latency "wildcard" "$BURST_WILDCARD_SUBDOMAIN" "$SINKHOLE_IPV4" "$DNS_BURST_SPLIT_SAMPLES"
+        step
+        measure_dns_path_latency "rewrite" "$BURST_REWRITE" "$BURST_REWRITE_IPV4" "$DNS_BURST_SPLIT_SAMPLES"
+
+        BURST_FAILURES_FILE=$(mktemp)
+        BURST_STARTED_MS=$(now_ms)
+        BURST_PIDS=()
+        for i in $(seq 1 "$DNS_BURST_REQUESTS"); do
+            case $((i % 3)) in
+                0) BURST_DOMAIN="$BURST_EXACT"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
+                1) BURST_DOMAIN="$BURST_WILDCARD_SUBDOMAIN"; BURST_EXPECT="$SINKHOLE_IPV4" ;;
+                *) BURST_DOMAIN="$BURST_REWRITE"; BURST_EXPECT="$BURST_REWRITE_IPV4" ;;
+            esac
+            (
+                BURST_DNS=$(target_dns_a_retry "$BURST_DOMAIN" "$BURST_EXPECT")
+                if ! printf '%s\n' "$BURST_DNS" | grep -Fxq "$BURST_EXPECT"; then
+                    printf '%s expected=%s got=%s\n' "$BURST_DOMAIN" "$BURST_EXPECT" "${BURST_DNS:-empty}" >> "$BURST_FAILURES_FILE"
+                fi
+            ) &
+            BURST_PIDS+=("$!")
+        done
+        for pid in "${BURST_PIDS[@]}"; do
+            wait "$pid" || true
+        done
+        BURST_ELAPSED_MS=$(( $(now_ms) - BURST_STARTED_MS ))
+        BURST_FAILURES=$(wc -l < "$BURST_FAILURES_FILE" 2>/dev/null || echo 0)
+        BURST_SAMPLE=$(head -1 "$BURST_FAILURES_FILE" 2>/dev/null || true)
+        rm -f "$BURST_FAILURES_FILE"
+        if [ "$BURST_FAILURES" -le "$DNS_BURST_MAX_FAILURES" ] && [ "$BURST_ELAPSED_MS" -le "$DNS_BURST_MAX_MS" ]; then
+            ok "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries completed in ${BURST_ELAPSED_MS}ms with ${BURST_FAILURES} failures"
+        else
+            fail "$STEP" "dns-burst" "${DNS_BURST_REQUESTS} hot-path queries had ${BURST_FAILURES} failures in ${BURST_ELAPSED_MS}ms (max failures ${DNS_BURST_MAX_FAILURES}, max ${DNS_BURST_MAX_MS}ms, sample: ${BURST_SAMPLE:-none})"
+        fi
     fi
 else
     skip "$STEP" "dns-burst" "burst skipped because setup failed"

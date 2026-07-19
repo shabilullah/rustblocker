@@ -660,6 +660,33 @@ async fn update_setting(
         }
     }
 
+    if body.key == "adaptive_hedge_delay_ms" {
+        match body.value.parse::<u64>() {
+            Ok(ms) => {
+                if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
+                forwarder.write().set_hedge_delay_ms(ms);
+                activity_log.info(
+                    "settings",
+                    "Save Settings",
+                    &format!("Setting saved: {} = {}", body.key, ms),
+                );
+                tracing::info!("Adaptive hedge delay reloaded: {}ms", ms);
+                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
+            }
+            Err(_) => {
+                activity_log.warning(
+                    "settings",
+                    "Save Settings",
+                    &format!("Invalid adaptive hedge delay: {}", body.value),
+                );
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": "invalid adaptive_hedge_delay_ms"}));
+            }
+        }
+    }
+
     // Listening socket settings can only take effect after a restart.
     if body.key == "listen_address" || body.key == "listen_port" {
         let valid = match body.key.as_str() {
@@ -811,7 +838,13 @@ fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
     let strategy = db::get_setting(pool, "forward_strategy")
         .and_then(|s| s.parse().ok())
         .unwrap_or_default();
-    if let Err(e) = forwarder.write().reload(&upstreams, timeout_secs, strategy) {
+    let hedge_delay_ms = db::get_setting(pool, "adaptive_hedge_delay_ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(crate::forwarder::DEFAULT_HEDGE_DELAY_MS);
+    if let Err(e) = forwarder
+        .write()
+        .reload(&upstreams, timeout_secs, strategy, hedge_delay_ms)
+    {
         warn!("Failed to reload forwarder: {}", e);
     }
 }
@@ -1491,6 +1524,7 @@ async fn get_version() -> impl Responder {
         "target": env!("TARGET_TRIPLE"),
         "resolver_cache_size": crate::forwarder::ParallelForwarder::DEFAULT_CACHE_SIZE,
         "dns_max_in_flight": crate::handler::DEFAULT_DNS_MAX_IN_FLIGHT,
+        "adaptive_hedge_delay_ms": crate::forwarder::DEFAULT_HEDGE_DELAY_MS,
     }))
 }
 
