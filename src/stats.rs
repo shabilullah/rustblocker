@@ -113,6 +113,7 @@ pub struct QueryLog {
 
 const BATCH_SIZE: usize = 100;
 const FLUSH_INTERVAL_MS: u64 = 1000;
+const VACUUM_AFTER_DELETED_ROWS: usize = 1_000;
 
 impl QueryLog {
     /// Create a new QueryLog and spawn the background writer task.
@@ -276,12 +277,30 @@ impl QueryLog {
             warn!("Failed to commit query log batch: {}", e);
         }
 
-        // Prune old entries.
         if retention_days > 0 {
-            let _ = conn.execute(
+            match conn.execute(
                 "DELETE FROM query_log WHERE timestamp < datetime('now', ?1)",
                 rusqlite::params![format!("-{} days", retention_days)],
-            );
+            ) {
+                Ok(deleted) => Self::compact_after_delete(&conn, deleted),
+                Err(e) => warn!("Failed to prune query log: {}", e),
+            }
+        }
+    }
+
+    fn compact_after_delete(conn: &rusqlite::Connection, deleted: usize) {
+        if deleted == 0 {
+            return;
+        }
+
+        if deleted >= VACUUM_AFTER_DELETED_ROWS
+            && let Err(e) = conn.execute_batch("VACUUM")
+        {
+            warn!("Failed to vacuum query log storage after pruning: {}", e);
+        }
+
+        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            warn!("Failed to checkpoint query log WAL after pruning: {}", e);
         }
     }
 
@@ -431,7 +450,10 @@ impl QueryLog {
             Ok(c) => c,
             Err(_) => return,
         };
-        let _ = conn.execute("DELETE FROM query_log", []);
+        match conn.execute("DELETE FROM query_log", []) {
+            Ok(deleted) => Self::compact_after_delete(&conn, deleted),
+            Err(e) => warn!("Failed to clear query log: {}", e),
+        }
         let _ = conn.execute("DELETE FROM sqlite_sequence WHERE name='query_log'", []);
     }
 }
@@ -444,14 +466,17 @@ mod tests {
 
     static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
-    fn test_pool() -> DbPool {
+    fn test_db_path() -> std::path::PathBuf {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
             .as_millis();
         let id = NEXT_DB.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("rustblocker-stats-test-{millis}-{id}.db"));
-        crate::db::create_pool(path).expect("failed to create test database pool")
+        std::env::temp_dir().join(format!("rustblocker-stats-test-{millis}-{id}.db"))
+    }
+
+    fn test_pool() -> DbPool {
+        crate::db::create_pool(test_db_path()).expect("failed to create test database pool")
     }
 
     fn query_entry(domain: &str) -> QueryEntry {
@@ -527,6 +552,51 @@ mod tests {
         assert_eq!(stats.top_blocked_domains[0].count, 2);
         assert_eq!(stats.upstream_stats[0].resolver, "1.1.1.1");
         assert_eq!(stats.upstream_stats[0].avg_latency_us, 30);
+    }
+
+    #[test]
+    fn pruning_query_log_compacts_wal() {
+        let path = test_db_path();
+        let pool = crate::db::create_pool(&path).expect("failed to create test database pool");
+        let conn = pool.get().expect("test db connection");
+        for i in 0..1_200 {
+            conn.execute(
+                "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action) VALUES (datetime('now', '-2 days'), '127.0.0.1', ?1, 'A', 'blocked')",
+                rusqlite::params![format!("old-{i}.example")],
+            )
+            .expect("insert old query log row");
+        }
+        drop(conn);
+
+        QueryLog::flush_entries(&pool, vec![query_entry("fresh.example")], 1);
+
+        let conn = pool.get().expect("test db connection after prune");
+        let old_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_log WHERE domain LIKE 'old-%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count old rows");
+        let fresh_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM query_log WHERE domain = 'fresh.example'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count fresh rows");
+        let wal_frames: u64 = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+            .expect("read WAL frame count");
+
+        assert_eq!(old_rows, 0);
+        assert_eq!(fresh_rows, 1);
+        assert_eq!(wal_frames, 0, "prune should checkpoint and truncate WAL");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]

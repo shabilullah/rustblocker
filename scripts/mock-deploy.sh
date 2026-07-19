@@ -228,6 +228,24 @@ DNS_FLOOD_CAPACITY_LAST_THREADS=0
 DNS_FLOOD_CAPACITY_LAST_FDS=0
 
 
+# Query log retention prune (finding 11): always-on DB storage smoke.
+# Inserts expired rows directly, triggers app writer prune, then verifies rows gone
+# and WAL checkpoint/truncate kept DB sidecars bounded.
+MOCK_QUERY_LOG_PRUNE_BASELINE="${MOCK_QUERY_LOG_PRUNE_BASELINE:-true}"
+QUERY_LOG_PRUNE_ROWS="${QUERY_LOG_PRUNE_ROWS:-1500}"
+QUERY_LOG_PRUNE_WAL_MAX_BYTES="${QUERY_LOG_PRUNE_WAL_MAX_BYTES:-65536}"
+QUERY_LOG_PRUNE_BASELINE_FILE="${QUERY_LOG_PRUNE_BASELINE_FILE:-target/mock-query-log-prune-baseline.json}"
+QUERY_LOG_PRUNE_STATUS="not_started"
+QUERY_LOG_PRUNE_OLD_ROWS_BEFORE=0
+QUERY_LOG_PRUNE_OLD_ROWS_AFTER=0
+QUERY_LOG_PRUNE_TOTAL_ROWS_AFTER=0
+QUERY_LOG_PRUNE_DB_BYTES_BEFORE=0
+QUERY_LOG_PRUNE_DB_BYTES_AFTER=0
+QUERY_LOG_PRUNE_WAL_BYTES_BEFORE=0
+QUERY_LOG_PRUNE_WAL_BYTES_AFTER=0
+QUERY_LOG_PRUNE_FREE_BEFORE=0
+QUERY_LOG_PRUNE_FREE_AFTER=0
+
 MOCK_STRESS_BLOCKLIST="${MOCK_STRESS_BLOCKLIST:-false}"
 STRESS_INSTALL_SQLITE3="${STRESS_INSTALL_SQLITE3:-true}"
 STRESS_BLOCKLIST_TIERS="${STRESS_BLOCKLIST_TIERS:-auto}"
@@ -383,6 +401,52 @@ check_resource_snapshot() {
     else
         ok "$STEP" "$label" "pid=$RESOURCE_PID rss=${RESOURCE_RSS_KB}KB growth=${growth}KB threads=$RESOURCE_THREADS fds=$RESOURCE_FDS"
     fi
+}
+
+remote_file_size() {
+    local path="$1"
+    local quoted_path
+    quoted_path=$(shell_quote "$path")
+    remote_root "if [ -f $quoted_path ]; then wc -c < $quoted_path | tr -d '[:space:]'; else printf '0'; fi" 2>/dev/null || printf '0'
+}
+
+remote_sqlite_scalar() {
+    local sql="$1"
+    local quoted_db quoted_sql
+    quoted_db=$(shell_quote "$REMOTE_DB_PATH")
+    quoted_sql=$(shell_quote "$sql")
+    remote_root "sqlite3 $quoted_db $quoted_sql" 2>/dev/null | tail -1
+}
+
+query_log_prune_measure_storage() {
+    QUERY_LOG_PRUNE_DB_BYTES_AFTER=$(remote_file_size "$REMOTE_DB_PATH")
+    QUERY_LOG_PRUNE_WAL_BYTES_AFTER=$(remote_file_size "${REMOTE_DB_PATH}-wal")
+    QUERY_LOG_PRUNE_FREE_AFTER=$(remote_sqlite_scalar "PRAGMA freelist_count;" || echo 0)
+    QUERY_LOG_PRUNE_FREE_AFTER=${QUERY_LOG_PRUNE_FREE_AFTER:-0}
+}
+
+write_query_log_prune_baseline() {
+    local dir
+    dir=$(dirname "$QUERY_LOG_PRUNE_BASELINE_FILE")
+    mkdir -p "$dir"
+    cat > "$QUERY_LOG_PRUNE_BASELINE_FILE" <<EOF
+{
+  "status": "$QUERY_LOG_PRUNE_STATUS",
+  "build_id": "$MOCK_BUILD_ID",
+  "git_rev": "$GIT_REV",
+  "rows_inserted": $QUERY_LOG_PRUNE_ROWS,
+  "old_rows_before": $QUERY_LOG_PRUNE_OLD_ROWS_BEFORE,
+  "old_rows_after": $QUERY_LOG_PRUNE_OLD_ROWS_AFTER,
+  "total_rows_after": $QUERY_LOG_PRUNE_TOTAL_ROWS_AFTER,
+  "db_bytes_before": $QUERY_LOG_PRUNE_DB_BYTES_BEFORE,
+  "db_bytes_after": $QUERY_LOG_PRUNE_DB_BYTES_AFTER,
+  "wal_bytes_before": $QUERY_LOG_PRUNE_WAL_BYTES_BEFORE,
+  "wal_bytes_after": $QUERY_LOG_PRUNE_WAL_BYTES_AFTER,
+  "freelist_before": $QUERY_LOG_PRUNE_FREE_BEFORE,
+  "freelist_after": $QUERY_LOG_PRUNE_FREE_AFTER,
+  "created_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
 }
 
 wait_for_health() {
@@ -1068,6 +1132,64 @@ if [ "$STATS_OK" = true ]; then
     ok "$STEP" "stats-concurrency" "${STATS_CONCURRENCY_REQUESTS} stats summaries completed (${STATS_BYTES} bytes, elapsed ${STATS_ELAPSED_MS}ms)"
 else
     fail "$STEP" "stats-concurrency" "one or more concurrent stats summaries failed"
+fi
+
+if enabled "$MOCK_QUERY_LOG_PRUNE_BASELINE"; then
+    QUERY_LOG_PRUNE_STATUS="running"
+    step
+    if remote_root "command -v sqlite3 >/dev/null 2>&1" >/dev/null 2>&1 \
+        || (enabled "$STRESS_INSTALL_SQLITE3" && stress_install_sqlite3 >/dev/null 2>&1); then
+        ok "$STEP" "query-log-prune" "sqlite3 available for retention storage probe"
+    else
+        QUERY_LOG_PRUNE_STATUS="failed"
+        fail "$STEP" "query-log-prune" "sqlite3 unavailable; cannot measure DB/WAL storage"
+    fi
+
+    if [ "$QUERY_LOG_PRUNE_STATUS" = "running" ]; then
+        step
+        PRUNE_PREFIX="${RUN_TAG}-prune"
+        QUERY_LOG_PRUNE_DB_BYTES_BEFORE=$(remote_file_size "$REMOTE_DB_PATH")
+        QUERY_LOG_PRUNE_WAL_BYTES_BEFORE=$(remote_file_size "${REMOTE_DB_PATH}-wal")
+        QUERY_LOG_PRUNE_FREE_BEFORE=$(remote_sqlite_scalar "PRAGMA freelist_count;" || echo 0)
+        QUERY_LOG_PRUNE_FREE_BEFORE=${QUERY_LOG_PRUNE_FREE_BEFORE:-0}
+        if remote_root "sqlite3 $(shell_quote "$REMOTE_DB_PATH") \"WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < $QUERY_LOG_PRUNE_ROWS) INSERT INTO query_log (timestamp, client_ip, domain, query_type, action) SELECT datetime('now', '-60 days'), '127.0.0.1', '$PRUNE_PREFIX-' || i || '.example', 'A', 'blocked' FROM n;\""; then
+            QUERY_LOG_PRUNE_OLD_ROWS_BEFORE=$(remote_sqlite_scalar "SELECT COUNT(*) FROM query_log WHERE domain LIKE '$PRUNE_PREFIX-%';" || echo 0)
+            ok "$STEP" "query-log-prune" "inserted expired rows=$QUERY_LOG_PRUNE_OLD_ROWS_BEFORE db_before=${QUERY_LOG_PRUNE_DB_BYTES_BEFORE}B wal_before=${QUERY_LOG_PRUNE_WAL_BYTES_BEFORE}B freelist_before=${QUERY_LOG_PRUNE_FREE_BEFORE}"
+        else
+            QUERY_LOG_PRUNE_STATUS="failed"
+            fail "$STEP" "query-log-prune" "failed to insert expired query_log rows"
+        fi
+    fi
+
+    if [ "$QUERY_LOG_PRUNE_STATUS" = "running" ]; then
+        step
+        target_dns_a "$FORWARD_PROBE_DOMAIN" >/dev/null 2>&1 || true
+        QUERY_LOG_PRUNE_OLD_ROWS_AFTER="$QUERY_LOG_PRUNE_OLD_ROWS_BEFORE"
+        for _ in $(seq 1 10); do
+            sleep 1
+            QUERY_LOG_PRUNE_OLD_ROWS_AFTER=$(remote_sqlite_scalar "SELECT COUNT(*) FROM query_log WHERE domain LIKE '$PRUNE_PREFIX-%';" || echo "$QUERY_LOG_PRUNE_OLD_ROWS_AFTER")
+            [ "${QUERY_LOG_PRUNE_OLD_ROWS_AFTER:-0}" = "0" ] && break
+            target_dns_a "$FORWARD_PROBE_DOMAIN" >/dev/null 2>&1 || true
+        done
+        QUERY_LOG_PRUNE_TOTAL_ROWS_AFTER=$(remote_sqlite_scalar "SELECT COUNT(*) FROM query_log;" || echo 0)
+        query_log_prune_measure_storage
+        PRUNE_HEALTH=$("${CURL[@]}" -o /dev/null -w "%{http_code}" "$BASE_URL/api/health" 2>/dev/null || true)
+        if [ "${QUERY_LOG_PRUNE_OLD_ROWS_BEFORE:-0}" -ge "$QUERY_LOG_PRUNE_ROWS" ] \
+            && [ "${QUERY_LOG_PRUNE_OLD_ROWS_AFTER:-1}" = "0" ] \
+            && [ "${QUERY_LOG_PRUNE_WAL_BYTES_AFTER:-999999999}" -le "$QUERY_LOG_PRUNE_WAL_MAX_BYTES" ] \
+            && [ "$PRUNE_HEALTH" = "200" ]; then
+            QUERY_LOG_PRUNE_STATUS="passed"
+            write_query_log_prune_baseline
+            ok "$STEP" "query-log-prune" "pruned ${QUERY_LOG_PRUNE_OLD_ROWS_BEFORE} expired rows; old_after=${QUERY_LOG_PRUNE_OLD_ROWS_AFTER} total_after=${QUERY_LOG_PRUNE_TOTAL_ROWS_AFTER} db=${QUERY_LOG_PRUNE_DB_BYTES_BEFORE}->${QUERY_LOG_PRUNE_DB_BYTES_AFTER}B wal=${QUERY_LOG_PRUNE_WAL_BYTES_BEFORE}->${QUERY_LOG_PRUNE_WAL_BYTES_AFTER}B freelist=${QUERY_LOG_PRUNE_FREE_BEFORE}->${QUERY_LOG_PRUNE_FREE_AFTER}; wrote $QUERY_LOG_PRUNE_BASELINE_FILE"
+        else
+            QUERY_LOG_PRUNE_STATUS="failed"
+            write_query_log_prune_baseline
+            fail "$STEP" "query-log-prune" "retention prune/storage gate failed old_before=${QUERY_LOG_PRUNE_OLD_ROWS_BEFORE:-0} old_after=${QUERY_LOG_PRUNE_OLD_ROWS_AFTER:-missing} wal_after=${QUERY_LOG_PRUNE_WAL_BYTES_AFTER:-missing} max_wal=$QUERY_LOG_PRUNE_WAL_MAX_BYTES health=${PRUNE_HEALTH:-empty}; wrote $QUERY_LOG_PRUNE_BASELINE_FILE"
+        fi
+    fi
+else
+    step
+    skip "$STEP" "query-log-prune" "disabled"
 fi
 
 # Step: Verify allowlist delete-by-ID path removes only the selected runtime entry.
