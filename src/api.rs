@@ -1406,9 +1406,14 @@ async fn restart_server(
 
 // --- Auth ---
 
-fn auth_cookie(session_value: String, max_age: i64) -> actix_web::cookie::Cookie<'static> {
+fn auth_cookie(
+    session_value: String,
+    max_age: i64,
+    secure: bool,
+) -> actix_web::cookie::Cookie<'static> {
     actix_web::cookie::Cookie::build(SESSION_COOKIE_NAME, session_value)
         .http_only(true)
+        .secure(secure)
         .same_site(actix_web::cookie::SameSite::Strict)
         .path("/")
         .max_age(actix_web::cookie::time::Duration::seconds(max_age))
@@ -1418,6 +1423,7 @@ fn auth_cookie(session_value: String, max_age: i64) -> actix_web::cookie::Cookie
 async fn login(
     pool: web::Data<DbPool>,
     auth: web::Data<Arc<AuthState>>,
+    req: HttpRequest,
     body: web::Json<LoginPayload>,
 ) -> impl Responder {
     let hash = match db::get_password_hash(&pool) {
@@ -1432,13 +1438,21 @@ async fn login(
     }
     let session = auth.create_session(SESSION_MAX_AGE_SECS);
     HttpResponse::Ok()
-        .cookie(auth_cookie(session, SESSION_MAX_AGE_SECS as i64))
+        .cookie(auth_cookie(
+            session,
+            SESSION_MAX_AGE_SECS as i64,
+            req.connection_info().scheme() == "https",
+        ))
         .json(serde_json::json!({"authenticated": true}))
 }
 
-async fn logout() -> impl Responder {
+async fn logout(req: HttpRequest) -> impl Responder {
     HttpResponse::Ok()
-        .cookie(auth_cookie(String::new(), 0))
+        .cookie(auth_cookie(
+            String::new(),
+            0,
+            req.connection_info().scheme() == "https",
+        ))
         .json(serde_json::json!({"authenticated": false}))
 }
 
@@ -1453,6 +1467,7 @@ async fn auth_check(auth: web::Data<Arc<AuthState>>, req: HttpRequest) -> impl R
 async fn change_password(
     pool: web::Data<DbPool>,
     auth: web::Data<Arc<AuthState>>,
+    req: HttpRequest,
     body: web::Json<ChangePasswordPayload>,
 ) -> impl Responder {
     let hash = match db::get_password_hash(&pool) {
@@ -1487,7 +1502,11 @@ async fn change_password(
     }
     let session = auth.create_session(SESSION_MAX_AGE_SECS);
     HttpResponse::Ok()
-        .cookie(auth_cookie(session, SESSION_MAX_AGE_SECS as i64))
+        .cookie(auth_cookie(
+            session,
+            SESSION_MAX_AGE_SECS as i64,
+            req.connection_info().scheme() == "https",
+        ))
         .json(serde_json::json!({"status": "ok"}))
 }
 
@@ -1825,4 +1844,23 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 web::post().to(test_cloudflare_connection),
             ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auth_cookie;
+
+    #[test]
+    fn auth_cookie_security_tracks_request_transport() {
+        assert!(
+            auth_cookie("session".into(), 60, true)
+                .secure()
+                .unwrap_or(false)
+        );
+        assert!(
+            !auth_cookie("session".into(), 60, false)
+                .secure()
+                .unwrap_or(false)
+        );
+    }
 }

@@ -730,6 +730,24 @@ fn cloudflare_https(r: &mut Runner) -> Result<(), String> {
                     format!("HTTPS health check passed (after {waited}s)"),
                 );
             }
+            let password = env_required(r, "WEBUI_PASSWORD")?;
+            match curl_https_login_cookie(&domain, &password) {
+                Ok(cookie)
+                    if cookie.contains("; Secure")
+                        && cookie.contains("; HttpOnly")
+                        && cookie.contains("SameSite=Strict") =>
+                {
+                    r.ok(
+                        "https-auth-cookie",
+                        "HTTPS login cookie has Secure, HttpOnly, and SameSite=Strict",
+                    );
+                }
+                Ok(cookie) => r.fail(
+                    "https-auth-cookie",
+                    format!("HTTPS login cookie missing security attributes: {cookie}"),
+                ),
+                Err(err) => r.fail("https-auth-cookie", err),
+            }
         } else {
             r.fail("https", "HTTPS health check failed");
             let _ = r.ssh_output("rc-service rustblocker status 2>/dev/null || systemctl status rustblocker --no-pager 2>/dev/null || true; tail -n 80 /var/log/rustblocker.log 2>/dev/null || true");
@@ -1322,6 +1340,43 @@ fn curl_external_code_insecure(url: &str) -> Result<u16, String> {
         "%{http_code}",
         url,
     ])
+}
+
+fn curl_https_login_cookie(domain: &str, password: &str) -> Result<String, String> {
+    let output = Command::new("curl")
+        .args([
+            "-sS",
+            "-k",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "5",
+            "-D",
+            "-",
+            "-o",
+            "/dev/null",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            &json!({"password": password}).to_string(),
+            &format!("https://{domain}/api/auth/login"),
+        ])
+        .output()
+        .map_err(|err| format!("start HTTPS login curl: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "HTTPS login curl exited {:?}",
+            output.status.code()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("set-cookie: ")
+                .or_else(|| line.strip_prefix("Set-Cookie: "))
+        })
+        .map(str::to_string)
+        .ok_or_else(|| "HTTPS login response missing Set-Cookie".to_string())
 }
 
 fn curl_code_args<const N: usize>(args: [&str; N]) -> Result<u16, String> {
