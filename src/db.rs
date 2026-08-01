@@ -1156,7 +1156,7 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(p.as_bytes());
             h.update(b"\n");
         }
-        map.insert("settings".to_string(), format!("{:x}", h.finalize()));
+        map.insert("settings".to_string(), hex(h.finalize().as_ref()));
     }
 
     // upstreams — sorted address:port
@@ -1176,7 +1176,7 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(r.as_bytes());
             h.update(b"\n");
         }
-        map.insert("upstreams".to_string(), format!("{:x}", h.finalize()));
+        map.insert("upstreams".to_string(), hex(h.finalize().as_ref()));
     }
 
     // rewrites — sorted domain
@@ -1201,7 +1201,7 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(r.as_bytes());
             h.update(b"\n");
         }
-        map.insert("rewrites".to_string(), format!("{:x}", h.finalize()));
+        map.insert("rewrites".to_string(), hex(h.finalize().as_ref()));
     }
 
     // sources — sorted url
@@ -1224,7 +1224,7 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(r.as_bytes());
             h.update(b"\n");
         }
-        map.insert("sources".to_string(), format!("{:x}", h.finalize()));
+        map.insert("sources".to_string(), hex(h.finalize().as_ref()));
     }
 
     // blocklist — sorted domain
@@ -1239,7 +1239,7 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(d.as_bytes());
             h.update(b"\n");
         }
-        map.insert("blocklist".to_string(), format!("{:x}", h.finalize()));
+        map.insert("blocklist".to_string(), hex(h.finalize().as_ref()));
     }
 
     // allowlist — sorted domain
@@ -1254,10 +1254,20 @@ pub fn sync_manifest(pool: &DbPool) -> Result<std::collections::HashMap<String, 
             h.update(d.as_bytes());
             h.update(b"\n");
         }
-        map.insert("allowlist".to_string(), format!("{:x}", h.finalize()));
+        map.insert("allowlist".to_string(), hex(h.finalize().as_ref()));
     }
 
     Ok(map)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 /// Return a full snapshot of a single sync category as JSON.

@@ -399,7 +399,9 @@ mod tests {
     use crate::config::UpstreamConfig;
     use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
     use crate::stats::QueryLog;
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
     fn test_handler(max_in_flight: usize) -> DnsBlockerHandler {
         let blocklist = BlocklistStore(Arc::new(RwLock::new(DomainStore::default())));
@@ -415,7 +417,9 @@ mod tests {
             )
             .expect("forwarder"),
         ));
-        let db_path = std::env::temp_dir().join(format!("rb-sem-test-{}.db", std::process::id()));
+        let id = NEXT_DB.fetch_add(1, Ordering::Relaxed);
+        let db_path =
+            std::env::temp_dir().join(format!("rb-sem-test-{}-{id}.db", std::process::id()));
         let pool = crate::db::create_pool(db_path.to_str().unwrap()).expect("pool");
         crate::db::seed_defaults(&pool).expect("seed");
         let query_log = QueryLog::new(pool, Arc::new(AtomicU64::new(30))).0;

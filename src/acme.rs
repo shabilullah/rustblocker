@@ -50,17 +50,18 @@ impl AcmeManager {
         };
 
         emit(log, op_id, op, "Creating ACME account...");
-        let (account, _credentials) = Account::create(
-            &NewAccount {
-                contact: &[&format!("mailto:{}", self.email)],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            url,
-            None,
-        )
-        .await
-        .context("failed to create ACME account")?;
+        let (account, _credentials) = Account::builder()?
+            .create(
+                &NewAccount {
+                    contact: &[&format!("mailto:{}", self.email)],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                url.to_owned(),
+                None,
+            )
+            .await
+            .context("failed to create ACME account")?;
 
         info!("ACME account created");
         emit(log, op_id, op, "ACME account created");
@@ -76,9 +77,7 @@ impl AcmeManager {
 
         emit(log, op_id, op, "Placing certificate order...");
         let mut order = account
-            .new_order(&NewOrder {
-                identifiers: &identifiers,
-            })
+            .new_order(&NewOrder::new(&identifiers))
             .await
             .context("failed to create ACME order")?;
 
@@ -95,49 +94,53 @@ impl AcmeManager {
             anyhow::bail!("unexpected initial order status: {:?}", state.status);
         }
 
-        let authorizations = order.authorizations().await?;
         emit(
             log,
             op_id,
             op,
-            &format!("Received {} authorization(s)", authorizations.len()),
+            &format!("Received {} authorization(s)", identifiers.len()),
         );
 
-        for authz in &authorizations {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
             if authz.status == AuthorizationStatus::Valid {
-                info!("Authorization already valid for: {:?}", authz.identifier);
+                info!("Authorization already valid for: {}", authz.identifier());
                 continue;
             }
 
             if authz.status != AuthorizationStatus::Pending {
                 anyhow::bail!(
-                    "unexpected authorization status for {:?}: {:?}",
-                    authz.identifier,
+                    "unexpected authorization status for {}: {:?}",
+                    authz.identifier(),
                     authz.status
                 );
             }
 
-            let challenge = authz
-                .challenges
-                .iter()
-                .find(|c| c.r#type == ChallengeType::Dns01)
+            let mut challenge = authz
+                .challenge(ChallengeType::Dns01)
                 .context("no DNS-01 challenge found")?;
-
-            let Identifier::Dns(domain_name) = &authz.identifier;
-            let challenge_domain = domain_name.strip_prefix("*.").unwrap_or(domain_name);
-            info!("Processing DNS-01 challenge for: {}", domain_name);
+            let Identifier::Dns(domain_name) = challenge.identifier().identifier else {
+                anyhow::bail!("DNS-01 challenge returned non-DNS identifier");
+            };
+            info!(
+                "Processing DNS-01 challenge for: {}",
+                challenge.identifier()
+            );
             emit(
                 log,
                 op_id,
                 op,
-                &format!("Setting up DNS-01 challenge for: {}", domain_name),
+                &format!(
+                    "Setting up DNS-01 challenge for: {}",
+                    challenge.identifier()
+                ),
             );
 
-            let key_auth = order.key_authorization(challenge);
-            let dns_value = key_auth.dns_value();
-            let record_name = format!("_acme-challenge.{}", challenge_domain);
+            let dns_value = challenge.key_authorization().dns_value();
+            let record_name = format!("_acme-challenge.{}", domain_name);
 
-            let zone_id = self.cloudflare.find_zone_id(challenge_domain).await?;
+            let zone_id = self.cloudflare.find_zone_id(domain_name).await?;
             info!("Creating TXT record: {} = {}", record_name, dns_value);
             emit(
                 log,
@@ -167,8 +170,8 @@ impl AcmeManager {
                 op,
                 "Notifying Let's Encrypt to validate challenge...",
             );
-            order
-                .set_challenge_ready(&challenge.url)
+            challenge
+                .set_ready()
                 .await
                 .context("failed to set challenge ready")?;
 
@@ -231,11 +234,9 @@ impl AcmeManager {
 
         let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
         if wildcard {
-            params
-                .subject_alt_names
-                .push(rcgen::SanType::DnsName(rcgen::Ia5String::try_from(
-                    format!("*.{}", domain),
-                )?));
+            params.subject_alt_names.push(rcgen::SanType::DnsName(
+                rcgen::string::Ia5String::try_from(format!("*.{}", domain))?,
+            ));
         }
 
         let mut dn = rcgen::DistinguishedName::new();
@@ -245,7 +246,7 @@ impl AcmeManager {
         let key_pair = rcgen::KeyPair::generate()?;
         let csr = params.serialize_request(&key_pair)?;
 
-        order.finalize(csr.der()).await?;
+        order.finalize_csr(csr.der()).await?;
         emit(log, op_id, op, "CSR submitted, waiting for certificate...");
 
         info!("Polling for certificate");

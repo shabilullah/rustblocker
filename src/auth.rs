@@ -14,10 +14,9 @@ use actix_web::{
 use base64::Engine;
 use bcrypt::{DEFAULT_COST, hash, verify};
 use futures::future::{LocalBoxFuture, Ready, ready};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use parking_lot::RwLock;
-use rand::RngCore;
-use rand::distributions::{Distribution, Uniform};
+use rand::RngExt;
 use serde_json::json;
 use sha2::Sha256;
 
@@ -35,7 +34,7 @@ impl AuthState {
     /// Generate a new random 256-bit session signing key.
     pub fn generate_secret() -> Vec<u8> {
         let mut session_secret = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut session_secret);
+        rand::rng().fill(&mut session_secret);
         session_secret
     }
 
@@ -67,12 +66,9 @@ impl AuthState {
     /// so the printed password survives copy/paste and manual typing.
     pub fn generate_password() -> String {
         const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz";
-        let uniform = Uniform::from(0..CHARSET.len());
-        let mut rng = rand::thread_rng();
-        uniform
-            .sample_iter(&mut rng)
-            .take(24)
-            .map(|i| CHARSET[i] as char)
+        let mut rng = rand::rng();
+        (0..24)
+            .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
             .collect()
     }
 
@@ -228,15 +224,13 @@ fn unix_now() -> u64 {
 type HmacSha256 = Hmac<Sha256>;
 
 fn sign(secret: &[u8], payload: &str) -> Vec<u8> {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC can accept a key of any length");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can accept a key of any length");
     mac.update(payload.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
 
 fn verify_signature(secret: &[u8], payload: &str, signature: &[u8]) -> bool {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(secret).expect("HMAC can accept a key of any length");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC can accept a key of any length");
     mac.update(payload.as_bytes());
     mac.verify_slice(signature).is_ok()
 }

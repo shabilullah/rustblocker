@@ -785,11 +785,12 @@ impl Runner {
     }
 
     fn db_api(&mut self) -> Result<(), String> {
-        let stats = self.curl_body("GET", "/api/stats", None)?.body;
-        if stats.contains("\"total_queries\"") {
-            self.ok("db-api", "stats endpoint reachable");
+        let stats = self.curl_json("GET", "/api/stats", None)?;
+        let counters = ["total_queries", "blocked", "allowed", "forwarded"];
+        if counters.iter().all(|key| json_u64(&stats, key).is_some()) {
+            self.ok("db-api", "stats endpoint returned numeric counters");
         } else {
-            self.fail("db-api", "could not read stats");
+            self.fail("db-api", format!("invalid stats counters: {stats}"));
         }
         let sources = self.curl_body("GET", "/api/sources", None)?.body;
         if sources.trim_start().starts_with('[') {
