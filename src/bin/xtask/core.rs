@@ -108,7 +108,7 @@ impl Config {
 
         let mut values = parse_deployenv(&deployenv)?;
         apply_defaults(&mut values);
-        for key in ["SSH_HOST", "SSH_USER", "SSH_PASSWORD", "WEBUI_PASSWORD"] {
+        for key in ["SSH_HOST", "WEBUI_PASSWORD"] {
             let present = env::var(key).ok().or_else(|| values.get(key).cloned());
             if present.is_none_or(|value| value.is_empty()) {
                 return Err(format!("{key} missing in {}", deployenv.display()));
@@ -170,11 +170,17 @@ impl Runner {
         File::create(&run_jsonl).map_err(|err| format!("create {}: {err}", run_jsonl.display()))?;
         File::create(&cookie_jar)
             .map_err(|err| format!("create {}: {err}", cookie_jar.display()))?;
-        let remote = format!(
-            "{}@{}",
-            config.env_or("SSH_USER", ""),
-            config.env_or("SSH_HOST", "")
-        );
+        let remote = config
+            .env("SSH_TARGET")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                let host = config.env_or("SSH_HOST", "");
+                config
+                    .env("SSH_USER")
+                    .filter(|value| !value.is_empty())
+                    .map(|user| format!("{user}@{host}"))
+                    .unwrap_or(host)
+            });
         Ok(Self {
             config,
             step: 0,
@@ -393,9 +399,8 @@ impl Runner {
 
     pub fn remote_root(&self, command: &str) -> Result<String, String> {
         let quoted_command = shell_quote(command);
-        let quoted_password = shell_quote(&self.env_or("SSH_PASSWORD", ""));
         self.ssh_output(&format!(
-            "if [ \"$(id -u)\" -eq 0 ]; then sh -c {quoted_command}; elif command -v sudo >/dev/null 2>&1; then printf '%s\\n' {quoted_password} | sudo -S sh -c {quoted_command}; elif command -v doas >/dev/null 2>&1; then printf '%s\\n' {quoted_password} | doas sh -c {quoted_command}; else echo 'root privileges required: install sudo/doas or deploy as root' >&2; exit 1; fi"
+            "if [ \"$(id -u)\" -eq 0 ]; then sh -c {quoted_command}; elif command -v sudo >/dev/null 2>&1; then sudo -n sh -c {quoted_command}; elif command -v doas >/dev/null 2>&1; then doas -n sh -c {quoted_command}; else echo 'root privileges required: install sudo/doas or deploy as root' >&2; exit 1; fi"
         ))
     }
 
@@ -943,34 +948,16 @@ impl Runner {
     }
 
     fn ssh_command(&self, command: &str) -> Command {
-        let mut ssh = if command_exists("sshpass") {
-            let mut command = Command::new("sshpass");
-            command.args(["-e", "ssh"]);
-            command.env("SSHPASS", self.env_or("SSH_PASSWORD", ""));
-            command
-        } else {
-            let mut command = Command::new("ssh");
-            apply_askpass_env(&mut command);
-            command
-        };
-        ssh.args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"])
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"])
             .arg(&self.remote)
             .arg(command);
         ssh
     }
 
     fn scp_command(&self) -> Command {
-        let mut scp = if command_exists("sshpass") {
-            let mut command = Command::new("sshpass");
-            command.args(["-e", "scp"]);
-            command.env("SSHPASS", self.env_or("SSH_PASSWORD", ""));
-            command
-        } else {
-            let mut command = Command::new("scp");
-            apply_askpass_env(&mut command);
-            command
-        };
-        scp.args(["-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=10"]);
+        let mut scp = Command::new("scp");
+        scp.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
         scp
     }
 }
@@ -1165,18 +1152,6 @@ fn command_exists(name: &str) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn apply_askpass_env(command: &mut Command) {
-    let bat = Path::new("askpass.bat");
-    let sh = Path::new("askpass.sh");
-    if bat.exists() {
-        command.env("SSH_ASKPASS", bat);
-    } else if sh.exists() {
-        command.env("SSH_ASKPASS", sh);
-    }
-    command.env("DISPLAY", "dummy");
-    command.env("SSH_ASKPASS_REQUIRE", "force");
 }
 
 fn shell_quote(value: &str) -> String {

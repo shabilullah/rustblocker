@@ -2,10 +2,11 @@
 # Copy this file to .deployenv, fill in your values, then run:
 #   cargo run --bin xtask -- mock-deploy --report-dir=target/mock-report
 
-# SSH connection
+# SSH connection. SSH_HOST remains network address used by DNS/HTTP probes.
+# SSH_TARGET may be an ~/.ssh/config alias; SSH_USER is legacy fallback.
 SSH_HOST=192.168.0.4
-SSH_USER=dns2
-SSH_PASSWORD=
+SSH_TARGET=dns2-proxmox-lxc
+SSH_USER=
 
 # RustBlocker web UI admin password
 WEBUI_PASSWORD=
