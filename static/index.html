@@ -146,8 +146,16 @@
                 </div>
             </div>
             <div class="bg-gray-800 rounded-lg p-4 border border-gray-700 mb-4">
-                <div class="flex items-center justify-between gap-3 mb-3">
-                    <h3 class="text-sm font-semibold text-gray-300">Live Query Trend</h3>
+                <div class="flex flex-wrap items-center justify-between gap-3 mb-3">
+                    <div class="flex items-center gap-3">
+                        <h3 class="text-sm font-semibold text-gray-300">Query Trend</h3>
+                        <select id="dashboard-trend-range" class="rounded border border-gray-700 px-2 py-1 font-mono text-xs" aria-label="Query trend range">
+                            <option value="1">24 hours</option>
+                            <option value="7">7 days</option>
+                            <option value="30">30 days</option>
+                            <option value="0">All retained</option>
+                        </select>
+                    </div>
                     <div class="flex items-center gap-3 font-mono text-xs text-gray-400">
                         <span class="flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-emerald-400"></span>Total</span>
                         <span class="flex items-center gap-1"><span class="h-2 w-2 rounded-full bg-red-400"></span>Blocked</span>
@@ -155,8 +163,8 @@
                     </div>
                 </div>
                 <div class="relative h-56">
-                    <canvas id="dashboard-query-chart" class="h-full w-full" aria-label="Live query trend chart"></canvas>
-                    <div id="dashboard-chart-empty" class="absolute inset-0 flex items-center justify-center font-mono text-xs text-gray-500">Waiting for live samples</div>
+                    <canvas id="dashboard-query-chart" class="h-full w-full" aria-label="Historical query trend chart"></canvas>
+                    <div id="dashboard-chart-empty" class="absolute inset-0 flex items-center justify-center font-mono text-xs text-gray-500">No queries in selected range</div>
                 </div>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">

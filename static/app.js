@@ -88,7 +88,6 @@
 
     const dashboardChart = {
         samples: [],
-        maxSamples: 40,
         previous: [],
         animationFrame: null,
         animationStart: 0,
@@ -106,8 +105,11 @@
         updateStatNumber('stat-allowed', allowlist.total);
         updateStatNumber('stat-rewrites', rewrites.length);
         updateStatNumber('stat-upstreams', upstreams.length);
-        await refreshDashboardStats();
-        await refreshHeaderVersion();
+        await Promise.all([
+            refreshDashboardStats(),
+            refreshDashboardTrend(),
+            refreshHeaderVersion(),
+        ]);
     }
 
     async function refreshHeaderVersion() {
@@ -131,7 +133,6 @@
         updateStatNumber('stat-dns-rejected', dnsConcurrency.rejected);
         updateStatNumber('stat-dns-in-flight', dnsConcurrency.in_flight);
         updateStatNumber('stat-dns-max-in-flight', dnsConcurrency.max_in_flight);
-        updateDashboardChart(stats);
 
         const clientsDiv = document.getElementById('stats-top-clients');
         clientsDiv.innerHTML = stats.top_clients.length
@@ -166,6 +167,12 @@
             : '<div class="text-gray-500 text-xs">No upstream queries yet</div>';
     }
 
+    async function refreshDashboardTrend() {
+        const range = document.getElementById('dashboard-trend-range')?.value || '1';
+        const trend = await fetchJson(API + `/stats/trend?days=${range}`, 'Query trend API');
+        updateDashboardChart(trend);
+    }
+
     function updateStatNumber(id, value) {
         const el = document.getElementById(id);
         if (!el) return;
@@ -178,19 +185,14 @@
         el.classList.add('stat-value-updated');
     }
 
-    function updateDashboardChart(stats) {
-        const sample = {
-            ts: Date.now(),
-            total: Number(stats.total_queries || 0),
-            blocked: Number(stats.blocked || 0),
-            forwarded: Number(stats.forwarded || 0),
-        };
-        dashboardChart.previous = dashboardChart.samples.map(s => ({...s}));
-        dashboardChart.samples.push(sample);
-        while (dashboardChart.samples.length > dashboardChart.maxSamples) {
-            dashboardChart.samples.shift();
-            dashboardChart.previous.shift();
-        }
+    function updateDashboardChart(points) {
+        dashboardChart.previous = dashboardChart.samples.map(sample => ({...sample}));
+        dashboardChart.samples = points.map(point => ({
+            ts: Number(point.timestamp) * 1000,
+            total: Number(point.total || 0),
+            blocked: Number(point.blocked || 0),
+            forwarded: Number(point.forwarded || 0),
+        }));
         animateDashboardChart();
     }
 
@@ -227,9 +229,10 @@
         ctx.clearRect(0, 0, rect.width, rect.height);
 
         const samples = dashboardChart.samples;
-        if (empty) empty.classList.toggle('hidden', samples.length > 1);
+        const hasQueries = samples.some(sample => sample.total > 0);
+        if (empty) empty.classList.toggle('hidden', hasQueries);
         drawChartGrid(ctx, rect.width, rect.height);
-        if (samples.length < 2) return;
+        if (!hasQueries) return;
 
         const previous = alignPreviousSamples(samples);
         const animated = samples.map((sample, index) => ({
@@ -1466,6 +1469,7 @@
     let updatePollTimer = null;
     let updatePollStopped = false;
     const UPDATE_POLL_INTERVAL_MS = 10000;
+    let dashboardTrendInterval = null;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
     function renderQueryRow(q) {
         const now = new Date();
@@ -1529,15 +1533,16 @@
         }
     }
     function startDashboardPoll() {
-        if (dashboardInterval) clearInterval(dashboardInterval);
-        dashboardInterval = setInterval(() => { refreshDashboardStats(); }, 3000);
+        stopDashboardPoll();
+        dashboardInterval = setInterval(refreshDashboardStats, 3000);
+        dashboardTrendInterval = setInterval(refreshDashboardTrend, 30000);
     }
 
     function stopDashboardPoll() {
-        if (dashboardInterval) {
-            clearInterval(dashboardInterval);
-            dashboardInterval = null;
-        }
+        clearInterval(dashboardInterval);
+        clearInterval(dashboardTrendInterval);
+        dashboardInterval = null;
+        dashboardTrendInterval = null;
     }
 
     async function loadStats() {
@@ -1574,9 +1579,13 @@
 
     async function clearStats() {
         if (!confirm('Clear all query statistics? This cannot be undone.')) return;
-        await fetch(API + '/stats', {method: 'DELETE'});
+        const response = await fetch(API + '/stats', {method: 'DELETE'});
+        if (!response.ok) throw new ApiResponseError(`Clear stats returned HTTP ${response.status}`);
+        dashboardChart.previous = dashboardChart.samples.map(sample => ({...sample}));
+        dashboardChart.samples = [];
+        animateDashboardChart();
         statsOffset = 0;
-        loadStats();
+        await loadStats();
     }
 
     const _rawFetch = window.fetch;
@@ -1723,6 +1732,7 @@ function attachListeners() {
     document.getElementById('change-password-btn')?.addEventListener('click', changePassword);
     document.getElementById('live-btn')?.addEventListener('click', toggleLive);
     document.getElementById('clear-stats-btn')?.addEventListener('click', clearStats);
+    document.getElementById('dashboard-trend-range')?.addEventListener('change', refreshDashboardTrend);
     document.getElementById('stats-prev')?.addEventListener('click', statsPrevPage);
     document.getElementById('stats-next')?.addEventListener('click', statsNextPage);
     document.getElementById('activity-hide-btn')?.addEventListener('click', () => setActivityHidden(true));

@@ -792,6 +792,30 @@ impl Runner {
         } else {
             self.fail("db-api", format!("invalid stats counters: {stats}"));
         }
+        let trend = self.curl_json("GET", "/api/stats/trend?days=1", None)?;
+        let valid_trend = trend.as_array().is_some_and(|points| {
+            points.len() == 40
+                && points.iter().all(|point| {
+                    ["timestamp", "total", "blocked", "forwarded"]
+                        .iter()
+                        .all(|key| point.get(key).and_then(Value::as_u64).is_some())
+                })
+        });
+        let invalid_range = self.curl_body("GET", "/api/stats/trend?days=2", None)?;
+        if valid_trend && invalid_range.code == 400 {
+            self.ok(
+                "query-trend",
+                "one-day history returned 40 numeric buckets; invalid range rejected",
+            );
+        } else {
+            self.fail(
+                "query-trend",
+                format!(
+                    "invalid trend contract (trend: {trend}, days=2 HTTP {})",
+                    invalid_range.code
+                ),
+            );
+        }
         let sources = self.curl_body("GET", "/api/sources", None)?.body;
         if sources.trim_start().starts_with('[') {
             self.ok("db-api", "sources endpoint reachable");

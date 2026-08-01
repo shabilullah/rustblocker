@@ -61,6 +61,10 @@ struct StatsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct TrendQuery {
+    days: Option<u64>,
+}
+#[derive(Debug, Deserialize)]
 struct QueryLogQuery {
     limit: Option<i64>,
     offset: Option<i64>,
@@ -1309,6 +1313,43 @@ async fn get_stats(
     HttpResponse::Ok().json(stats)
 }
 
+async fn get_query_trend(
+    pool: web::Data<DbPool>,
+    req: HttpRequest,
+    acl: web::Data<SharedAcl>,
+    query_log: web::Data<QueryLog>,
+    query: web::Query<TrendQuery>,
+) -> impl Responder {
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let requested_days = query.days.unwrap_or(1);
+    if !matches!(requested_days, 0 | 1 | 7 | 30) {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "days must be 0, 1, 7, or 30"}));
+    }
+    let end_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let retention_days = query_log.retention_days();
+    let pool = pool.get_ref().clone();
+    let trend = match db_blocking(move || {
+        Ok(QueryLog::get_query_trend(
+            &pool,
+            end_unix,
+            requested_days,
+            retention_days,
+        ))
+    })
+    .await
+    {
+        Ok(trend) => trend,
+        Err(resp) => return resp,
+    };
+    HttpResponse::Ok().json(trend)
+}
+
 async fn get_queries(
     pool: web::Data<DbPool>,
     req: HttpRequest,
@@ -1826,6 +1867,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/sources/{id}", web::delete().to(delete_source))
             .route("/sources/refresh", web::post().to(refresh_all_sources))
             .route("/stats", web::get().to(get_stats))
+            .route("/stats/trend", web::get().to(get_query_trend))
             .route("/stats/queries", web::get().to(get_queries))
             .route("/stats", web::delete().to(clear_stats))
             .route("/stats/live", web::get().to(live_queries))

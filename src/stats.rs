@@ -75,6 +75,14 @@ pub struct UpstreamStats {
     pub max_latency_us: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct QueryTrendPoint {
+    pub timestamp: i64,
+    pub total: u64,
+    pub blocked: u64,
+    pub forwarded: u64,
+}
+
 /// Lightweight query log entry for the API.
 #[derive(Debug, Serialize)]
 pub struct QueryLogEntry {
@@ -187,6 +195,10 @@ impl QueryLog {
     /// Update retention days (hot-reloaded from the web API).
     pub fn set_retention(&self, days: u64) {
         self.retention_days.store(days, Ordering::Relaxed);
+    }
+
+    pub fn retention_days(&self) -> u64 {
+        self.retention_days.load(Ordering::Relaxed)
     }
 
     /// Background task: batch entries and flush to SQLite periodically.
@@ -415,6 +427,82 @@ impl QueryLog {
         }
     }
 
+    /// Return 40 query-count buckets spanning the requested, retained history.
+    pub fn get_query_trend(
+        pool: &DbPool,
+        end_unix: i64,
+        requested_days: u64,
+        retention_days: u64,
+    ) -> Vec<QueryTrendPoint> {
+        const POINTS: i64 = 40;
+        const DAY_SECS: i64 = 86_400;
+
+        let conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(_) => return vec![],
+        };
+        let retained_start = if retention_days == 0 {
+            conn.query_row(
+                "SELECT MIN(unixepoch(timestamp)) FROM query_log",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(end_unix.saturating_sub(POINTS))
+        } else {
+            end_unix.saturating_sub((retention_days as i64).saturating_mul(DAY_SECS))
+        };
+        let requested_start = if requested_days == 0 {
+            retained_start
+        } else {
+            end_unix.saturating_sub((requested_days as i64).saturating_mul(DAY_SECS))
+        };
+        let start_unix = requested_start.max(retained_start);
+        let span_secs = end_unix.saturating_sub(start_unix);
+        let bucket_secs = (span_secs.saturating_add(POINTS - 1) / POINTS).max(1);
+        let mut buckets = vec![(0_u64, 0_u64, 0_u64); POINTS as usize];
+
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT MIN((unixepoch(timestamp) - ?1) / ?2, ?4),
+                    COUNT(*),
+                    COALESCE(SUM(action = 'blocked'), 0),
+                    COALESCE(SUM(action = 'forwarded'), 0)
+             FROM query_log
+             WHERE timestamp >= datetime(?1, 'unixepoch')
+               AND timestamp <= datetime(?3, 'unixepoch')
+             GROUP BY 1",
+        ) && let Ok(rows) = stmt.query_map(
+            rusqlite::params![start_unix, bucket_secs, end_unix, POINTS - 1],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                ))
+            },
+        ) {
+            for row in rows.filter_map(Result::ok) {
+                let (bucket, total, blocked, forwarded) = row;
+                if let Some(counts) = buckets.get_mut(bucket as usize) {
+                    *counts = (total, blocked, forwarded);
+                }
+            }
+        }
+
+        buckets
+            .into_iter()
+            .enumerate()
+            .map(|(index, counts)| QueryTrendPoint {
+                timestamp: (start_unix + (index as i64 + 1) * bucket_secs).min(end_unix),
+                total: counts.0,
+                blocked: counts.1,
+                forwarded: counts.2,
+            })
+            .collect()
+    }
+
     /// Get recent query log entries (paginated).
     pub fn get_queries(pool: &DbPool, limit: i64, offset: i64) -> Vec<QueryLogEntry> {
         let conn = match pool.get() {
@@ -552,6 +640,46 @@ mod tests {
         assert_eq!(stats.top_blocked_domains[0].count, 2);
         assert_eq!(stats.upstream_stats[0].resolver, "1.1.1.1");
         assert_eq!(stats.upstream_stats[0].avg_latency_us, 30);
+    }
+
+    #[test]
+    fn query_trend_uses_bucket_counts_capped_by_retention() {
+        let pool = test_pool();
+        let conn = pool.get().expect("test db connection");
+        for (timestamp, action) in [
+            ("2023-12-30 23:59:59", "allowed"),
+            ("2023-12-31 00:02:01", "blocked"),
+            ("2024-01-01 00:01:58", "forwarded"),
+        ] {
+            conn.execute(
+                "INSERT INTO query_log (timestamp, client_ip, domain, query_type, action)
+                 VALUES (?1, '127.0.0.1', 'trend.example', 'A', ?2)",
+                rusqlite::params![timestamp, action],
+            )
+            .expect("insert trend row");
+        }
+
+        let trend = QueryLog::get_query_trend(&pool, 1_704_067_320, 30, 1);
+
+        assert_eq!(trend.len(), 40);
+        assert_eq!(
+            trend.first().map(|point| point.timestamp),
+            Some(1_703_983_080)
+        );
+        assert_eq!(trend.first().map(|point| point.blocked), Some(1));
+        assert_eq!(
+            trend.last().map(|point| point.timestamp),
+            Some(1_704_067_320)
+        );
+        assert_eq!(trend.last().map(|point| point.forwarded), Some(1));
+        assert_eq!(trend.iter().map(|point| point.total).sum::<u64>(), 2);
+
+        let all_retained = QueryLog::get_query_trend(&pool, 1_704_067_320, 0, 0);
+        assert_eq!(all_retained.iter().map(|point| point.total).sum::<u64>(), 3);
+
+        QueryLog::clear(&pool);
+        let cleared = QueryLog::get_query_trend(&pool, 1_704_067_320, 0, 0);
+        assert!(cleared.iter().all(|point| point.total == 0));
     }
 
     #[test]
