@@ -17,6 +17,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
+    upstream_outcome_labels(r);
     db_concurrency(r, &cfg);
     import_hot_reload(r, &cfg);
     dns_rewrite(r, &cfg);
@@ -415,6 +416,55 @@ fn allowlist_stats(r: &mut Runner, cfg: &SmokeConfig) {
     let _ = cfg;
 }
 
+fn upstream_outcome_labels(r: &mut Runner) {
+    let domain = format!(
+        "mock-nxdomain-{}-{}.invalid",
+        unix_secs(),
+        std::process::id()
+    );
+    let response = r.dns_query(&domain);
+    let mut queries = String::new();
+    let mut labeled = false;
+    for _ in 0..8 {
+        thread::sleep(Duration::from_secs(1));
+        queries = r
+            .curl_body("GET", "/api/stats/queries?limit=50", None)
+            .map(|response| response.body)
+            .unwrap_or_default();
+        if queries.contains(&format!("\"domain\":\"{}\"", domain))
+            && queries.contains("\"resolver\":\"nxdomain\"")
+        {
+            labeled = true;
+            break;
+        }
+    }
+
+    if labeled {
+        r.ok(
+            "upstream-outcome-labels",
+            format!("NXDOMAIN response persisted with resolver=nxdomain ({domain})"),
+        );
+    } else {
+        r.fail(
+            "upstream-outcome-labels",
+            format!(
+                "NXDOMAIN outcome missing exact label (query={}, queries={})",
+                response
+                    .map(|value| if value.is_empty() {
+                        "empty".to_string()
+                    } else {
+                        value
+                    })
+                    .unwrap_or_else(|err| format!("error: {err}")),
+                if queries.is_empty() {
+                    "empty"
+                } else {
+                    &queries
+                }
+            ),
+        );
+    }
+}
 fn db_concurrency(r: &mut Runner, cfg: &SmokeConfig) {
     let Ok(http) = LocalHttp::login(r, cfg) else {
         r.fail(

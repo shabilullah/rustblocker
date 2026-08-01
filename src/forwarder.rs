@@ -318,7 +318,7 @@ impl ParallelForwarder {
                 let info = send_servfail(request, &mut response_handle).await?;
                 return Ok(ResolveResult {
                     info,
-                    resolver: "error".to_string(),
+                    resolver: "invalid_query".to_string(),
                     latency_us: 0,
                 });
             }
@@ -364,7 +364,7 @@ impl ParallelForwarder {
             warn!("No upstream resolvers configured");
             return Ok(ResolveResult {
                 info: send_servfail(request, response_handle).await?,
-                resolver: "error".to_string(),
+                resolver: "no_upstream".to_string(),
                 latency_us: start.elapsed().as_micros() as u64,
             });
         };
@@ -385,7 +385,7 @@ impl ParallelForwarder {
             }
             Ok(Err(e)) => {
                 let latency_us = start.elapsed().as_micros() as u64;
-                if is_negative_response(&e) {
+                if is_dns_no_answer(&e) {
                     self.record_success(0, latency_us);
                 } else {
                     self.record_failure(0);
@@ -445,7 +445,7 @@ impl ParallelForwarder {
                     }
                     Err(e) => {
                         debug!("Upstream resolver failed: {}", e);
-                        if is_negative_response(&e) {
+                        if is_dns_no_answer(&e) {
                             let latency_us = start.elapsed().as_micros() as u64;
                             self.record_success(idx, latency_us);
                             let (info, resolver) =
@@ -483,7 +483,7 @@ impl ParallelForwarder {
                 warn!("All upstream resolvers failed without a captured error");
                 Ok(ResolveResult {
                     info: send_servfail(request, response_handle).await?,
-                    resolver: "error".to_string(),
+                    resolver: "upstream_error".to_string(),
                     latency_us: start.elapsed().as_micros() as u64,
                 })
             }
@@ -512,7 +512,7 @@ impl ParallelForwarder {
             warn!("No upstream resolvers configured");
             return Ok(ResolveResult {
                 info: send_servfail(request, response_handle).await?,
-                resolver: "error".to_string(),
+                resolver: "no_upstream".to_string(),
                 latency_us: start.elapsed().as_micros() as u64,
             });
         }
@@ -568,7 +568,7 @@ impl ParallelForwarder {
                             }
                             Some((idx, Err(e))) => {
                                 debug!("Upstream resolver failed: {}", e);
-                                if is_negative_response(&e) {
+                                if is_dns_no_answer(&e) {
                                     let latency_us = start.elapsed().as_micros() as u64;
                                     self.record_success(idx, latency_us);
                                     let (info, resolver) =
@@ -619,7 +619,7 @@ impl ParallelForwarder {
                 warn!("All upstream resolvers failed without a captured error");
                 Ok(ResolveResult {
                     info: send_servfail(request, response_handle).await?,
-                    resolver: "error".to_string(),
+                    resolver: "upstream_error".to_string(),
                     latency_us: start.elapsed().as_micros() as u64,
                 })
             }
@@ -702,48 +702,76 @@ fn extract_answers(
     answers
 }
 
-/// Classify an upstream error into a response code and resolver label.
+/// Classify an upstream failure into downstream DNS response and log label.
 ///
-/// Returns `(response_code, label)`:
-/// - `NoRecordsFound` (NODATA / NXDomain) → the upstream's original code,
-///   `"negative"`. These are legitimate responses, not failures.
-/// - Any other error → `ServFail`, `"error"`. Real transport/protocol
-///   failures warrant SERVFAIL.
+/// DNS responses retain their upstream response code. Failures without a DNS
+/// response become SERVFAIL and expose their actual failure class.
 fn classify_upstream_error(err: &NetError) -> (ResponseCode, &'static str) {
     match err {
-        NetError::Dns(DnsError::NoRecordsFound(no_records)) => {
-            (no_records.response_code, "negative")
+        NetError::Dns(DnsError::NoRecordsFound(no_records)) => match no_records.response_code {
+            ResponseCode::NXDomain => (ResponseCode::NXDomain, "nxdomain"),
+            ResponseCode::NoError => (ResponseCode::NoError, "nodata"),
+            code => (code, response_code_label(code)),
+        },
+        NetError::Dns(DnsError::ResponseCode(code)) => (*code, response_code_label(*code)),
+        NetError::Timeout => (ResponseCode::ServFail, "timeout"),
+        NetError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            (ResponseCode::ServFail, "timeout")
         }
-        _ => (ResponseCode::ServFail, "error"),
+        NetError::Io(_) | NetError::NoConnections | NetError::Busy => {
+            (ResponseCode::ServFail, "transport_error")
+        }
+        NetError::Proto(_) | NetError::QueryCaseMismatch | NetError::ParseInt(_) => {
+            (ResponseCode::ServFail, "protocol_error")
+        }
+        _ => (ResponseCode::ServFail, "upstream_error"),
     }
 }
 
-fn is_negative_response(err: &NetError) -> bool {
-    matches!(classify_upstream_error(err), (_, "negative"))
+fn response_code_label(code: ResponseCode) -> &'static str {
+    match code {
+        ResponseCode::NoError => "noerror",
+        ResponseCode::FormErr => "formerr",
+        ResponseCode::ServFail => "servfail",
+        ResponseCode::NXDomain => "nxdomain",
+        ResponseCode::NotImp => "notimp",
+        ResponseCode::Refused => "refused",
+        ResponseCode::YXDomain => "yxdomain",
+        ResponseCode::YXRRSet => "yxrrset",
+        ResponseCode::NXRRSet => "nxrrset",
+        ResponseCode::NotAuth => "notauth",
+        ResponseCode::NotZone => "notzone",
+        ResponseCode::BADVERS => "badvers",
+        ResponseCode::BADSIG => "badsig",
+        ResponseCode::BADKEY => "badkey",
+        ResponseCode::BADTIME => "badtime",
+        ResponseCode::BADMODE => "badmode",
+        ResponseCode::BADNAME => "badname",
+        ResponseCode::BADALG => "badalg",
+        ResponseCode::BADTRUNC => "badtrunc",
+        ResponseCode::BADCOOKIE => "badcookie",
+        ResponseCode::Unknown(_) => "unknown_response",
+    }
 }
 
-/// Build a response for an upstream error, forwarding legitimate negative
-/// responses (NODATA / NXDomain) verbatim and SERVFAIL for real failures.
+fn is_dns_no_answer(err: &NetError) -> bool {
+    matches!(err, NetError::Dns(DnsError::NoRecordsFound(_)))
+}
+
+/// Build a response for an upstream DNS response or failure.
 async fn build_error_response(
     request: &hickory_server::server::Request,
     response_handle: &mut impl hickory_server::server::ResponseHandler,
     err: &NetError,
 ) -> Result<(ResponseInfo, String)> {
     let (rcode, label) = classify_upstream_error(err);
-    if label == "negative" {
-        // NoRecordsFound carries optional SOA + authority records that should
-        // be preserved for downstream negative caching.
-        let no_records = match err {
-            NetError::Dns(DnsError::NoRecordsFound(nr)) => nr,
-            other => {
-                // classify_upstream_error already proved this is a "negative"
-                // response; this branch is defensive in case a future NetError
-                // variant is classified as negative but carries no NoRecords.
-                warn!("Unexpected non-NoRecords negative upstream error: {other}");
-                let info = send_servfail(request, response_handle).await?;
-                return Ok((info, "error".to_string()));
-            }
-        };
+    if let NetError::Dns(DnsError::NoRecordsFound(no_records)) = err {
+        // Preserve authority data needed for downstream NODATA/NXDOMAIN caching.
         let ttl = no_records.negative_ttl.unwrap_or(0);
         let soa_records: Vec<Record> = no_records
             .soa
@@ -764,8 +792,8 @@ async fn build_error_response(
             .unwrap_or_default();
 
         debug!(
-            "Forwarding {} response (negative) for {} (ttl={})",
-            rcode, no_records.query, ttl,
+            "Forwarding {} response ({}) for {} (ttl={})",
+            rcode, label, no_records.query, ttl,
         );
 
         let builder = MessageResponseBuilder::from_message_request(request);
@@ -781,8 +809,10 @@ async fn build_error_response(
         let info = response_handle.send_response(response).await?;
         Ok((info, label.to_string()))
     } else {
-        warn!("Forwarding error: {}, sending SERVFAIL", err);
-        let info = send_servfail(request, response_handle).await?;
+        warn!("Upstream {}: {}; returning {}", label, err, rcode);
+        let builder = MessageResponseBuilder::from_message_request(request);
+        let response = builder.error_msg(&request.metadata, rcode);
+        let info = response_handle.send_response(response).await?;
         Ok((info, label.to_string()))
     }
 }
@@ -874,8 +904,7 @@ mod tests {
         assert!(matches!(extracted[0].data, RData::A(_)));
     }
 
-    // --- classify_upstream_error: response-code preservation for negative
-    // responses (the core fix for the "AAAA forwarded error" bug) ---
+    // --- classify_upstream_error: exact DNS responses and failure classes ---
 
     fn no_records_query(name: &str) -> Box<Query> {
         Query::query(
@@ -894,7 +923,7 @@ mod tests {
         let err: NetError = DnsError::NoRecordsFound(nr).into();
         let (rcode, label) = classify_upstream_error(&err);
         assert_eq!(rcode, ResponseCode::NoError);
-        assert_eq!(label, "negative");
+        assert_eq!(label, "nodata");
     }
 
     /// NXDomain: the domain does not exist. Must be forwarded as NXDOMAIN,
@@ -908,16 +937,47 @@ mod tests {
         let err: NetError = DnsError::NoRecordsFound(nr).into();
         let (rcode, label) = classify_upstream_error(&err);
         assert_eq!(rcode, ResponseCode::NXDomain);
-        assert_eq!(label, "negative");
+        assert_eq!(label, "nxdomain");
     }
 
-    /// Real transport failures (timeout, IO) must still produce SERVFAIL.
+    /// Transport failures become SERVFAIL without hiding failure class.
     #[test]
     fn classify_transport_error_returns_servfail() {
+        let err: NetError = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::ServFail);
+        assert_eq!(label, "transport_error");
+    }
+
+    #[test]
+    fn classify_timeout_returns_servfail() {
+        let (rcode, label) = classify_upstream_error(&NetError::Timeout);
+        assert_eq!(rcode, ResponseCode::ServFail);
+        assert_eq!(label, "timeout");
+    }
+
+    #[test]
+    fn classify_io_timeout_returns_timeout() {
         let err: NetError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
         let (rcode, label) = classify_upstream_error(&err);
         assert_eq!(rcode, ResponseCode::ServFail);
-        assert_eq!(label, "error");
+        assert_eq!(label, "timeout");
+    }
+
+    #[test]
+    fn classify_protocol_error_returns_servfail() {
+        let err = NetError::Proto("malformed response".into());
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::ServFail);
+        assert_eq!(label, "protocol_error");
+    }
+
+    #[test]
+    fn classify_dns_error_preserves_response_code() {
+        let err: NetError = DnsError::ResponseCode(ResponseCode::Refused).into();
+        let (rcode, label) = classify_upstream_error(&err);
+        assert_eq!(rcode, ResponseCode::Refused);
+        assert_eq!(label, "refused");
     }
 
     #[test]
