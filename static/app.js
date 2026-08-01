@@ -1293,7 +1293,6 @@
     }
 
     async function checkForUpdates() {
-        updatePollStopped = false;
         await autoCheckUpdate({manual: true});
         startUpdatePoll({delay: UPDATE_POLL_INTERVAL_MS});
     }
@@ -1308,21 +1307,21 @@
         const btn = document.getElementById('update-apply-btn');
         const notes = document.getElementById('update-notes');
         if (!status) return;
-        status.textContent = updatePollStopped
-            ? 'Automatic update checks stopped after a failed request. Use the refresh icon to try again.'
-            : 'Automatic update checks are enabled. Use the refresh icon to check now.';
+        status.textContent = 'Automatic update checks are enabled. Use the refresh icon to check now.';
         status.className = 'text-sm text-gray-400';
         btn?.classList.add('hidden');
         notes?.classList.add('hidden');
     }
 
     function startUpdatePoll(options = {}) {
-        if (updatePollTimer || updatePollStopped) return;
-        const delay = options.delay ?? 10000;
+        if (updatePollTimer) return;
+        const delay = options.delay ?? UPDATE_INITIAL_DELAY_MS;
         updatePollTimer = setTimeout(async () => {
             updatePollTimer = null;
             const ok = await autoCheckUpdate({manual: false});
-            if (ok && !window._updateInfo) startUpdatePoll({delay: UPDATE_POLL_INTERVAL_MS});
+            if (!window._updateInfo) {
+                startUpdatePoll({delay: ok ? UPDATE_POLL_INTERVAL_MS : UPDATE_RETRY_INTERVAL_MS});
+            }
         }, delay);
     }
 
@@ -1374,13 +1373,12 @@
                 return true;
             }
         } catch (e) {
-            updatePollStopped = true;
             stopUpdatePoll();
             if (manual && status) {
                 status.textContent = 'Update check failed: ' + (e.message || 'Network error');
                 status.className = 'text-sm text-red-400';
             } else if (settingsVisible && status) {
-                status.textContent = 'Automatic update checks stopped after a failed request. Use the refresh icon to try again.';
+                status.textContent = 'Update check failed. Automatic retry scheduled.';
                 status.className = 'text-sm text-amber-400';
             }
             window._updateInfo = null;
@@ -1467,8 +1465,9 @@
     let reconnectTimer = null;
     let dashboardInterval = null;
     let updatePollTimer = null;
-    let updatePollStopped = false;
-    const UPDATE_POLL_INTERVAL_MS = 10000;
+    const UPDATE_INITIAL_DELAY_MS = 10000;
+    const UPDATE_POLL_INTERVAL_MS = 6 * 60 * 60 * 1000;
+    const UPDATE_RETRY_INTERVAL_MS = 5 * 60 * 1000;
     let dashboardTrendInterval = null;
     const actionColors = {blocked:'text-red-400', allowed:'text-green-400', rewritten:'text-blue-400', forwarded:'text-yellow-400'};
     function renderQueryRow(q) {

@@ -1594,23 +1594,20 @@ async fn check_update(req: HttpRequest, acl: web::Data<SharedAcl>) -> impl Respo
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    match tokio::task::spawn_blocking(update::check_for_update).await {
-        Ok(Ok(Some(info))) => HttpResponse::Ok().json(serde_json::json!({
+    match update::check_for_update().await {
+        Ok(Some(info)) => HttpResponse::Ok().json(serde_json::json!({
             "update_available": true,
             "version": info.version,
             "notes": info.notes,
             "download_url": info.download_url,
             "current_version": info.current_version,
         })),
-        Ok(Ok(None)) => HttpResponse::Ok().json(serde_json::json!({
+        Ok(None) => HttpResponse::Ok().json(serde_json::json!({
             "update_available": false,
             "current_version": update::current_version(),
         })),
-        Ok(Err(e)) => HttpResponse::BadGateway().json(serde_json::json!({
+        Err(e) => HttpResponse::BadGateway().json(serde_json::json!({
             "error": format!("{:#}", e),
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("join error: {:#}", e),
         })),
     }
 }

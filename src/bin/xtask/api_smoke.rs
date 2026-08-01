@@ -18,6 +18,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
     upstream_outcome_labels(r);
+    update_detection(r);
     db_concurrency(r, &cfg);
     import_hot_reload(r, &cfg);
     dns_rewrite(r, &cfg);
@@ -462,6 +463,54 @@ fn upstream_outcome_labels(r: &mut Runner) {
                     &queries
                 }
             ),
+        );
+    }
+}
+
+fn update_detection(r: &mut Runner) {
+    let mut last = Value::Null;
+    let mut passed = true;
+    for _ in 0..3 {
+        match r.curl_json("GET", "/api/update/check", None) {
+            Ok(response) => {
+                let has_status = response
+                    .get("update_available")
+                    .is_some_and(Value::is_boolean);
+                let has_current = response
+                    .get("current_version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.is_empty());
+                let has_release = !response
+                    .get("update_available")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || (response
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .is_some_and(|version| !version.is_empty())
+                        && response
+                            .get("download_url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| url.starts_with("https://github.com/")));
+                passed &= has_status && has_current && has_release;
+                last = response;
+            }
+            Err(error) => {
+                passed = false;
+                last = Value::String(error);
+            }
+        }
+    }
+
+    if passed {
+        r.ok(
+            "update-detection",
+            format!("three release-feed checks returned valid metadata ({last})"),
+        );
+    } else {
+        r.fail(
+            "update-detection",
+            format!("release-feed update check failed validation ({last})"),
         );
     }
 }
