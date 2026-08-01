@@ -48,6 +48,12 @@ pub struct SourceRefreshResult {
     pub store: DomainStore,
 }
 
+static SOURCE_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) async fn lock_source_mutation() -> tokio::sync::MutexGuard<'static, ()> {
+    SOURCE_MUTATION_LOCK.lock().await
+}
+
 pub fn create_pool<P: AsRef<Path>>(db_path: P) -> Result<DbPool, DbError> {
     let path = db_path.as_ref();
     let manager = SqliteConnectionManager::file(path);
@@ -1069,6 +1075,11 @@ pub async fn refresh_source(
         return status;
     }
 
+    // Keep DB snapshot replacement and runtime-store install ordered. Without
+    // this lock, overlapping refreshes can install an older rebuilt snapshot
+    // after a newer refresh committed, dropping valid domains until restart.
+    let _mutation_guard = lock_source_mutation().await;
+
     let pool_for_db = pool.clone();
     let table_for_db = table.to_string();
     let source_id = source.id;
@@ -1338,6 +1349,47 @@ mod tests {
         let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
         assert!(names.iter().any(|d| d == "keep.example.com"));
         assert!(!names.iter().any(|d| d == "drop.example.com"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_source_refreshes_keep_runtime_store_consistent() {
+        let pool = test_pool();
+        let first = add_source(&pool, "memory://first", "blocklist", 24).unwrap();
+        let second = add_source(&pool, "memory://second", "blocklist", 24).unwrap();
+        let store = std::sync::Arc::new(parking_lot::RwLock::new(DomainStore::default()));
+        let first_path = std::env::temp_dir().join(format!("source-first-{first}.list"));
+        let second_path = std::env::temp_dir().join(format!("source-second-{second}.list"));
+        std::fs::write(&first_path, "first.example.com\n").unwrap();
+        std::fs::write(&second_path, "second.example.com\n").unwrap();
+        let first_source = DbSource {
+            id: first,
+            url: first_path.to_string_lossy().into_owned(),
+            list_type: "blocklist".to_string(),
+            enabled: true,
+            update_interval_hours: 24,
+            last_updated: None,
+            last_status: None,
+        };
+        let second_source = DbSource {
+            id: second,
+            url: second_path.to_string_lossy().into_owned(),
+            list_type: "blocklist".to_string(),
+            enabled: true,
+            update_interval_hours: 24,
+            last_updated: None,
+            last_status: None,
+        };
+
+        let (first_status, second_status) = tokio::join!(
+            refresh_source(&pool, &first_source, Some(&store), None),
+            refresh_source(&pool, &second_source, Some(&store), None),
+        );
+
+        assert!(first_status.starts_with("ok:"));
+        assert!(second_status.starts_with("ok:"));
+        let runtime = store.read();
+        assert!(runtime.matches("first.example.com"));
+        assert!(runtime.matches("second.example.com"));
     }
 
     #[test]

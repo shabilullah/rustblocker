@@ -19,6 +19,7 @@ pub struct Config {
     pub skip_build: bool,
     pub skip_deploy: bool,
     pub timeout_secs: u64,
+    preserve_slave_mode: bool,
     values: BTreeMap<String, String>,
 }
 
@@ -45,6 +46,7 @@ pub struct Runner {
     summary_json: PathBuf,
     compare_json: PathBuf,
     remote: String,
+    slave_mode_suspended: bool,
 }
 
 pub fn mock_deploy(raw_args: Vec<String>) -> Result<(), String> {
@@ -53,7 +55,16 @@ pub fn mock_deploy(raw_args: Vec<String>) -> Result<(), String> {
         .map_err(|err| format!("create {}: {err}", config.report_dir.display()))?;
 
     let mut runner = Runner::new(config)?;
-    let result = runner.run();
+    let run_result = runner.run();
+    let restore_result = runner.restore_slave_mode();
+    let result = match (run_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Err(run_err), Err(restore_err)) => Err(format!(
+            "{run_err}; slave-mode restore failed: {restore_err}"
+        )),
+    };
     let summary = runner.write_summary(if result.is_ok() { 0 } else { 1 })?;
     println!("xtask: summary={}", runner.summary_json.display());
 
@@ -82,6 +93,7 @@ impl Config {
         let mut skip_build = false;
         let mut skip_deploy = false;
         let mut timeout_secs = 30;
+        let mut preserve_slave_mode = false;
 
         for arg in raw_args {
             if let Some(value) = arg.strip_prefix("--report-dir=") {
@@ -98,6 +110,8 @@ impl Config {
                 skip_build = true;
             } else if arg == "--skip-deploy" {
                 skip_deploy = true;
+            } else if arg == "--preserve-slave-mode" {
+                preserve_slave_mode = true;
             } else if arg == "--help" || arg == "-h" {
                 usage_mock_deploy();
                 std::process::exit(0);
@@ -122,6 +136,7 @@ impl Config {
             skip_build,
             skip_deploy,
             timeout_secs,
+            preserve_slave_mode,
             values,
         })
     }
@@ -190,6 +205,7 @@ impl Runner {
             summary_json,
             compare_json,
             remote,
+            slave_mode_suspended: false,
         })
     }
 
@@ -201,6 +217,7 @@ impl Runner {
         );
         let target = self.detect_target()?;
         self.build(&target)?;
+        self.suspend_slave_mode()?;
         self.deploy(&target)?;
         self.login()?;
         let settings = self.settings()?;
@@ -920,6 +937,63 @@ impl Runner {
         Ok(())
     }
 
+    fn suspend_slave_mode(&mut self) -> Result<(), String> {
+        if self.config.preserve_slave_mode {
+            self.skip(
+                "slave-mode-isolation",
+                "preserved for targeted slave-mode test",
+            );
+            return Ok(());
+        }
+
+        let db = shell_quote(&self.env_or("REMOTE_DB_PATH", "/var/lib/rustblocker/rustblocker.db"));
+        let enabled = self.remote_root(&format!(
+            "command -v sqlite3 >/dev/null 2>&1 && sqlite3 {db} \"SELECT value FROM settings WHERE key='sync_enabled';\""
+        ))?;
+        if enabled.trim() != "true" {
+            self.ok("slave-mode-isolation", "slave mode already disabled");
+            return Ok(());
+        }
+
+        self.remote_root(&format!(
+            "sqlite3 {db} \"UPDATE settings SET value='false' WHERE key='sync_enabled';\""
+        ))?;
+        self.slave_mode_suspended = true;
+        self.restart_remote_service()?;
+        self.ok(
+            "slave-mode-isolation",
+            "disabled active slave mode for isolated mock run",
+        );
+        Ok(())
+    }
+
+    fn restore_slave_mode(&mut self) -> Result<(), String> {
+        if !self.slave_mode_suspended {
+            return Ok(());
+        }
+
+        let db = shell_quote(&self.env_or("REMOTE_DB_PATH", "/var/lib/rustblocker/rustblocker.db"));
+        let result = self
+            .remote_root(&format!(
+                "sqlite3 {db} \"UPDATE settings SET value='true' WHERE key='sync_enabled';\""
+            ))
+            .and_then(|_| self.restart_remote_service());
+        match result {
+            Ok(()) => {
+                self.slave_mode_suspended = false;
+                self.ok("slave-mode-restore", "restored active slave mode");
+                Ok(())
+            }
+            Err(err) => {
+                self.fail(
+                    "slave-mode-restore",
+                    format!("failed to restore active slave mode: {err}"),
+                );
+                Err(err)
+            }
+        }
+    }
+
     fn write_summary(&self, exit_code: i32) -> Result<Value, String> {
         let summary = summarize_run(&self.run_jsonl, exit_code);
         write_json(&self.summary_json, &summary)?;
@@ -1339,6 +1413,6 @@ fn unix_millis() -> u128 {
 
 fn usage_mock_deploy() {
     eprintln!(
-        "  cargo run --bin xtask -- mock-deploy [--report-dir=DIR] [--compare=SUMMARY_JSON] [--deployenv=FILE] [--skip-build] [--skip-deploy] [--timeout=SECONDS]"
+        "  cargo run --bin xtask -- mock-deploy [--report-dir=DIR] [--compare=SUMMARY_JSON] [--deployenv=FILE] [--skip-build] [--skip-deploy] [--preserve-slave-mode] [--timeout=SECONDS]"
     );
 }

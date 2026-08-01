@@ -1215,6 +1215,7 @@ async fn delete_source(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let id = path.into_inner();
+    let _mutation_guard = db::lock_source_mutation().await;
     let pool_for_delete = pool.get_ref().clone();
     let result =
         match db_blocking(move || Ok(db::delete_source_with_cleanup(&pool_for_delete, id))).await {
