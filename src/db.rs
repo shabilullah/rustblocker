@@ -92,7 +92,7 @@ fn init_schema(conn: &rusqlite::Connection) -> Result<(), DbError> {
         CREATE TABLE IF NOT EXISTS upstreams (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             address TEXT NOT NULL,
-            port INTEGER NOT NULL DEFAULT 53
+            port INTEGER NOT NULL DEFAULT 53 CHECK (port BETWEEN 1 AND 65535)
         );
         CREATE TABLE IF NOT EXISTS blocklist_domains (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +152,14 @@ fn init_schema(conn: &rusqlite::Connection) -> Result<(), DbError> {
             PRIMARY KEY (list_type, domain)
         );",
     );
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS validate_upstream_port_insert
+         BEFORE INSERT ON upstreams WHEN NEW.port NOT BETWEEN 1 AND 65535
+         BEGIN SELECT RAISE(ABORT, 'upstream port must be between 1 and 65535'); END;
+         CREATE TRIGGER IF NOT EXISTS validate_upstream_port_update
+         BEFORE UPDATE OF port ON upstreams WHEN NEW.port NOT BETWEEN 1 AND 65535
+         BEGIN SELECT RAISE(ABORT, 'upstream port must be between 1 and 65535'); END;",
+    )?;
     Ok(())
 }
 
@@ -495,7 +503,7 @@ pub fn get_certificate_status(pool: &DbPool, domain: &str) -> Option<serde_json:
 pub struct DbUpstream {
     pub id: i64,
     pub address: String,
-    pub port: i64,
+    pub port: u16,
 }
 
 pub fn get_upstreams(pool: &DbPool) -> Result<Vec<DbUpstream>, DbError> {
@@ -509,11 +517,10 @@ pub fn get_upstreams(pool: &DbPool) -> Result<Vec<DbUpstream>, DbError> {
                 port: row.get(2)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
-pub fn add_upstream(pool: &DbPool, address: &str, port: i64) -> Result<i64, DbError> {
+pub fn add_upstream(pool: &DbPool, address: &str, port: u16) -> Result<i64, DbError> {
     let conn = pool.get()?;
     conn.execute(
         "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
@@ -1411,6 +1418,28 @@ mod tests {
         assert_eq!(deleted.as_deref(), Some("delete-me.example"));
         assert!(get_domain_by_id(&pool, "blocklist_domains", id).is_none());
         assert!(delete_domain_by_id(&pool, "blocklist_domains", id).is_none());
+    }
+
+    #[test]
+    fn upstream_ports_remain_lossless_and_database_rejects_invalid_values() {
+        let pool = test_pool();
+        let id = add_upstream(&pool, "127.0.0.1", 65_535).unwrap();
+        let upstream = get_upstreams(&pool)
+            .unwrap()
+            .into_iter()
+            .find(|upstream| upstream.id == id)
+            .unwrap();
+        assert_eq!(upstream.port, 65_535);
+
+        let error = pool
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
+                params!["127.0.0.1", 65_536],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("upstream port must be between"));
     }
 
     #[test]

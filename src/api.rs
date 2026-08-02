@@ -41,7 +41,7 @@ struct BulkImport {
 #[derive(Debug, Deserialize)]
 struct UpstreamAdd {
     address: String,
-    port: Option<i64>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -793,6 +793,10 @@ async fn add_upstream(
     let pool_for_add = pool.get_ref().clone();
     let address = body.address.clone();
     let port = body.port.unwrap_or(53);
+    if port == 0 {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "port must be between 1 and 65535"}));
+    }
     let id = match db_blocking(move || db::add_upstream(&pool_for_add, &address, port)).await {
         Ok(id) => id,
         Err(response) => return response,
@@ -827,7 +831,7 @@ fn reload_forwarder(pool: &DbPool, forwarder: &Arc<RwLock<ParallelForwarder>>) {
         .iter()
         .map(|u| UpstreamConfig {
             address: u.address.clone(),
-            port: Some(u.port as u16),
+            port: Some(u.port),
         })
         .collect();
     let timeout_secs: u64 = db::get_setting(pool, "upstream_timeout_secs")

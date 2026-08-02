@@ -366,7 +366,7 @@ fn reload_forwarder_from_db(
         .iter()
         .map(|u| UpstreamConfig {
             address: u.address.clone(),
-            port: Some(u.port as u16),
+            port: Some(u.port),
         })
         .collect();
 
@@ -386,7 +386,7 @@ fn apply_upstreams(
     #[derive(Deserialize)]
     struct UpstreamItem {
         address: String,
-        port: i64,
+        port: u16,
     }
 
     let items: Vec<UpstreamItem> = match serde_json::from_value(data.clone()) {
@@ -396,6 +396,10 @@ fn apply_upstreams(
             return;
         }
     };
+    if items.iter().any(|item| item.port == 0) {
+        warn!("Sync: upstream port must be between 1 and 65535");
+        return;
+    }
 
     // Replace all upstreams atomically.
     let mut conn = match pool.get() {
@@ -431,7 +435,7 @@ fn apply_upstreams(
         .iter()
         .map(|u| UpstreamConfig {
             address: u.address.clone(),
-            port: Some(u.port as u16),
+            port: Some(u.port),
         })
         .collect();
     let strategy = forward_strategy_from_db(pool);

@@ -267,12 +267,12 @@ async fn run_server(cli: Cli) -> Result<()> {
         rewrites.read().rules.len(),
     );
 
-    let db_upstreams = db::get_upstreams(&pool).unwrap_or_default();
+    let db_upstreams = db::get_upstreams(&pool).context("Failed to load upstreams")?;
     let upstreams: Vec<UpstreamConfig> = db_upstreams
         .iter()
         .map(|u| UpstreamConfig {
             address: u.address.clone(),
-            port: Some(u.port as u16),
+            port: Some(u.port),
         })
         .collect();
 

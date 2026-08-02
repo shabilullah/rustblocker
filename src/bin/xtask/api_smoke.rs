@@ -1,4 +1,6 @@
-use crate::core::{ResourceSnapshot, Runner, target_dns_probe, target_dnssec_probe};
+use crate::core::{
+    ResourceSnapshot, Runner, target_dns_probe, target_dns_probe_port, target_dnssec_probe,
+};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
     upstream_protocol_fidelity(r, &cfg);
+    configured_upstream_port(r, &cfg);
     update_detection(r);
     db_concurrency(r, &cfg);
     import_hot_reload(r, &cfg);
@@ -760,6 +763,153 @@ fn upstream_protocol_fidelity(r: &mut Runner, cfg: &SmokeConfig) {
             format!(
                 "upstream DNS message lost data or label (NXDOMAIN={nxdomain:?} DNSSEC={dnssec:?} labeled={labeled} queries={})",
                 if queries.is_empty() { "empty" } else { &queries }
+            ),
+        );
+    }
+}
+
+fn configured_upstream_port(r: &mut Runner, cfg: &SmokeConfig) {
+    let port = r.env_u64("CUSTOM_UPSTREAM_PROOF_PORT").unwrap_or(55_353);
+    let Ok(port) = u16::try_from(port) else {
+        r.fail(
+            "configured-upstream-port",
+            format!("CUSTOM_UPSTREAM_PROOF_PORT outside 1..=65535: {port}"),
+        );
+        return;
+    };
+    if port == 0 {
+        r.fail(
+            "configured-upstream-port",
+            "CUSTOM_UPSTREAM_PROOF_PORT must be nonzero",
+        );
+        return;
+    }
+
+    let upstreams_before = match r.curl_json("GET", "/api/upstreams", None) {
+        Ok(value) => value,
+        Err(error) => {
+            r.fail("configured-upstream-port", error);
+            return;
+        }
+    };
+    let web_port = r.env_u64("WEB_PORT").unwrap_or(54);
+    let db = format!("/tmp/rustblocker-upstream-port-{}.db", cfg.run_tag);
+    let log = format!("/tmp/rustblocker-upstream-port-{}.log", cfg.run_tag);
+    let pid_file = format!("/tmp/rustblocker-upstream-port-{}.pid", cfg.run_tag);
+    let bin = format!(
+        "{}/{}",
+        r.env_or("REMOTE_INSTALL_DIR", "/usr/local/lib/rustblocker"),
+        r.env_or("BINARY_NAME", "rustblocker")
+    );
+    let launch = format!(
+        "rm -f {db} {db}-wal {db}-shm {log} {pid_file}; nohup {bin} --db-path {db} --dns-port {port} --web-port {} --force-http >{log} 2>&1 & echo $! >{pid_file}",
+        web_port + 1000,
+        db = shell_quote(&db),
+        log = shell_quote(&log),
+        pid_file = shell_quote(&pid_file),
+        bin = shell_quote(&bin),
+    );
+    if let Err(error) = r.remote_root(&launch) {
+        r.fail(
+            "configured-upstream-port",
+            format!("start proof resolver: {error}"),
+        );
+        return;
+    }
+
+    let proof_domain = format!("{}-custom-port.rustblocker.test", cfg.run_tag);
+    let mut side_ready = false;
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(500));
+        if target_dns_probe_port(&cfg.ssh_host, port, &proof_domain, 1)
+            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0)
+        {
+            side_ready = true;
+            break;
+        }
+    }
+
+    let mut added_id = None;
+    let invalid_zero = r
+        .curl_body(
+            "POST",
+            "/api/upstreams",
+            Some(json!({"address": "127.0.0.1", "port": 0})),
+        )
+        .ok();
+    let invalid_large = r
+        .curl_body(
+            "POST",
+            "/api/upstreams",
+            Some(json!({"address": "127.0.0.1", "port": 65536})),
+        )
+        .ok();
+    if side_ready {
+        let existing_ids = upstreams_before
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.get("id").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        for id in existing_ids {
+            let _ = r.curl_code("DELETE", &format!("/api/upstreams/{id}"), None);
+        }
+        added_id = r
+            .curl_json(
+                "POST",
+                "/api/upstreams",
+                Some(json!({"address": "127.0.0.1", "port": port})),
+            )
+            .ok()
+            .and_then(|value| json_id(&value));
+    }
+
+    let resolved = side_ready
+        && added_id.is_some()
+        && target_dns_probe(&cfg.ssh_host, &proof_domain, 1)
+            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0);
+    if let Some(id) = added_id {
+        let _ = r.curl_code("DELETE", &format!("/api/upstreams/{id}"), None);
+    }
+    for upstream in upstreams_before.as_array().into_iter().flatten() {
+        if let (Some(address), Some(port)) = (
+            upstream.get("address").and_then(Value::as_str),
+            upstream.get("port").and_then(Value::as_u64),
+        ) {
+            let _ = r.curl_code(
+                "POST",
+                "/api/upstreams",
+                Some(json!({"address": address, "port": port})),
+            );
+        }
+    }
+    let cleanup = format!(
+        "if [ -f {pid_file} ]; then kill $(cat {pid_file}) 2>/dev/null || true; fi; rm -f {db} {db}-wal {db}-shm {log} {pid_file}",
+        pid_file = shell_quote(&pid_file),
+        db = shell_quote(&db),
+        log = shell_quote(&log),
+    );
+    let _ = r.remote_root(&cleanup);
+
+    let validation_ok = invalid_zero
+        .as_ref()
+        .is_some_and(|response| response.code == 400)
+        && invalid_large
+            .as_ref()
+            .is_some_and(|response| response.code == 400);
+    if resolved && validation_ok {
+        r.ok(
+            "configured-upstream-port",
+            format!("forwarded through configured 127.0.0.1:{port}; rejected ports 0 and 65536"),
+        );
+    } else {
+        r.fail(
+            "configured-upstream-port",
+            format!(
+                "custom-port forwarding failed side_ready={side_ready} added={} resolved={resolved} zero={:?} large={:?}",
+                added_id.is_some(),
+                invalid_zero.map(|response| response.code),
+                invalid_large.map(|response| response.code)
             ),
         );
     }
