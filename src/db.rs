@@ -34,6 +34,10 @@ use tracing::info;
 
 use crate::lists::DomainStore;
 
+const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const MIN_SOURCE_DOMAINS: usize = 10;
+const MIN_SOURCE_RETAINED_PERCENT: usize = 10;
+
 pub type DbPool = Pool<SqliteConnectionManager>;
 
 pub struct DomainImportResult {
@@ -190,28 +194,56 @@ pub fn seed_defaults(pool: &DbPool) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Fetch content from a URL or read from a local file path.
-pub async fn fetch_source(path: &str) -> String {
-    if path.starts_with("http://") || path.starts_with("https://") {
+/// Fetch content from a URL or local file with a bounded response size.
+pub async fn fetch_source(path: &str) -> Result<String, String> {
+    let bytes = if path.starts_with("http://") || path.starts_with("https://") {
         info!("Fetching from {}...", path);
-        match reqwest::get(path).await {
-            Ok(resp) => resp.text().await.unwrap_or_default(),
-            Err(e) => {
-                tracing::warn!("Failed to fetch {}: {}", path, e);
-                String::new()
-            }
+        let mut response = reqwest::get(path)
+            .await
+            .map_err(|e| format!("request failed: {e}"))?
+            .error_for_status()
+            .map_err(|e| format!("HTTP request failed: {e}"))?;
+        if response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"))
+        {
+            return Err("suspicious content type: text/html".to_string());
         }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_SOURCE_BYTES as u64)
+        {
+            return Err(format!("response exceeds {} byte limit", MAX_SOURCE_BYTES));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("response read failed: {e}"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_SOURCE_BYTES {
+                return Err(format!("response exceeds {} byte limit", MAX_SOURCE_BYTES));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes
     } else {
-        std::fs::read_to_string(path).unwrap_or_default()
-    }
+        let metadata = std::fs::metadata(path).map_err(|e| format!("file metadata failed: {e}"))?;
+        if metadata.len() > MAX_SOURCE_BYTES as u64 {
+            return Err(format!("file exceeds {} byte limit", MAX_SOURCE_BYTES));
+        }
+        std::fs::read(path).map_err(|e| format!("file read failed: {e}"))?
+    };
+    String::from_utf8(bytes).map_err(|e| format!("source is not UTF-8: {e}"))
 }
 
 /// Import domains from a URL or file into the database.
 pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize {
-    let content = fetch_source(path).await;
-    if content.is_empty() {
+    let Ok(content) = fetch_source(path).await else {
         return 0;
-    }
+    };
     let pool = pool.clone();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
@@ -234,21 +266,39 @@ fn parse_domain_line(line: &str) -> Option<String> {
     } else {
         line
     };
-
-    let domain_part = domain_part.trim();
-    if domain_part.is_empty() {
+    let normalized = domain_part
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let name = normalized.strip_prefix("*.").unwrap_or(&normalized);
+    if name.is_empty()
+        || name.len() > 253
+        || !name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
         return None;
     }
-
-    let normalized = domain_part.to_lowercase();
-    let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized.to_string())
-    }
+    Some(normalized)
 }
 
+fn parse_source_domains(content: &str) -> Result<Vec<String>, String> {
+    let mut domains: Vec<String> = content.lines().filter_map(parse_domain_line).collect();
+    domains.sort_unstable();
+    domains.dedup();
+    if domains.len() < MIN_SOURCE_DOMAINS {
+        return Err(format!(
+            "suspicious content: found {} usable domains, minimum is {}",
+            domains.len(),
+            MIN_SOURCE_DOMAINS
+        ));
+    }
+    Ok(domains)
+}
 /// Insert parsed domains, preserving `*.` prefix for wildcards.
 fn insert_domains_from_content(
     conn: &rusqlite::Connection,
@@ -929,9 +979,25 @@ fn replace_source_domains(
         .get()
         .map_err(|e| format!("failed to get DB connection: {e}"))?;
 
-    let mut new_list: Vec<String> = content.lines().filter_map(parse_domain_line).collect();
-    new_list.sort();
-    new_list.dedup();
+    let new_list = parse_source_domains(content)?;
+    let previous_count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_domains WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("count prior source domains: {e}"))?;
+    if previous_count >= 10
+        && new_list.len().saturating_mul(100)
+            < previous_count.saturating_mul(MIN_SOURCE_RETAINED_PERCENT)
+    {
+        return Err(format!(
+            "suspicious content: {} usable domains would retain less than {}% of prior {}",
+            new_list.len(),
+            MIN_SOURCE_RETAINED_PERCENT,
+            previous_count
+        ));
+    }
 
     let tx = conn
         .transaction()
@@ -1057,18 +1123,20 @@ pub async fn refresh_source(
     };
 
     info!("Refreshing source: {} ({})", source.url, source.list_type);
-    let content = fetch_source(&source.url).await;
-    if content.is_empty() {
-        let status = "failed: empty response".to_string();
-        let pool = pool.clone();
-        let status_for_db = status.clone();
-        let source_id = source.id;
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = update_source_status(&pool, source_id, &status_for_db);
-        })
-        .await;
-        return status;
-    }
+    let content = match fetch_source(&source.url).await {
+        Ok(content) => content,
+        Err(error) => {
+            let status = format!("failed: {error}");
+            let pool = pool.clone();
+            let status_for_db = status.clone();
+            let source_id = source.id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = update_source_status(&pool, source_id, &status_for_db);
+            })
+            .await;
+            return status;
+        }
+    };
 
     // Keep DB snapshot replacement and runtime-store install ordered. Without
     // this lock, overlapping refreshes can install an older rebuilt snapshot
@@ -1332,28 +1400,27 @@ mod tests {
         let pool = test_pool();
         let id = add_source(&pool, "memory://sticky-source", "blocklist", 24).unwrap();
 
-        let full = "0.0.0.0 keep.example.com\n0.0.0.0 drop.example.com\n";
+        let full = (0..20)
+            .map(|index| format!("domain-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (full_count, full_store) =
-            replace_source_domains(&pool, id, "blocklist_domains", full).expect("full replace");
-        assert_eq!(full_count, 2);
-        assert!(full_store.matches("keep.example.com"));
-        assert!(full_store.matches("drop.example.com"));
+            replace_source_domains(&pool, id, "blocklist_domains", &full).expect("full replace");
+        assert_eq!(full_count, 20);
+        assert!(full_store.matches("domain-0.example.com"));
+        assert!(full_store.matches("domain-19.example.com"));
 
-        let shrink = "0.0.0.0 keep.example.com\n";
+        let shrink = (0..10)
+            .map(|index| format!("domain-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let (shrink_count, shrink_store) =
-            replace_source_domains(&pool, id, "blocklist_domains", shrink).expect("shrink replace");
-        assert_eq!(shrink_count, 1);
-        assert!(shrink_store.matches("keep.example.com"));
-        assert!(
-            !shrink_store.matches("drop.example.com"),
-            "removed source domain must leave the rebuilt store"
-        );
-
-        // DB must also drop the unreferenced domain.
-        let domains = get_domains(&pool, "blocklist_domains").unwrap_or_default();
-        let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
-        assert!(names.iter().any(|d| d == "keep.example.com"));
-        assert!(!names.iter().any(|d| d == "drop.example.com"));
+            replace_source_domains(&pool, id, "blocklist_domains", &shrink)
+                .expect("shrink replace");
+        assert_eq!(shrink_count, 10);
+        assert!(shrink_store.matches("domain-0.example.com"));
+        assert!(!shrink_store.matches("domain-19.example.com"));
+        assert_eq!(count_domains(&pool, "blocklist_domains").unwrap(), 10);
     }
 
     #[tokio::test]
@@ -1364,8 +1431,16 @@ mod tests {
         let store = std::sync::Arc::new(parking_lot::RwLock::new(DomainStore::default()));
         let first_path = std::env::temp_dir().join(format!("source-first-{first}.list"));
         let second_path = std::env::temp_dir().join(format!("source-second-{second}.list"));
-        std::fs::write(&first_path, "first.example.com\n").unwrap();
-        std::fs::write(&second_path, "second.example.com\n").unwrap();
+        let first_content = (0..10)
+            .map(|index| format!("first-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let second_content = (0..10)
+            .map(|index| format!("second-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&first_path, first_content).unwrap();
+        std::fs::write(&second_path, second_content).unwrap();
         let first_source = DbSource {
             id: first,
             url: first_path.to_string_lossy().into_owned(),
@@ -1393,8 +1468,8 @@ mod tests {
         assert!(first_status.starts_with("ok:"));
         assert!(second_status.starts_with("ok:"));
         let runtime = store.read();
-        assert!(runtime.matches("first.example.com"));
-        assert!(runtime.matches("second.example.com"));
+        assert!(runtime.matches("first-0.example.com"));
+        assert!(runtime.matches("second-0.example.com"));
     }
 
     #[test]
@@ -1402,24 +1477,21 @@ mod tests {
         let pool = test_pool();
         let _manual_id = add_domain(&pool, "blocklist_domains", "manual.example.com");
         let id = add_source(&pool, "memory://manual-overlap", "blocklist", 24).unwrap();
-        replace_source_domains(
-            &pool,
-            id,
-            "blocklist_domains",
-            "0.0.0.0 manual.example.com\n0.0.0.0 source-only.example.com\n",
-        )
-        .expect("seed overlapping source");
+        let full = std::iter::once("manual.example.com".to_string())
+            .chain((0..10).map(|index| format!("source-{index}.example.com")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        replace_source_domains(&pool, id, "blocklist_domains", &full)
+            .expect("seed overlapping source");
 
-        let (_count, store) = replace_source_domains(
-            &pool,
-            id,
-            "blocklist_domains",
-            "0.0.0.0 source-only.example.com\n",
-        )
-        .expect("shrink source without manual domain");
+        let shrink = (0..10)
+            .map(|index| format!("source-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_count, store) = replace_source_domains(&pool, id, "blocklist_domains", &shrink)
+            .expect("shrink source without manual domain");
 
-        // Source-only domain remains; manual domain must remain even though source dropped it.
-        assert!(store.matches("source-only.example.com"));
+        assert!(store.matches("source-0.example.com"));
         assert!(store.matches("manual.example.com"));
         let domains = get_domains(&pool, "blocklist_domains").unwrap_or_default();
         let names: Vec<_> = domains.into_iter().map(|d| d.domain).collect();
@@ -1430,17 +1502,16 @@ mod tests {
     fn source_delete_prunes_owned_domains() {
         let pool = test_pool();
         let id = add_source(&pool, "memory://delete-source", "blocklist", 24).unwrap();
-        replace_source_domains(
-            &pool,
-            id,
-            "blocklist_domains",
-            "0.0.0.0 only-from-source.example.com\n",
-        )
-        .expect("seed source domains");
+        let content = (0..10)
+            .map(|index| format!("source-only-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        replace_source_domains(&pool, id, "blocklist_domains", &content)
+            .expect("seed source domains");
 
         let (list_type, rebuilt) = delete_source_with_cleanup(&pool, id).expect("source deleted");
         assert_eq!(list_type, "blocklist");
-        assert!(!rebuilt.matches("only-from-source.example.com"));
+        assert!(!rebuilt.matches("source-only-0.example.com"));
         assert_eq!(
             count_domains(&pool, "blocklist_domains").unwrap_or_default(),
             0
@@ -1458,5 +1529,71 @@ mod tests {
         assert_eq!(deleted.ipv4.as_deref(), Some("192.0.2.77"));
         assert!(get_rewrite_by_id(&pool, id).is_none());
         assert!(delete_rewrite_by_id(&pool, id).is_none());
+    }
+    #[test]
+    fn suspicious_refresh_preserves_prior_snapshot() {
+        let pool = test_pool();
+        let id = add_source(&pool, "memory://protected", "blocklist", 24).unwrap();
+        let full = (0..20)
+            .map(|index| format!("domain-{index}.example.com"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        replace_source_domains(&pool, id, "blocklist_domains", &full).unwrap();
+
+        let error = replace_source_domains(
+            &pool,
+            id,
+            "blocklist_domains",
+            "<html><body>upstream unavailable</body></html>",
+        )
+        .unwrap_err();
+        assert!(error.contains("suspicious content"));
+
+        let domains = get_domains(&pool, "blocklist_domains").unwrap();
+        assert_eq!(domains.len(), 20);
+        assert!(
+            domains
+                .iter()
+                .any(|row| row.domain == "domain-0.example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_source_rejects_http_error_status() {
+        use std::io::Write;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 11\r\nConnection: close\r\n\r\nexample.com",
+                )
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        let error = fetch_source(&format!("http://{address}/list"))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(!error.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fetch_source_rejects_oversized_file() {
+        let path = std::env::temp_dir().join(format!(
+            "oversized-source-{}-{}.list",
+            std::process::id(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SOURCE_BYTES as u64 + 1).unwrap();
+        drop(file);
+
+        let error = fetch_source(path.to_str().unwrap()).await.unwrap_err();
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("exceeds 67108864 byte limit"));
     }
 }

@@ -618,6 +618,70 @@ fn run_sticky(r: &mut Runner, ctx: &BaselineRun) -> Result<(), String> {
     }
 
     if status == "running" {
+        let error_source = r.curl_body(
+            "POST",
+            "/api/sources",
+            Some(json!({
+                "url": format!("http://127.0.0.1:{}/missing-source-{}", ctx.web_port, ctx.run_tag),
+                "list_type": "blocklist",
+                "update_interval_hours": 24
+            })),
+        )?;
+        let error_body = parse_body_json(&error_source);
+        let error_id = error_body.get("id").and_then(Value::as_u64).unwrap_or(0);
+        let error_status = error_body
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if error_id > 0 {
+            let _ = r.curl_code("DELETE", &format!("/api/sources/{error_id}"), None);
+        }
+
+        let wrote_error = r
+            .remote_root(&format!(
+                "printf '%s\\n' '<html><body>upstream unavailable</body></html>' > {}",
+                shell_quote(&full_path)
+            ))
+            .is_ok();
+        let suspicious = if wrote_error {
+            r.curl_body("POST", &format!("/api/sources/{source_id}/refresh"), None)?
+        } else {
+            CurlResponse {
+                code: 0,
+                body: "failed to write suspicious source content".to_string(),
+            }
+        };
+        let retained_dns = r.dns_query(&removed_domain).unwrap_or_default();
+        if error_source.code == 201
+            && error_status.starts_with("failed: HTTP request failed:")
+            && suspicious.code == 200
+            && suspicious.body.contains("failed: suspicious content:")
+            && has_exact_line(&retained_dns, &ctx.sinkhole_ipv4)
+        {
+            r.ok(
+                "source-refresh-safety",
+                "HTTP error and suspicious body rejected; prior DNS snapshot retained",
+            );
+        } else {
+            status = "unsafe_refresh".to_string();
+            r.fail(
+                "source-refresh-safety",
+                format!(
+                    "HTTP source={} suspicious={} retained_dns={}",
+                    error_source.body,
+                    suspicious.body,
+                    empty_if_blank(&retained_dns)
+                ),
+            );
+        }
+    } else {
+        r.skip(
+            "source-refresh-safety",
+            "skipped because full source import did not complete",
+        );
+    }
+
+    if status == "running" {
         let _ = r.remote_root(&format!(
             "cp -f {} {}",
             shell_quote(&shrink_path),

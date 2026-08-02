@@ -109,13 +109,13 @@ fn schedule_restart(reason: &str, delay: Duration) {
 }
 
 /// Resolve import content from either inline content or a URL.
-async fn resolve_import_content(body: &BulkImport) -> String {
+async fn resolve_import_content(body: &BulkImport) -> Result<String, String> {
     if let Some(url) = &body.url {
         db::fetch_source(url).await
     } else if let Some(content) = &body.content {
-        content.clone()
+        Ok(content.clone())
     } else {
-        String::new()
+        Err("no content or url provided".to_string())
     }
 }
 
@@ -989,11 +989,15 @@ async fn bulk_import_blocklist(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let content = resolve_import_content(&body).await;
-    if content.is_empty() {
-        return HttpResponse::BadRequest()
-            .json(serde_json::json!({"error": "no content or url provided"}));
-    }
+    let content = match resolve_import_content(&body).await {
+        Ok(content) if !content.is_empty() => content,
+        Ok(_) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "empty content"}));
+        }
+        Err(error) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": error}));
+        }
+    };
     let pool_for_import = pool.get_ref().clone();
     let import_result = match db_blocking(move || {
         db::bulk_import_domains_with_entries(&pool_for_import, "blocklist_domains", &content)
@@ -1100,11 +1104,15 @@ async fn bulk_import_allowlist(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let content = resolve_import_content(&body).await;
-    if content.is_empty() {
-        return HttpResponse::BadRequest()
-            .json(serde_json::json!({"error": "no content or url provided"}));
-    }
+    let content = match resolve_import_content(&body).await {
+        Ok(content) if !content.is_empty() => content,
+        Ok(_) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "empty content"}));
+        }
+        Err(error) => {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": error}));
+        }
+    };
     let pool_for_import = pool.get_ref().clone();
     let import_result = match db_blocking(move || {
         db::bulk_import_domains_with_entries(&pool_for_import, "allowlist_domains", &content)
