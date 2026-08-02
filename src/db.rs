@@ -364,12 +364,31 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), DbError>
     Ok(())
 }
 
-pub fn get_password_hash(pool: &DbPool) -> Option<String> {
-    get_setting(pool, "admin_password_hash")
+pub fn update_auth_credentials(
+    pool: &DbPool,
+    current_password_hash: &str,
+    new_password_hash: &str,
+    session_secret: &str,
+) -> Result<bool, DbError> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
+        "UPDATE settings SET value = ?1 WHERE key = 'admin_password_hash' AND value = ?2",
+        params![new_password_hash, current_password_hash],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('session_secret', ?1)",
+        params![session_secret],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
-pub fn set_password_hash(pool: &DbPool, hash: &str) -> Result<(), DbError> {
-    set_setting(pool, "admin_password_hash", hash)
+pub fn get_password_hash(pool: &DbPool) -> Option<String> {
+    get_setting(pool, "admin_password_hash")
 }
 pub fn get_setting(pool: &DbPool, key: &str) -> Option<String> {
     let conn = pool.get().ok()?;
@@ -581,27 +600,26 @@ pub fn search_domains(
 }
 
 pub fn add_domain(pool: &DbPool, table: &str, domain: &str) -> Result<i64, DbError> {
-    let conn = pool.get()?;
+    let mut conn = pool.get()?;
     let normalized = domain.to_lowercase();
     let normalized = normalized.strip_suffix('.').unwrap_or(&normalized);
+    let tx = conn.transaction()?;
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
-    conn.execute(&sql, params![normalized])?;
-    let id: i64 = conn
-        .query_row(
-            &format!("SELECT id FROM {} WHERE domain = ?1", table),
-            params![normalized],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    // do NOT bump last_insert_rowid via a manual_domains insert; resolve via SELECT only.
+    tx.execute(&sql, params![normalized])?;
+    let id: i64 = tx.query_row(
+        &format!("SELECT id FROM {} WHERE domain = ?1", table),
+        params![normalized],
+        |row| row.get(0),
+    )?;
     let list_type = match table {
         "allowlist_domains" => "allowlist",
         _ => "blocklist",
     };
-    let _ = conn.execute(
+    tx.execute(
         "INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)",
         params![list_type, normalized],
-    );
+    )?;
+    tx.commit()?;
     Ok(id)
 }
 
@@ -1595,5 +1613,46 @@ mod tests {
         let error = fetch_source(path.to_str().unwrap()).await.unwrap_err();
         std::fs::remove_file(path).unwrap();
         assert!(error.contains("exceeds 67108864 byte limit"));
+    }
+
+    #[test]
+    fn auth_credentials_roll_back_together() {
+        let pool = test_pool();
+        seed_defaults(&pool).unwrap();
+        set_setting(&pool, "admin_password_hash", "old-hash").unwrap();
+        set_setting(&pool, "session_secret", "old-secret").unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_secret BEFORE INSERT ON settings
+                 WHEN NEW.key = 'session_secret'
+                 BEGIN SELECT RAISE(ABORT, 'reject secret'); END;",
+            )
+            .unwrap();
+
+        assert!(update_auth_credentials(&pool, "old-hash", "new-hash", "new-secret").is_err());
+        assert_eq!(
+            get_setting(&pool, "admin_password_hash").as_deref(),
+            Some("old-hash")
+        );
+        assert_eq!(
+            get_setting(&pool, "session_secret").as_deref(),
+            Some("old-secret")
+        );
+    }
+
+    #[test]
+    fn domain_and_manual_ownership_roll_back_together() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_manual BEFORE INSERT ON manual_domains
+                 BEGIN SELECT RAISE(ABORT, 'reject manual'); END;",
+            )
+            .unwrap();
+
+        assert!(add_domain(&pool, "blocklist_domains", "atomic.example.com").is_err());
+        assert_eq!(count_domains(&pool, "blocklist_domains").unwrap(), 0);
     }
 }

@@ -15,6 +15,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     let resource_base = r.resource_snapshot().ok().map(|snapshot| snapshot.rss_kb);
 
     block_response_modes(r, &cfg);
+    persistence_failure_guards(r, &cfg);
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
@@ -225,6 +226,184 @@ fn block_response_modes(r: &mut Runner, cfg: &SmokeConfig) {
         r.fail(
             "block-response-restore",
             format!("failed to restore block_response_mode (HTTP {restore_code})"),
+        );
+    }
+}
+
+fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
+    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    {
+        r.fail(
+            "persistence-failure-guards",
+            "sqlite3 unavailable; cannot inject deterministic DB failures",
+        );
+        return;
+    }
+
+    let sentinel = format!("{}-persist-sentinel.rustblocker.test", cfg.run_tag);
+    let blocked = r.curl_json(
+        "POST",
+        "/api/blocklist",
+        Some(json!({ "domain": sentinel })),
+    );
+    let blocked_id = blocked.as_ref().ok().and_then(json_id);
+    if blocked_id.is_none() {
+        r.fail(
+            "persistence-failure-guards",
+            format!(
+                "could not create blocked sentinel: {}",
+                format_result_json(&blocked)
+            ),
+        );
+        return;
+    }
+
+    let trigger_sql = "DROP TRIGGER IF EXISTS mock_fail_setting; DROP TRIGGER IF EXISTS mock_fail_blocklist; DROP TRIGGER IF EXISTS mock_fail_allowlist; DROP TRIGGER IF EXISTS mock_fail_rewrite; DROP TRIGGER IF EXISTS mock_fail_upstream; CREATE TRIGGER mock_fail_setting BEFORE INSERT ON settings WHEN NEW.key IN ('block_response_mode', 'session_secret') BEGIN SELECT RAISE(ABORT, 'mock persistence failure'); END; CREATE TRIGGER mock_fail_blocklist BEFORE INSERT ON blocklist_domains BEGIN SELECT RAISE(ABORT, 'mock persistence failure'); END; CREATE TRIGGER mock_fail_allowlist BEFORE INSERT ON allowlist_domains BEGIN SELECT RAISE(ABORT, 'mock persistence failure'); END; CREATE TRIGGER mock_fail_rewrite BEFORE INSERT ON rewrites BEGIN SELECT RAISE(ABORT, 'mock persistence failure'); END; CREATE TRIGGER mock_fail_upstream BEFORE INSERT ON upstreams BEGIN SELECT RAISE(ABORT, 'mock persistence failure'); END;";
+    let drop_sql = "DROP TRIGGER IF EXISTS mock_fail_setting; DROP TRIGGER IF EXISTS mock_fail_blocklist; DROP TRIGGER IF EXISTS mock_fail_allowlist; DROP TRIGGER IF EXISTS mock_fail_rewrite; DROP TRIGGER IF EXISTS mock_fail_upstream;";
+    let sqlite = |sql: &str| {
+        format!(
+            "sqlite3 {} {}",
+            shell_quote(&cfg.remote_db_path),
+            shell_quote(sql)
+        )
+    };
+    if let Err(error) = r.remote_root(&sqlite(trigger_sql)) {
+        r.fail(
+            "persistence-failure-guards",
+            format!("could not install failure triggers: {error}"),
+        );
+        if let Some(id) = blocked_id {
+            let _ = r.curl_code("DELETE", &format!("/api/blocklist/{id}"), None);
+        }
+        return;
+    }
+
+    let settings_before = r
+        .curl_json("GET", "/api/settings", None)
+        .unwrap_or(Value::Null);
+    let blocked_before = r.dns_probe(&sentinel, 1);
+    let setting_code = r
+        .curl_code(
+            "PUT",
+            "/api/settings",
+            Some(json!({ "key": "block_response_mode", "value": "nxdomain" })),
+        )
+        .unwrap_or(0);
+    let settings_after = r
+        .curl_json("GET", "/api/settings", None)
+        .unwrap_or(Value::Null);
+    let blocked_after_setting = r.dns_probe(&sentinel, 1);
+
+    let block_domain = format!("{}-failed-block.rustblocker.test", cfg.run_tag);
+    let block_before = r.dns_probe(&block_domain, 1);
+    let block_code = r
+        .curl_body(
+            "POST",
+            "/api/blocklist",
+            Some(json!({ "domain": block_domain })),
+        )
+        .map(|response| response.code)
+        .unwrap_or(0);
+    let block_after = r.dns_probe(&block_domain, 1);
+
+    let allow_code = r
+        .curl_body(
+            "POST",
+            "/api/allowlist",
+            Some(json!({ "domain": sentinel })),
+        )
+        .map(|response| response.code)
+        .unwrap_or(0);
+    let blocked_after_allow = r.dns_probe(&sentinel, 1);
+
+    let rewrite_domain = format!("{}-failed-rewrite.rustblocker.test", cfg.run_tag);
+    let rewrite_before = r.dns_probe(&rewrite_domain, 1);
+    let rewrite_code = r
+        .curl_body(
+            "POST",
+            "/api/rewrites",
+            Some(json!({ "domain": rewrite_domain, "ipv4": "192.0.2.77", "ipv6": null })),
+        )
+        .map(|response| response.code)
+        .unwrap_or(0);
+    let rewrite_after = r.dns_probe(&rewrite_domain, 1);
+
+    let upstreams_before = r
+        .curl_json("GET", "/api/upstreams", None)
+        .unwrap_or(Value::Null);
+    let upstream_code = r
+        .curl_body(
+            "POST",
+            "/api/upstreams",
+            Some(json!({ "address": "192.0.2.88", "port": 53 })),
+        )
+        .map(|response| response.code)
+        .unwrap_or(0);
+    let upstreams_after = r
+        .curl_json("GET", "/api/upstreams", None)
+        .unwrap_or(Value::Null);
+
+    let password_code = r
+        .curl_body(
+            "PUT",
+            "/api/auth/password",
+            Some(json!({
+                "current_password": cfg.webui_password,
+                "new_password": format!("FailedPersist-{}", cfg.run_tag),
+            })),
+        )
+        .map(|response| response.code)
+        .unwrap_or(0);
+    let auth_after_password = r
+        .curl_json("GET", "/api/auth/check", None)
+        .unwrap_or(Value::Null);
+    let original_login_code = r
+        .curl_code(
+            "POST",
+            "/api/auth/login",
+            Some(json!({ "password": cfg.webui_password })),
+        )
+        .unwrap_or(0);
+
+    let cleanup = r.remote_root(&sqlite(drop_sql));
+    if let Some(id) = blocked_id {
+        let _ = r.curl_code("DELETE", &format!("/api/blocklist/{id}"), None);
+    }
+
+    let same_probe = |left: &Result<crate::core::DnsProbe, String>,
+                      right: &Result<crate::core::DnsProbe, String>| {
+        matches!((left, right), (Ok(left), Ok(right)) if left.rcode == right.rcode && left.answers == right.answers && left.ede == right.ede)
+    };
+    let passed = setting_code == 500
+        && settings_before.get("block_response_mode") == settings_after.get("block_response_mode")
+        && same_probe(&blocked_before, &blocked_after_setting)
+        && block_code == 500
+        && same_probe(&block_before, &block_after)
+        && allow_code == 500
+        && same_probe(&blocked_before, &blocked_after_allow)
+        && rewrite_code == 500
+        && same_probe(&rewrite_before, &rewrite_after)
+        && upstream_code == 500
+        && upstreams_before == upstreams_after
+        && password_code == 500
+        && auth_after_password
+            .get("authenticated")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && original_login_code == 200
+        && cleanup.is_ok();
+    if passed {
+        r.ok(
+            "persistence-failure-guards",
+            "forced setting/domain/rewrite/upstream/password DB failures returned HTTP 500 and preserved live state",
+        );
+    } else {
+        r.fail(
+            "persistence-failure-guards",
+            format!(
+                "persistence guard failed setting={setting_code} block={block_code} allow={allow_code} rewrite={rewrite_code} upstream={upstream_code} password={password_code} auth={auth_after_password} login={original_login_code} setting_dns={blocked_before:?}/{blocked_after_setting:?} allow_dns={blocked_after_allow:?} block_dns={block_before:?}/{block_after:?} rewrite_dns={rewrite_before:?}/{rewrite_after:?} cleanup={cleanup:?}"
+            ),
         );
     }
 }

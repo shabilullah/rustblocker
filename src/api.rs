@@ -138,6 +138,13 @@ where
         })
 }
 
+async fn persist_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), HttpResponse> {
+    let pool = pool.clone();
+    let key = key.to_string();
+    let value = value.to_string();
+    db_blocking(move || db::set_setting(&pool, &key, &value)).await
+}
+
 /// Insert a domain into the correct set (exact or wildcard) of a DomainStore.
 fn insert_domain(store: &mut DomainStore, domain: &str) {
     store.insert(domain);
@@ -640,187 +647,124 @@ async fn update_setting(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    // Forwarding strategy changes apply immediately to new forwarded queries.
-    if body.key == "forward_strategy" {
+
+    let strategy = if body.key == "forward_strategy" {
         match body.value.parse::<ForwardStrategy>() {
-            Ok(strategy) => {
-                if let Err(e) = db::set_setting(&pool, &body.key, strategy.as_str()) {
-                    tracing::warn!("db set_setting failed: {e}");
-                }
-                forwarder.write().set_strategy(strategy);
-                activity_log.info(
-                    "settings",
-                    "Save Settings",
-                    &format!("Setting saved: {} = {}", body.key, strategy.as_str()),
-                );
-                tracing::info!("Forward strategy reloaded: {}", strategy.as_str());
-                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
-            }
+            Ok(value) => Some(value),
             Err(_) => {
-                activity_log.warning(
-                    "settings",
-                    "Save Settings",
-                    &format!("Invalid forward strategy: {}", body.value),
-                );
                 return HttpResponse::BadRequest()
                     .json(serde_json::json!({"error": "invalid forward_strategy"}));
             }
         }
-    }
-    if body.key == "block_response_mode" {
+    } else {
+        None
+    };
+    let response_mode = if body.key == "block_response_mode" {
         match body.value.parse::<BlockResponseMode>() {
-            Ok(mode) => {
-                if let Err(e) = db::set_setting(&pool, &body.key, mode.as_str()) {
-                    tracing::warn!("db set_setting failed: {e}");
-                }
-                *block_response_mode.write() = mode;
-                activity_log.info(
-                    "settings",
-                    "Save Settings",
-                    &format!("Setting saved: {} = {}", body.key, mode),
-                );
-                tracing::info!("Blocked DNS response mode reloaded: {}", mode);
-                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
-            }
+            Ok(value) => Some(value),
             Err(_) => {
-                activity_log.warning(
-                    "settings",
-                    "Save Settings",
-                    &format!("Invalid blocked DNS response mode: {}", body.value),
-                );
                 return HttpResponse::BadRequest()
                     .json(serde_json::json!({"error": "invalid block_response_mode"}));
             }
         }
-    }
-
-    if body.key == "adaptive_hedge_delay_ms" {
+    } else {
+        None
+    };
+    let hedge_delay = if body.key == "adaptive_hedge_delay_ms" {
         match body.value.parse::<u64>() {
-            Ok(ms) => {
-                if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
-                    tracing::warn!("db set_setting failed: {e}");
-                }
-                forwarder.write().set_hedge_delay_ms(ms);
-                activity_log.info(
-                    "settings",
-                    "Save Settings",
-                    &format!("Setting saved: {} = {}", body.key, ms),
-                );
-                tracing::info!("Adaptive hedge delay reloaded: {}ms", ms);
-                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
-            }
+            Ok(value) => Some(value),
             Err(_) => {
-                activity_log.warning(
-                    "settings",
-                    "Save Settings",
-                    &format!("Invalid adaptive hedge delay: {}", body.value),
-                );
                 return HttpResponse::BadRequest()
                     .json(serde_json::json!({"error": "invalid adaptive_hedge_delay_ms"}));
             }
         }
-    }
-
-    // Listening socket settings can only take effect after a restart.
-    if body.key == "listen_address" || body.key == "listen_port" {
-        let valid = match body.key.as_str() {
-            "listen_address" => body.value.parse::<std::net::IpAddr>().is_ok(),
-            "listen_port" => body.value.parse::<u16>().is_ok(),
-            _ => false,
-        };
-        if !valid {
-            activity_log.warning(
-                "settings",
-                "Save Settings",
-                &format!("Invalid {}: {}", body.key, body.value),
-            );
-            return HttpResponse::BadRequest().json(serde_json::json!({
-                "error": format!("invalid {}: {}", body.key, body.value)
-            }));
-        }
-        if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
-            tracing::warn!("db set_setting failed: {e}");
-        }
-        let reason = format!("{} changed to {}", body.key, body.value);
-        activity_log.info(
-            "settings",
-            "Save Settings",
-            &format!("Setting saved: {} = {}", body.key, body.value),
-        );
-        schedule_restart(&reason, Duration::from_secs(1));
-        return HttpResponse::Ok().json(serde_json::json!({
-            "ok": true,
-            "restart_pending": true,
-        }));
-    }
-
+    } else {
+        None
+    };
     let parsed_acl = if body.key == "allowed_networks" {
         match crate::acl::Acl::parse(&body.value) {
-            Ok(parsed) => Some(parsed),
+            Ok(value) => Some(value),
             Err(error) => {
-                activity_log.warning(
-                    "settings",
-                    "Save Settings",
-                    &format!("Invalid allowed_networks: {error}"),
-                );
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": error.to_string()
-                }));
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": error.to_string()}));
             }
         }
     } else {
         None
     };
 
-    if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
-        tracing::warn!("db set_setting failed: {e}");
+    let restart_pending = body.key == "listen_address" || body.key == "listen_port";
+    if restart_pending {
+        let valid = match body.key.as_str() {
+            "listen_address" => body.value.parse::<std::net::IpAddr>().is_ok(),
+            "listen_port" => body.value.parse::<u16>().is_ok(),
+            _ => false,
+        };
+        if !valid {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": format!("invalid {}: {}", body.key, body.value)
+            }));
+        }
     }
+
+    let persisted_value = strategy
+        .as_ref()
+        .map(|value| value.as_str())
+        .or_else(|| response_mode.as_ref().map(|value| value.as_str()))
+        .unwrap_or(&body.value);
+    if let Err(response) = persist_setting(&pool, &body.key, persisted_value).await {
+        return response;
+    }
+
+    if let Some(strategy) = strategy {
+        forwarder.write().set_strategy(strategy);
+    } else if let Some(mode) = response_mode {
+        *block_response_mode.write() = mode;
+    } else if let Some(ms) = hedge_delay {
+        forwarder.write().set_hedge_delay_ms(ms);
+    } else {
+        match body.key.as_str() {
+            "sinkhole_ipv4" => {
+                if let Ok(ip) = body.value.parse::<Ipv4Addr>() {
+                    *sinkhole_ipv4.write() = ip;
+                }
+            }
+            "sinkhole_ipv6" => {
+                if let Ok(ip) = body.value.parse::<Ipv6Addr>() {
+                    *sinkhole_ipv6.write() = ip;
+                }
+            }
+            "upstream_timeout_secs" => {
+                if let Ok(secs) = body.value.parse::<u64>() {
+                    forwarder.write().set_timeout(secs);
+                }
+            }
+            "stats_retention_days" => {
+                if let Ok(days) = body.value.parse::<u64>() {
+                    query_log.set_retention(days);
+                }
+            }
+            "allowed_networks" => {
+                *acl.write() = parsed_acl.expect("allowed_networks parsed before persistence");
+            }
+            _ => {}
+        }
+    }
+
     activity_log.info(
         "settings",
         "Save Settings",
-        &format!("Setting saved: {} = {}", body.key, body.value),
+        &format!("Setting saved: {} = {}", body.key, persisted_value),
     );
-    // Hot-reload the setting in memory
-    match body.key.as_str() {
-        "sinkhole_ipv4" => {
-            if let Ok(ip) = body.value.parse::<Ipv4Addr>() {
-                *sinkhole_ipv4.write() = ip;
-                tracing::info!("Sinkhole IPv4 reloaded: {}", ip);
-            } else {
-                tracing::warn!("Invalid sinkhole IPv4: {}", body.value);
-            }
-        }
-        "sinkhole_ipv6" => {
-            if let Ok(ip) = body.value.parse::<Ipv6Addr>() {
-                *sinkhole_ipv6.write() = ip;
-                tracing::info!("Sinkhole IPv6 reloaded: {}", ip);
-            } else {
-                tracing::warn!("Invalid sinkhole IPv6: {}", body.value);
-            }
-        }
-        "upstream_timeout_secs" => {
-            if let Ok(secs) = body.value.parse::<u64>() {
-                forwarder.write().set_timeout(secs);
-                tracing::info!("Upstream timeout reloaded: {}s", secs);
-            } else {
-                tracing::warn!("Invalid upstream timeout: {}", body.value);
-            }
-        }
-        "stats_retention_days" => {
-            if let Ok(days) = body.value.parse::<u64>() {
-                query_log.set_retention(days);
-                tracing::info!("Stats retention reloaded: {} days", days);
-            } else {
-                tracing::warn!("Invalid retention days: {}", body.value);
-            }
-        }
-        "allowed_networks" => {
-            *acl.write() = parsed_acl.expect("allowed_networks parsed before persistence");
-            tracing::info!("ACL reloaded: {}", body.value);
-        }
-        _ => {}
+    if restart_pending {
+        schedule_restart(
+            &format!("{} changed to {}", body.key, body.value),
+            Duration::from_secs(1),
+        );
+        HttpResponse::Ok().json(serde_json::json!({"ok": true, "restart_pending": true}))
+    } else {
+        HttpResponse::Ok().json(serde_json::json!({"ok": true}))
     }
-    HttpResponse::Ok().json(serde_json::json!({"ok": true}))
 }
 
 // --- Upstreams ---
@@ -846,11 +790,14 @@ async fn add_upstream(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_upstream(&pool, &body.address, body.port.unwrap_or(53)).unwrap_or_else(|e| {
-        tracing::warn!("add_upstream failed: {e}");
-        0
-    });
-    reload_forwarder(&pool, &forwarder);
+    let pool_for_add = pool.get_ref().clone();
+    let address = body.address.clone();
+    let port = body.port.unwrap_or(53);
+    let id = match db_blocking(move || db::add_upstream(&pool_for_add, &address, port)).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    reload_forwarder(pool.get_ref(), &forwarder);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
@@ -942,10 +889,12 @@ async fn add_blocklist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_domain(&pool, "blocklist_domains", &body.domain).unwrap_or_else(|e| {
-        tracing::warn!("add_domain failed: {e}");
-        0
-    });
+    let pool = pool.get_ref().clone();
+    let domain = body.domain.clone();
+    let id = match db_blocking(move || db::add_domain(&pool, "blocklist_domains", &domain)).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     insert_domain(&mut blocklist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
@@ -1057,10 +1006,12 @@ async fn add_allowlist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_domain(&pool, "allowlist_domains", &body.domain).unwrap_or_else(|e| {
-        tracing::warn!("add_domain failed: {e}");
-        0
-    });
+    let pool = pool.get_ref().clone();
+    let domain = body.domain.clone();
+    let id = match db_blocking(move || db::add_domain(&pool, "allowlist_domains", &domain)).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
     insert_domain(&mut allowlist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
@@ -1154,22 +1105,23 @@ async fn add_rewrite(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
-    let id = db::add_rewrite(
-        &pool,
-        &body.domain,
-        body.ipv4.as_deref(),
-        body.ipv6.as_deref(),
-    )
-    .unwrap_or_else(|e| {
-        tracing::warn!("add_rewrite failed: {e}");
-        0
-    });
-    let rule = crate::config::RewriteRule {
+    let pool = pool.get_ref().clone();
+    let domain = body.domain.clone();
+    let ipv4 = body.ipv4.clone();
+    let ipv6 = body.ipv6.clone();
+    let id = match db_blocking(move || {
+        db::add_rewrite(&pool, &domain, ipv4.as_deref(), ipv6.as_deref())
+    })
+    .await
+    {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    rewrites.write().insert(crate::config::RewriteRule {
         domain: body.domain.clone(),
         ipv4: body.ipv4.clone(),
         ipv6: body.ipv6.clone(),
-    };
-    rewrites.write().insert(rule);
+    });
     HttpResponse::Created().json(serde_json::json!({"id": id}))
 }
 
@@ -1541,10 +1493,16 @@ async fn login(
         }
     };
     let pool = pool.get_ref().clone();
+    let auth_for_login = Arc::clone(&auth);
     let password = body.password.clone();
     let verified = match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        db::get_password_hash(&pool).map(|hash| AuthState::verify_password(&password, &hash))
+        auth_for_login.with_credential_lock(|| {
+            db::get_password_hash(&pool).map(|hash| {
+                AuthState::verify_password(&password, &hash)
+                    .then(|| auth_for_login.create_session(SESSION_MAX_AGE_SECS))
+            })
+        })
     })
     .await
     {
@@ -1555,9 +1513,12 @@ async fn login(
                 .json(serde_json::json!({"error": "failed to process login"}));
         }
     };
-    match verified {
-        Some(true) => throttle.record_success(client_ip),
-        Some(false) => {
+    let session = match verified {
+        Some(Some(session)) => {
+            throttle.record_success(client_ip);
+            session
+        }
+        Some(None) => {
             throttle.record_failure(client_ip);
             return HttpResponse::Unauthorized()
                 .json(serde_json::json!({"error": "invalid password"}));
@@ -1566,8 +1527,7 @@ async fn login(
             return HttpResponse::Unauthorized()
                 .json(serde_json::json!({"error": "no admin password configured"}));
         }
-    }
-    let session = auth.create_session(SESSION_MAX_AGE_SECS);
+    };
     HttpResponse::Ok()
         .cookie(auth_cookie(
             session,
@@ -1601,37 +1561,79 @@ async fn change_password(
     req: HttpRequest,
     body: web::Json<ChangePasswordPayload>,
 ) -> impl Responder {
-    let hash = match db::get_password_hash(&pool) {
-        Some(h) => h,
-        None => {
-            return HttpResponse::Unauthorized()
-                .json(serde_json::json!({"error": "no admin password configured"}));
-        }
-    };
-    if !AuthState::verify_password(&body.current_password, &hash) {
-        return HttpResponse::Unauthorized()
-            .json(serde_json::json!({"error": "current password is incorrect"}));
-    }
     if body.new_password.len() < 6 {
         return HttpResponse::BadRequest()
             .json(serde_json::json!({"error": "new password must be at least 6 characters"}));
     }
-    let new_hash = match AuthState::hash_password(&body.new_password) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!("failed to hash new password: {e}");
+
+    enum PasswordChange {
+        Changed(String),
+        Missing,
+        Incorrect,
+        Conflict,
+        Failed(String),
+    }
+
+    let pool = pool.get_ref().clone();
+    let current_password = body.current_password.clone();
+    let new_password = body.new_password.clone();
+    let auth_for_change = Arc::clone(&auth);
+    let change = tokio::task::spawn_blocking(move || {
+        auth_for_change.with_credential_lock(|| {
+            let Some(current_hash) = db::get_password_hash(&pool) else {
+                return PasswordChange::Missing;
+            };
+            if !AuthState::verify_password(&current_password, &current_hash) {
+                return PasswordChange::Incorrect;
+            }
+            let new_hash = match AuthState::hash_password(&new_password) {
+                Ok(hash) => hash,
+                Err(error) => return PasswordChange::Failed(error.to_string()),
+            };
+            let new_secret = AuthState::generate_secret();
+            match db::update_auth_credentials(
+                &pool,
+                &current_hash,
+                &new_hash,
+                &encode_secret(&new_secret),
+            ) {
+                Ok(true) => {
+                    auth_for_change.replace_secret(new_secret);
+                    PasswordChange::Changed(auth_for_change.create_session(SESSION_MAX_AGE_SECS))
+                }
+                Ok(false) => PasswordChange::Conflict,
+                Err(error) => PasswordChange::Failed(error.to_string()),
+            }
+        })
+    })
+    .await;
+
+    let session = match change {
+        Ok(PasswordChange::Changed(session)) => session,
+        Ok(PasswordChange::Missing) => {
+            return HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "no admin password configured"}));
+        }
+        Ok(PasswordChange::Incorrect) => {
+            return HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "current password is incorrect"}));
+        }
+        Ok(PasswordChange::Conflict) => {
+            return HttpResponse::Conflict()
+                .json(serde_json::json!({"error": "password changed concurrently"}));
+        }
+        Ok(PasswordChange::Failed(error)) => {
+            tracing::error!("failed to persist password change: {error}");
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({"error": "failed to process password"}));
+        }
+        Err(error) => {
+            tracing::error!("password change task failed: {error}");
             return HttpResponse::InternalServerError()
                 .json(serde_json::json!({"error": "failed to process password"}));
         }
     };
-    let _ = db::set_password_hash(&pool, &new_hash);
-    // Rotate the session signing secret so existing sessions are invalidated.
-    // Issue a new session cookie for the current user so they stay logged in.
-    let new_secret = auth.rotate_secret();
-    if let Err(e) = db::set_setting(&pool, "session_secret", &encode_secret(&new_secret)) {
-        tracing::warn!("db set_setting failed: {e}");
-    }
-    let session = auth.create_session(SESSION_MAX_AGE_SECS);
+
     HttpResponse::Ok()
         .cookie(auth_cookie(
             session,

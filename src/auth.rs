@@ -118,6 +118,7 @@ impl Default for LoginThrottle {
 /// Authentication state shared across worker threads.
 pub struct AuthState {
     session_secret: Arc<RwLock<Vec<u8>>>,
+    credential_lock: Arc<Mutex<()>>,
 }
 
 impl AuthState {
@@ -132,19 +133,19 @@ impl AuthState {
     pub fn from_secret(session_secret: Vec<u8>) -> Self {
         Self {
             session_secret: Arc::new(RwLock::new(session_secret)),
+            credential_lock: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Generate a new session signing key and update the in-memory secret.
-    ///
-    /// The caller is responsible for persisting the returned secret to
-    /// persistent storage (e.g. the `session_secret` database setting).
-    pub fn rotate_secret(&self) -> Vec<u8> {
-        let new_secret = Self::generate_secret();
-        *self.session_secret.write() = new_secret.clone();
-        new_secret
+    /// Replace the signing key after its persistent copy commits.
+    pub fn replace_secret(&self, new_secret: Vec<u8>) {
+        *self.session_secret.write() = new_secret;
     }
 
+    pub(crate) fn with_credential_lock<T>(&self, operation: impl FnOnce() -> T) -> T {
+        let _guard = self.credential_lock.lock();
+        operation()
+    }
     /// Create a new auth state with a randomly generated session signing key.
     pub fn new() -> Self {
         Self::from_secret(Self::generate_secret())
@@ -391,7 +392,7 @@ mod tests {
         assert!(auth.validate_session(&session));
 
         // After rotating the signing secret, the old cookie must no longer validate.
-        auth.rotate_secret();
+        auth.replace_secret(AuthState::generate_secret());
         assert!(!auth.validate_session(&session));
 
         // A freshly issued session should validate against the new secret.
