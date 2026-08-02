@@ -45,6 +45,9 @@ pub struct DnsProbe {
     pub authorities: u16,
     pub additionals: u16,
     pub has_soa: bool,
+    pub authority_soa_owner_root: bool,
+    pub authority_soa_ttl: Option<u32>,
+    pub authority_soa_minimum: Option<u32>,
     pub has_rrsig: bool,
     pub has_opt: bool,
     pub ede: Option<u16>,
@@ -1598,14 +1601,24 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
 
     let mut ede = None;
     let mut has_soa = false;
+    let mut authority_soa_owner_root = false;
+    let mut authority_soa_ttl = None;
+    let mut authority_soa_minimum = None;
     let mut has_rrsig = false;
     let mut has_opt = false;
     for index in 0..(ancount as usize + nscount as usize + arcount as usize) {
+        let owner_is_root = buf.get(offset) == Some(&0);
         skip_dns_name(buf, &mut offset)?;
         if offset + 10 > buf.len() {
             return Err("truncated dns record".to_string());
         }
         let rr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let ttl = u32::from_be_bytes([
+            buf[offset + 4],
+            buf[offset + 5],
+            buf[offset + 6],
+            buf[offset + 7],
+        ]);
         let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         let end = offset
@@ -1613,6 +1626,23 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
             .filter(|value| *value <= buf.len())
             .ok_or_else(|| "truncated dns rdata".to_string())?;
         has_soa |= rr_type == 6;
+        let in_authority = index >= ancount as usize && index < ancount as usize + nscount as usize;
+        if in_authority && rr_type == 6 {
+            let mut soa_offset = offset;
+            skip_dns_name(buf, &mut soa_offset)?;
+            skip_dns_name(buf, &mut soa_offset)?;
+            if soa_offset + 20 != end {
+                return Err("invalid SOA rdata".to_string());
+            }
+            authority_soa_owner_root = owner_is_root;
+            authority_soa_ttl = Some(ttl);
+            authority_soa_minimum = Some(u32::from_be_bytes([
+                buf[soa_offset + 16],
+                buf[soa_offset + 17],
+                buf[soa_offset + 18],
+                buf[soa_offset + 19],
+            ]));
+        }
         has_rrsig |= rr_type == 46;
         if index >= ancount as usize + nscount as usize && rr_type == 41 {
             has_opt = true;
@@ -1644,6 +1674,9 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
         authorities: nscount,
         additionals: arcount,
         has_soa,
+        authority_soa_owner_root,
+        authority_soa_ttl,
+        authority_soa_minimum,
         has_rrsig,
         has_opt,
         ede,

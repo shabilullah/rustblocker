@@ -8,11 +8,11 @@
 
 mod common;
 
-use common::{MockResponseHandler, make_handler, make_request};
+use common::{MockResponseHandler, make_handler, make_request, make_request_with_class};
 use hickory_net::runtime::TokioTime;
 use hickory_proto::op::ResponseCode;
-use hickory_proto::rr::RecordType;
 use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
+use hickory_proto::rr::{DNSClass, Name, RData, RecordType};
 use hickory_server::server::RequestHandler;
 
 /// Drive the handler: send a query, return (response_code, answer_count,
@@ -55,9 +55,10 @@ async fn overload_returns_servfail_and_increments_rejected() {
 #[tokio::test]
 async fn blocklist_exact_match_returns_nxdomain() {
     let (handler, _) = make_handler(&["ads.example.com"], &[], &[]);
-    let (rcode, answers, _) = query(&handler, "ads.example.com", RecordType::A).await;
+    let (rcode, answers, authorities) = query(&handler, "ads.example.com", RecordType::A).await;
     assert_eq!(rcode, ResponseCode::NXDomain, "blocked => NXDOMAIN");
     assert_eq!(answers, 0, "NXDOMAIN has no answer records");
+    assert_eq!(authorities, 1, "NXDOMAIN includes negative-cache SOA");
 }
 
 #[tokio::test]
@@ -70,6 +71,21 @@ async fn blocklist_response_includes_blocked_ede() {
         .await;
     let message = mock.message();
     assert_eq!(message.metadata.response_code, ResponseCode::NXDomain);
+    assert!(!message.metadata.authoritative);
+    let soa = message
+        .all_sections()
+        .find(|record| record.record_type() == RecordType::SOA)
+        .expect("blocked NXDOMAIN must include SOA");
+    assert_eq!(soa.ttl, 60);
+    let RData::SOA(soa) = &soa.data else {
+        unreachable!("SOA record has SOA data")
+    };
+    assert_eq!(soa.mname, Name::from_ascii("localhost.").unwrap());
+    assert_eq!(
+        soa.rname,
+        Name::from_ascii("hostmaster.localhost.").unwrap()
+    );
+    assert_eq!(soa.minimum, 60);
     assert_eq!(
         message
             .edns
@@ -77,6 +93,22 @@ async fn blocklist_response_includes_blocked_ede() {
             .and_then(|edns| edns.options().get(EdnsCode::Unknown(15))),
         Some(&EdnsOption::Unknown(15, 15_u16.to_be_bytes().to_vec()))
     );
+}
+
+#[tokio::test]
+async fn blocklist_soa_matches_query_class() {
+    let (handler, _) = make_handler(&["ads.example.com"], &[], &[]);
+    let req = make_request_with_class("ads.example.com", RecordType::A, DNSClass::CH);
+    let mock = MockResponseHandler::new();
+    let _ = handler
+        .handle_request::<_, TokioTime>(&req, mock.clone())
+        .await;
+    let message = mock.message();
+    let soa = message
+        .all_sections()
+        .find(|record| record.record_type() == RecordType::SOA)
+        .expect("blocked NXDOMAIN must include SOA");
+    assert_eq!(soa.dns_class, DNSClass::CH);
 }
 
 #[tokio::test]

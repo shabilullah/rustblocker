@@ -4,12 +4,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hickory_proto::op::{Edns, Header, HeaderCounts, Metadata, ResponseCode};
 use hickory_proto::rr::rdata::opt::EdnsOption;
-use hickory_proto::rr::rdata::{A, AAAA};
-use hickory_proto::rr::{RData, Record, RecordType};
+use hickory_proto::rr::rdata::{A, AAAA, SOA};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use parking_lot::RwLock;
@@ -29,6 +30,23 @@ const BLOCKED_RESPONSE_TTL_SECS: u32 = 60;
 const EDE_OPTION_CODE: u16 = 15;
 const EDE_FORGED_ANSWER: u16 = 4;
 const EDE_BLOCKED: u16 = 15;
+// Root is the only owner enclosing every blocked QNAME. Keep AA clear: this is
+// locally synthesized recursive policy data, not authority for the DNS root.
+static BLOCKED_NXDOMAIN_SOA: LazyLock<Record> = LazyLock::new(|| {
+    Record::from_rdata(
+        Name::root(),
+        BLOCKED_RESPONSE_TTL_SECS,
+        RData::SOA(SOA::new(
+            Name::from_ascii("localhost.").expect("valid blocked SOA MNAME"),
+            Name::from_ascii("hostmaster.localhost.").expect("valid blocked SOA RNAME"),
+            1,
+            BLOCKED_RESPONSE_TTL_SECS as i32,
+            BLOCKED_RESPONSE_TTL_SECS as i32,
+            BLOCKED_RESPONSE_TTL_SECS as i32,
+            BLOCKED_RESPONSE_TTL_SECS,
+        )),
+    )
+});
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum BlockResponseMode {
@@ -349,6 +367,7 @@ impl RequestHandler for DnsBlockerHandler {
             let raw_name = query.name().to_string();
             let domain = normalize_domain(&raw_name);
             let query_type = query.query_type();
+            let query_class = query.query_class();
             let query_name = hickory_proto::rr::Name::from(query.name());
 
             debug!("Query from {}: {} ({})", src_ip, domain, query_type);
@@ -444,7 +463,28 @@ impl RequestHandler for DnsBlockerHandler {
                     }
                     BlockResponse::NxDomain => {
                         metadata.response_code = ResponseCode::NXDomain;
-                        rh.send_response(builder.build_no_records(metadata)).await
+                        metadata.authoritative = false;
+                        if query_class == DNSClass::IN {
+                            let response = builder.build(
+                                metadata,
+                                [].iter(),
+                                [].iter(),
+                                std::iter::once(&*BLOCKED_NXDOMAIN_SOA),
+                                [].iter(),
+                            );
+                            rh.send_response(response).await
+                        } else {
+                            let mut soa = BLOCKED_NXDOMAIN_SOA.clone();
+                            soa.dns_class = query_class;
+                            let response = builder.build(
+                                metadata,
+                                [].iter(),
+                                [].iter(),
+                                std::iter::once(&soa),
+                                [].iter(),
+                            );
+                            rh.send_response(response).await
+                        }
                     }
                     BlockResponse::Refused => {
                         metadata.response_code = ResponseCode::Refused;

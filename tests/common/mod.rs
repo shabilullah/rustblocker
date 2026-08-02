@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hickory_net::NetError;
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
-use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RecordType};
 use hickory_proto::serialize::binary::BinEncoder;
 use hickory_server::net::xfer::Protocol;
 use hickory_server::server::{Request, ResponseHandler, ResponseInfo};
@@ -118,12 +118,19 @@ impl ResponseHandler for MockResponseHandler {
 
 /// Build a DNS `Request` for the given domain and record type (A by default).
 pub fn make_request(name: &str, query_type: RecordType) -> Request {
+    make_request_with_class(name, query_type, DNSClass::IN)
+}
+
+pub fn make_request_with_class(
+    name: &str,
+    query_type: RecordType,
+    query_class: DNSClass,
+) -> Request {
     let mut msg = Message::new(0x1234, MessageType::Query, OpCode::Query);
     msg.metadata.recursion_desired = true;
-    msg.add_query(Query::query(
-        Name::from_ascii(format!("{}.", name)).unwrap(),
-        query_type,
-    ));
+    let mut query = Query::query(Name::from_ascii(format!("{}.", name)).unwrap(), query_type);
+    query.set_query_class(query_class);
+    msg.add_query(query);
     msg.set_edns(hickory_proto::op::Edns::new());
     let bytes = msg.to_vec().expect("encode failed");
     Request::from_bytes(

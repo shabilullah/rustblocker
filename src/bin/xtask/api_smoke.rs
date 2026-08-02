@@ -158,22 +158,36 @@ fn block_response_modes(r: &mut Runner, cfg: &SmokeConfig) {
     let nxdomain_a = target_dns_probe(&cfg.ssh_host, &domain, 1);
     let nxdomain_https = target_dns_probe(&cfg.ssh_host, &domain, 65);
     let nxdomain_ok = nxdomain_code == 200
-        && nxdomain_a
-            .as_ref()
-            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0 && probe.ede == Some(15))
-        && nxdomain_https
-            .as_ref()
-            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0 && probe.ede == Some(15));
+        && nxdomain_a.as_ref().is_ok_and(|probe| {
+            probe.rcode == 3
+                && probe.answers == 0
+                && probe.authorities == 1
+                && probe.has_soa
+                && probe.authority_soa_owner_root
+                && probe.authority_soa_ttl == Some(60)
+                && probe.authority_soa_minimum == Some(60)
+                && probe.ede == Some(15)
+        })
+        && nxdomain_https.as_ref().is_ok_and(|probe| {
+            probe.rcode == 3
+                && probe.answers == 0
+                && probe.authorities == 1
+                && probe.has_soa
+                && probe.authority_soa_owner_root
+                && probe.authority_soa_ttl == Some(60)
+                && probe.authority_soa_minimum == Some(60)
+                && probe.ede == Some(15)
+        });
     if nxdomain_ok {
         r.ok(
             "block-response-nxdomain",
-            "A and HTTPS queries returned NXDOMAIN with EDE 15 (Blocked)",
+            "A and HTTPS queries returned NXDOMAIN with root SOA TTL/MINIMUM 60 and EDE 15 (Blocked)",
         );
     } else {
         r.fail(
             "block-response-nxdomain",
             format!(
-                "expected HTTP 200 and A/HTTPS NXDOMAIN answers=0 EDE=15; HTTP={nxdomain_code} A={nxdomain_a:?} HTTPS={nxdomain_https:?}"
+                "expected HTTP 200 and A/HTTPS NXDOMAIN answers=0 root authority SOA TTL/MINIMUM=60 EDE=15; HTTP={nxdomain_code} A={nxdomain_a:?} HTTPS={nxdomain_https:?}"
             ),
         );
     }
