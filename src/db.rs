@@ -342,8 +342,7 @@ pub fn get_settings(pool: &DbPool) -> Result<serde_json::Value, DbError> {
     let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
     let rows: Vec<(String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let mut map = serde_json::Map::new();
     for (key, value) in rows {
@@ -550,8 +549,7 @@ pub fn get_domains(pool: &DbPool, table: &str) -> Result<Vec<DbDomain>, DbError>
                 domain: row.get(1)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<_, _>>()?;
     Ok(v)
 }
 
@@ -705,8 +703,7 @@ pub fn get_rewrites(pool: &DbPool) -> Result<Vec<DbRewrite>, DbError> {
                 ipv6: row.get(3)?,
             })
         })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<Result<_, _>>()?;
     Ok(v)
 }
 
@@ -1696,5 +1693,38 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn policy_readers_reject_malformed_rows() {
+        let domains = test_pool();
+        domains
+            .get()
+            .unwrap()
+            .execute("INSERT INTO blocklist_domains (domain) VALUES (X'80')", [])
+            .unwrap();
+        assert!(get_domains(&domains, "blocklist_domains").is_err());
+
+        let rewrites = test_pool();
+        rewrites
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO rewrites (domain, ipv4) VALUES ('broken.example', X'80')",
+                [],
+            )
+            .unwrap();
+        assert!(get_rewrites(&rewrites).is_err());
+
+        let settings = test_pool();
+        settings
+            .get()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings (key, value) VALUES ('allowed_networks', X'80')",
+                [],
+            )
+            .unwrap();
+        assert!(get_settings(&settings).is_err());
     }
 }

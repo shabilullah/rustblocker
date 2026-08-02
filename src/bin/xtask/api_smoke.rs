@@ -19,6 +19,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     block_response_modes(r, &cfg);
     persistence_failure_guards(r, &cfg);
     bulk_import_failure_rollback(r, &cfg);
+    startup_policy_read_failure(r, &cfg);
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
@@ -500,6 +501,81 @@ fn bulk_import_failure_rollback(r: &mut Runner, cfg: &SmokeConfig) {
     }
 }
 
+fn startup_policy_read_failure(r: &mut Runner, cfg: &SmokeConfig) {
+    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    {
+        r.fail(
+            "startup-policy-read-failure",
+            "sqlite3 unavailable; cannot inject malformed policy row",
+        );
+        return;
+    }
+
+    let db = format!("/tmp/rustblocker-startup-policy-{}.db", cfg.run_tag);
+    let log = format!("/tmp/rustblocker-startup-policy-{}.log", cfg.run_tag);
+    let exit_file = format!("/tmp/rustblocker-startup-policy-{}.exit", cfg.run_tag);
+    let bin = format!(
+        "{}/{}",
+        r.env_or("REMOTE_INSTALL_DIR", "/usr/local/lib/rustblocker"),
+        r.env_or("BINARY_NAME", "rustblocker")
+    );
+    let setup = format!(
+        "rm -f {db} {db}-wal {db}-shm {log} {exit_file}; sqlite3 {source} {backup}; sqlite3 {db} {corrupt}; nohup sh -c {run} >{log} 2>&1 &",
+        db = shell_quote(&db),
+        log = shell_quote(&log),
+        exit_file = shell_quote(&exit_file),
+        source = shell_quote(&cfg.remote_db_path),
+        backup = shell_quote(&format!(".backup {db}")),
+        corrupt = shell_quote("INSERT INTO blocklist_domains (domain) VALUES (X'80');"),
+        run = shell_quote(&format!(
+            "{} --db-path {} --dns-port 55554 --web-port 55555 --force-http; printf '%s' $? > {}",
+            shell_quote(&bin),
+            shell_quote(&db),
+            shell_quote(&exit_file),
+        )),
+    );
+    if let Err(error) = r.remote_root(&setup) {
+        r.fail(
+            "startup-policy-read-failure",
+            format!("could not launch malformed-policy startup proof: {error}"),
+        );
+        return;
+    }
+
+    for _ in 0..20 {
+        if r.ssh_status(&format!("test -f {}", shell_quote(&exit_file))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    let exit = r
+        .remote_root(&format!("cat {}", shell_quote(&exit_file)))
+        .unwrap_or_default();
+    let output = r
+        .remote_root(&format!("cat {}", shell_quote(&log)))
+        .unwrap_or_default();
+    let cleanup = r.remote_root(&format!(
+        "rm -f {db} {db}-wal {db}-shm {log} {exit_file}",
+        db = shell_quote(&db),
+        log = shell_quote(&log),
+        exit_file = shell_quote(&exit_file),
+    ));
+    if exit.trim().parse::<i32>().is_ok_and(|code| code != 0)
+        && output.contains("Failed to load blocklist")
+        && cleanup.is_ok()
+    {
+        r.ok(
+            "startup-policy-read-failure",
+            "malformed blocklist row aborted startup with visible policy load error",
+        );
+    } else {
+        r.fail(
+            "startup-policy-read-failure",
+            format!("startup proof failed exit={exit:?} output={output:?} cleanup={cleanup:?}"),
+        );
+    }
+}
 fn query_log_prune(r: &mut Runner, cfg: &SmokeConfig) {
     if !cfg.mock_query_log_prune_baseline {
         r.skip("query-log-prune", "disabled");

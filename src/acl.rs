@@ -63,16 +63,6 @@ impl Acl {
 /// Shared ACL state for both DNS handler and web server.
 pub type SharedAcl = Arc<RwLock<Acl>>;
 
-/// Load ACL from the `allowed_networks` setting in the database.
-pub fn load_acl_from_db(pool: &crate::db::DbPool) -> Result<SharedAcl, AclParseError> {
-    let settings = crate::db::get_settings(pool).unwrap_or_default();
-    let cidr_list = settings
-        .get("allowed_networks")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    Ok(Arc::new(RwLock::new(Acl::parse(cidr_list)?)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::Acl;

@@ -181,17 +181,17 @@ fn restart_service_if_running() -> bool {
     false
 }
 
-fn load_store_from_db(pool: &db::DbPool, table: &str) -> DomainStore {
-    let domains = db::get_domains(pool, table).unwrap_or_default();
+fn load_store_from_db(pool: &db::DbPool, table: &str) -> Result<DomainStore, db::DbError> {
+    let domains = db::get_domains(pool, table)?;
     let mut store = DomainStore::default();
     for d in &domains {
         store.insert(&d.domain);
     }
-    store
+    Ok(store)
 }
 
-fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
-    let rewrites = db::get_rewrites(pool).unwrap_or_default();
+fn load_rewrites_from_db(pool: &db::DbPool) -> Result<RewriteMap, db::DbError> {
+    let rewrites = db::get_rewrites(pool)?;
     let rules = rewrites
         .iter()
         .map(|r| rustblocker::config::RewriteRule {
@@ -200,16 +200,11 @@ fn load_rewrites_from_db(pool: &db::DbPool) -> RewriteMap {
             ipv6: r.ipv6.clone(),
         })
         .collect();
-    RewriteMap::load(rules)
+    Ok(RewriteMap::load(rules))
 }
 
-fn get_setting_string(pool: &db::DbPool, key: &str) -> String {
-    let settings = db::get_settings(pool).unwrap_or_default();
-    settings
-        .get(key)
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
+fn get_setting_string<'a>(settings: &'a serde_json::Value, key: &str) -> &'a str {
+    settings.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
 const CSP_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none'";
@@ -218,21 +213,22 @@ async fn run_server(cli: Cli) -> Result<()> {
     let pool = db::create_pool(cli.db_path()).context("Failed to create SQLite database")?;
 
     db::seed_defaults(&pool).context("Failed to seed defaults")?;
+    let settings = db::get_settings(&pool).context("Failed to load settings")?;
     if db::get_password_hash(&pool).is_none() {
         warn!("No admin password set. Use `rustblocker --genpass` before accessing the web UI.");
     }
 
-    let listen_address = get_setting_string(&pool, "listen_address");
-    let db_dns_port: u16 = get_setting_string(&pool, "listen_port")
+    let listen_address = get_setting_string(&settings, "listen_address");
+    let db_dns_port: u16 = get_setting_string(&settings, "listen_port")
         .parse()
         .unwrap_or(53);
-    let upstream_timeout: u64 = get_setting_string(&pool, "upstream_timeout_secs")
+    let upstream_timeout: u64 = get_setting_string(&settings, "upstream_timeout_secs")
         .parse()
         .unwrap_or(5);
-    let forward_strategy: ForwardStrategy = get_setting_string(&pool, "forward_strategy")
+    let forward_strategy: ForwardStrategy = get_setting_string(&settings, "forward_strategy")
         .parse()
         .unwrap_or_default();
-    let adaptive_hedge_delay_ms: u64 = get_setting_string(&pool, "adaptive_hedge_delay_ms")
+    let adaptive_hedge_delay_ms: u64 = get_setting_string(&settings, "adaptive_hedge_delay_ms")
         .parse()
         .unwrap_or(rustblocker::forwarder::DEFAULT_HEDGE_DELAY_MS);
 
@@ -244,21 +240,23 @@ async fn run_server(cli: Cli) -> Result<()> {
         .context("Invalid listen address")?;
 
     // Load ACL from database
-    let allowed_networks = get_setting_string(&pool, "allowed_networks");
-    let shared_acl = acl::load_acl_from_db(&pool).context("Invalid allowed_networks setting")?;
+    let allowed_networks = get_setting_string(&settings, "allowed_networks");
+    let shared_acl = Arc::new(RwLock::new(
+        acl::Acl::parse(allowed_networks).context("Invalid allowed_networks setting")?,
+    ));
     if !allowed_networks.is_empty() {
         info!("ACL enabled: {}", allowed_networks);
     }
 
-    let blocklist = BlocklistStore(Arc::new(RwLock::new(load_store_from_db(
-        &pool,
-        "blocklist_domains",
-    ))));
-    let allowlist = AllowlistStore(Arc::new(RwLock::new(load_store_from_db(
-        &pool,
-        "allowlist_domains",
-    ))));
-    let rewrites = Arc::new(RwLock::new(load_rewrites_from_db(&pool)));
+    let blocklist = BlocklistStore(Arc::new(RwLock::new(
+        load_store_from_db(&pool, "blocklist_domains").context("Failed to load blocklist")?,
+    )));
+    let allowlist = AllowlistStore(Arc::new(RwLock::new(
+        load_store_from_db(&pool, "allowlist_domains").context("Failed to load allowlist")?,
+    )));
+    let rewrites = Arc::new(RwLock::new(
+        load_rewrites_from_db(&pool).context("Failed to load rewrites")?,
+    ));
 
     info!(
         "Loaded from DB: {} blocked, {} allowed, {} rewrites",
@@ -286,14 +284,14 @@ async fn run_server(cli: Cli) -> Result<()> {
         .context("Failed to create upstream forwarder")?,
     ));
 
-    let retention_days: u64 = get_setting_string(&pool, "stats_retention_days")
+    let retention_days: u64 = get_setting_string(&settings, "stats_retention_days")
         .parse()
         .unwrap_or(30);
     let retention = Arc::new(AtomicU64::new(retention_days));
     let (query_log, _log_handle) = QueryLog::new(pool.clone(), retention);
 
-    let sinkhole_ipv4_str = get_setting_string(&pool, "sinkhole_ipv4");
-    let sinkhole_ipv6_str = get_setting_string(&pool, "sinkhole_ipv6");
+    let sinkhole_ipv4_str = get_setting_string(&settings, "sinkhole_ipv4");
+    let sinkhole_ipv6_str = get_setting_string(&settings, "sinkhole_ipv6");
     let sinkhole_ipv4_raw: std::net::Ipv4Addr = sinkhole_ipv4_str
         .parse()
         .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
@@ -302,7 +300,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
     let sinkhole_ipv4 = Arc::new(RwLock::new(sinkhole_ipv4_raw));
     let sinkhole_ipv6 = Arc::new(RwLock::new(sinkhole_ipv6_raw));
-    let block_response_mode_raw = get_setting_string(&pool, "block_response_mode")
+    let block_response_mode_raw = get_setting_string(&settings, "block_response_mode")
         .parse::<BlockResponseMode>()
         .unwrap_or_default();
     let block_response_mode = Arc::new(RwLock::new(block_response_mode_raw));
