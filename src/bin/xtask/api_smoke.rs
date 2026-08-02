@@ -18,6 +18,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
 
     block_response_modes(r, &cfg);
     persistence_failure_guards(r, &cfg);
+    bulk_import_failure_rollback(r, &cfg);
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
@@ -411,6 +412,89 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
             "persistence-failure-guards",
             format!(
                 "persistence guard failed setting={setting_code} block={block_code} allow={allow_code} rewrite={rewrite_code} upstream={upstream_code} password={password_code} auth={auth_after_password} login={original_login_code} setting_dns={blocked_before:?}/{blocked_after_setting:?} allow_dns={blocked_after_allow:?} block_dns={block_before:?}/{block_after:?} rewrite_dns={rewrite_before:?}/{rewrite_after:?} cleanup={cleanup:?}"
+            ),
+        );
+    }
+}
+
+fn bulk_import_failure_rollback(r: &mut Runner, cfg: &SmokeConfig) {
+    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    {
+        r.fail(
+            "bulk-import-rollback",
+            "sqlite3 unavailable; cannot inject deterministic import failure",
+        );
+        return;
+    }
+
+    let first = format!("first.{}-failed-import.rustblocker.test", cfg.run_tag);
+    let second = format!("second.{}-failed-import.rustblocker.test", cfg.run_tag);
+    let trigger_sql = format!(
+        "DROP TRIGGER IF EXISTS mock_fail_bulk_manual; CREATE TRIGGER mock_fail_bulk_manual BEFORE INSERT ON manual_domains WHEN NEW.domain = {} BEGIN SELECT RAISE(ABORT, 'mock bulk import failure'); END;",
+        shell_quote(&second),
+    );
+    let drop_sql = "DROP TRIGGER IF EXISTS mock_fail_bulk_manual;";
+    let sqlite = |sql: &str| {
+        format!(
+            "sqlite3 {} {}",
+            shell_quote(&cfg.remote_db_path),
+            shell_quote(sql)
+        )
+    };
+    if let Err(error) = r.remote_root(&sqlite(&trigger_sql)) {
+        r.fail(
+            "bulk-import-rollback",
+            format!("could not install import failure trigger: {error}"),
+        );
+        return;
+    }
+
+    let before_first = r.dns_probe(&first, 1);
+    let before_second = r.dns_probe(&second, 1);
+    let response = r.curl_body(
+        "POST",
+        "/api/blocklist/import",
+        Some(json!({"content": format!("{first}\n{second}")})),
+    );
+    let cleanup = r.remote_root(&sqlite(drop_sql));
+    let first_search = r
+        .curl_json(
+            "GET",
+            &format!("/api/blocklist?search={}", url_encode(&first)),
+            None,
+        )
+        .unwrap_or(Value::Null);
+    let second_search = r
+        .curl_json(
+            "GET",
+            &format!("/api/blocklist?search={}", url_encode(&second)),
+            None,
+        )
+        .unwrap_or(Value::Null);
+    let after_first = r.dns_probe(&first, 1);
+    let after_second = r.dns_probe(&second, 1);
+    let same_probe = |left: &Result<crate::core::DnsProbe, String>,
+                      right: &Result<crate::core::DnsProbe, String>| {
+        matches!((left, right), (Ok(left), Ok(right)) if left.rcode == right.rcode && left.answers == right.answers)
+    };
+    let passed = response.as_ref().is_ok_and(|response| response.code == 500)
+        && domains_empty(&first_search)
+        && domains_empty(&second_search)
+        && same_probe(&before_first, &after_first)
+        && same_probe(&before_second, &after_second)
+        && cleanup.is_ok();
+
+    if passed {
+        r.ok(
+            "bulk-import-rollback",
+            "failed manual-domain insert rolled back DB transaction and left runtime store unchanged",
+        );
+    } else {
+        r.fail(
+            "bulk-import-rollback",
+            format!(
+                "rollback proof failed response={response:?} first={first_search} second={second_search} dns={before_first:?}/{after_first:?},{before_second:?}/{after_second:?} cleanup={cleanup:?}"
             ),
         );
     }

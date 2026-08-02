@@ -249,19 +249,16 @@ pub async fn fetch_source(path: &str) -> Result<String, String> {
 }
 
 /// Import domains from a URL or file into the database.
-pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> usize {
-    let Ok(content) = fetch_source(path).await else {
-        return 0;
-    };
+pub async fn import_from_source(pool: &DbPool, table: &str, path: &str) -> Result<usize, String> {
+    let content = fetch_source(path).await?;
     let pool = pool.clone();
     let table = table.to_string();
     tokio::task::spawn_blocking(move || {
-        bulk_import_domains_with_entries(&pool, &table, &content)
-            .map(|r| r.inserted)
-            .unwrap_or(0)
+        bulk_import_domains_with_entries(&pool, &table, &content).map(|result| result.inserted)
     })
     .await
-    .unwrap_or(0)
+    .map_err(|error| format!("database task failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 fn parse_domain_line(line: &str) -> Option<String> {
@@ -310,32 +307,32 @@ fn parse_source_domains(content: &str) -> Result<Vec<String>, String> {
 }
 /// Insert parsed domains, preserving `*.` prefix for wildcards.
 fn insert_domains_from_content(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     table: &str,
     content: &str,
-) -> DomainStore {
+) -> Result<DomainImportResult, DbError> {
     let sql = format!("INSERT OR IGNORE INTO {} (domain) VALUES (?1)", table);
     let list_type = match table {
         "allowlist_domains" => "allowlist",
         _ => "blocklist",
     };
     let mut store = DomainStore::default();
-    // Wrap all inserts in a single transaction so a 100k-line source
-    // doesn't create 100k individual write transactions.
-    let _ = conn.execute("BEGIN", []);
-    for line in content.lines() {
-        if let Some(domain) = parse_domain_line(line) {
-            conn.execute(&sql, params![domain]).ok();
-            // API bulk import is treated as manual so source refresh won't prune it.
-            let _ = conn.execute(
-                "INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)",
-                params![list_type, domain],
-            );
-            store.insert(&domain);
+    let mut inserted = 0;
+    let tx = conn.transaction()?;
+    {
+        let mut insert_domain = tx.prepare(&sql)?;
+        let mut insert_manual =
+            tx.prepare("INSERT OR IGNORE INTO manual_domains (list_type, domain) VALUES (?1, ?2)")?;
+        for line in content.lines() {
+            if let Some(domain) = parse_domain_line(line) {
+                inserted += insert_domain.execute(params![domain])?;
+                insert_manual.execute(params![list_type, domain])?;
+                store.insert(&domain);
+            }
         }
     }
-    let _ = conn.execute("COMMIT", []);
-    store
+    tx.commit()?;
+    Ok(DomainImportResult { inserted, store })
 }
 
 // --- Settings ---
@@ -673,10 +670,8 @@ pub fn delete_domain_by_id(pool: &DbPool, table: &str, id: i64) -> Option<String
     }
 }
 
-pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> usize {
-    bulk_import_domains_with_entries(pool, table, content)
-        .map(|r| r.inserted)
-        .unwrap_or(0)
+pub fn bulk_import_domains(pool: &DbPool, table: &str, content: &str) -> Result<usize, DbError> {
+    bulk_import_domains_with_entries(pool, table, content).map(|result| result.inserted)
 }
 
 pub fn bulk_import_domains_with_entries(
@@ -684,22 +679,8 @@ pub fn bulk_import_domains_with_entries(
     table: &str,
     content: &str,
 ) -> Result<DomainImportResult, DbError> {
-    let conn = pool.get()?;
-    let before: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0);
-    let store = insert_domains_from_content(&conn, table, content);
-    let after: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
-            row.get(0)
-        })
-        .unwrap_or(0);
-    Ok(DomainImportResult {
-        inserted: (after - before) as usize,
-        store,
-    })
+    let mut conn = pool.get()?;
+    insert_domains_from_content(&mut conn, table, content)
 }
 
 // --- Rewrites ---
@@ -1684,5 +1665,36 @@ mod tests {
 
         assert!(add_domain(&pool, "blocklist_domains", "atomic.example.com").is_err());
         assert_eq!(count_domains(&pool, "blocklist_domains").unwrap(), 0);
+    }
+
+    #[test]
+    fn bulk_import_rolls_back_domains_and_runtime_entries_together() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_second_manual BEFORE INSERT ON manual_domains
+                 WHEN NEW.domain = 'second.example.com'
+                 BEGIN SELECT RAISE(ABORT, 'reject second manual domain'); END;",
+            )
+            .unwrap();
+        let error = bulk_import_domains_with_entries(
+            &pool,
+            "blocklist_domains",
+            "first.example.com\nsecond.example.com",
+        )
+        .err()
+        .expect("bulk import must fail");
+
+        assert!(error.to_string().contains("reject second manual domain"));
+        assert_eq!(count_domains(&pool, "blocklist_domains").unwrap(), 0);
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM manual_domains", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 }
