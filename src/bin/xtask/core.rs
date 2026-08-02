@@ -227,6 +227,7 @@ impl Runner {
         self.suspend_slave_mode()?;
         self.deploy(&target)?;
         self.login()?;
+        self.auth_login_throttle()?;
         let settings = self.settings()?;
         self.resource_baseline();
         self.forward_strategy(&settings)?;
@@ -683,6 +684,105 @@ impl Runner {
             self.fail("login", format!("HTTP {code}"));
         }
         Ok(())
+    }
+
+    fn auth_login_throttle(&mut self) -> Result<(), String> {
+        let body = json!({
+            "password": format!("wrong-login-throttle-{}", unix_millis()),
+        })
+        .to_string();
+        let login_url = self.url("/api/auth/login");
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let mut attempts = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let mut command = Command::new("curl");
+            command
+                .args(["-s", "--connect-timeout", "5", "--max-time"])
+                .arg(self.config.timeout_secs.to_string())
+                .args(["-o", null_device, "-w", "%{http_code}", "-X", "POST"])
+                .arg(&login_url)
+                .args(["-H", "Content-Type: application/json", "-d", &body])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            attempts.push(
+                command
+                    .spawn()
+                    .map_err(|err| format!("start concurrent login probe: {err}"))?,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let health_started = Instant::now();
+        let health = self.curl_code("GET", "/api/health", None)?;
+        let health_ms = health_started.elapsed().as_millis();
+        if health == 200 && health_ms <= 2_000 {
+            self.ok(
+                "login-worker-isolation",
+                format!("health HTTP 200 in {health_ms}ms during concurrent bcrypt work"),
+            );
+        } else {
+            self.fail(
+                "login-worker-isolation",
+                format!("health HTTP {health} took {health_ms}ms during concurrent bcrypt work"),
+            );
+        }
+
+        let mut unauthorized = 0_u64;
+        let mut throttled = 0_u64;
+        let mut unexpected = Vec::new();
+        for attempt in attempts {
+            let output = attempt
+                .wait_with_output()
+                .map_err(|err| format!("wait for concurrent login probe: {err}"))?;
+            let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            match code.as_str() {
+                "401" => unauthorized += 1,
+                "429" => throttled += 1,
+                _ => unexpected.push(code),
+            }
+        }
+
+        let mut locked_wrong = 0;
+        for _ in 0..6 {
+            locked_wrong = self.curl_code(
+                "POST",
+                "/api/auth/login",
+                Some(json!({
+                    "password": format!("wrong-login-lockout-{}", unix_millis()),
+                })),
+            )?;
+            if locked_wrong == 429 {
+                break;
+            }
+        }
+        let locked_correct = self.curl_code(
+            "POST",
+            "/api/auth/login",
+            Some(json!({ "password": self.env_or("WEBUI_PASSWORD", "") })),
+        )?;
+        if unauthorized > 0
+            && throttled > 0
+            && unexpected.is_empty()
+            && locked_wrong == 429
+            && locked_correct == 429
+        {
+            self.ok(
+                "login-throttle",
+                format!(
+                    "concurrent attempts unauthorized={unauthorized} throttled={throttled}; subsequent wrong and correct attempts HTTP 429"
+                ),
+            );
+        } else {
+            self.fail(
+                "login-throttle",
+                format!(
+                    "expected mixed 401/429 then lockout; unauthorized={unauthorized} throttled={throttled} unexpected={unexpected:?} wrong={locked_wrong} correct={locked_correct}"
+                ),
+            );
+        }
+
+        self.restart_remote_service()?;
+        self.login()
     }
 
     fn settings(&mut self) -> Result<Value, String> {

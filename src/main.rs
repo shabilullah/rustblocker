@@ -373,6 +373,7 @@ async fn run_server(cli: Cli) -> Result<()> {
             secret
         });
     let auth_data = Arc::new(rustblocker::auth::AuthState::from_secret(session_secret));
+    let login_throttle_data = actix_web::web::Data::new(rustblocker::auth::LoginThrottle::new());
 
     // HTTPS is attempted by default. If a valid certificate is stored for the
     // configured domain, bind HTTPS on `https_port`; otherwise continue HTTP-only.
@@ -429,6 +430,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(sinkhole_v6_data.clone())
                 .app_data(block_response_mode_data.clone())
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
+                .app_data(login_throttle_data.clone())
                 .app_data(activity_log.clone())
                 .app_data(sync_state_data.clone())
                 .app_data(dns_concurrency_data.clone())

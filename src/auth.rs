@@ -4,7 +4,10 @@
 //! an HMAC-SHA256 key. The key is generated once and persisted in the SQLite
 //! database, so existing login sessions survive process restarts.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use actix_web::{
     Error, HttpResponse,
@@ -15,7 +18,7 @@ use base64::Engine;
 use bcrypt::{DEFAULT_COST, hash, verify};
 use futures::future::{LocalBoxFuture, Ready, ready};
 use hmac::{Hmac, KeyInit, Mac};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::RngExt;
 use serde_json::json;
 use sha2::Sha256;
@@ -24,6 +27,93 @@ pub const SESSION_COOKIE_NAME: &str = "rustblocker_session";
 
 /// Number of seconds a login session remains valid.
 pub const SESSION_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+
+const LOGIN_MAX_CONCURRENT: usize = 2;
+const LOGIN_MAX_FAILURES: u8 = 5;
+const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+const LOGIN_MAX_TRACKED_CLIENTS: usize = 4096;
+
+#[derive(Debug)]
+struct FailedLogins {
+    count: u8,
+    window_started: Instant,
+}
+
+/// Bounds expensive password checks and failed attempts from each client IP.
+pub struct LoginThrottle {
+    failures: Mutex<HashMap<IpAddr, FailedLogins>>,
+    bcrypt_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self {
+            failures: Mutex::new(HashMap::new()),
+            bcrypt_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_MAX_CONCURRENT)),
+        }
+    }
+
+    pub fn begin(&self, client_ip: IpAddr) -> Result<tokio::sync::OwnedSemaphorePermit, u64> {
+        let now = Instant::now();
+        if let Some(retry_after) = self.retry_after_at(client_ip, now) {
+            return Err(retry_after);
+        }
+        self.bcrypt_slots.clone().try_acquire_owned().map_err(|_| 1)
+    }
+
+    pub fn record_failure(&self, client_ip: IpAddr) {
+        self.record_failure_at(client_ip, Instant::now());
+    }
+
+    pub fn record_success(&self, client_ip: IpAddr) {
+        self.failures.lock().remove(&client_ip);
+    }
+
+    fn retry_after_at(&self, client_ip: IpAddr, now: Instant) -> Option<u64> {
+        let mut failures = self.failures.lock();
+        if failures.len() >= LOGIN_MAX_TRACKED_CLIENTS {
+            failures.retain(|_, attempt| {
+                now.saturating_duration_since(attempt.window_started) < LOGIN_FAILURE_WINDOW
+            });
+        }
+        if let Some(attempt) = failures.get(&client_ip) {
+            let elapsed = now.saturating_duration_since(attempt.window_started);
+            if elapsed >= LOGIN_FAILURE_WINDOW {
+                failures.remove(&client_ip);
+            } else if attempt.count >= LOGIN_MAX_FAILURES {
+                return Some(
+                    LOGIN_FAILURE_WINDOW
+                        .saturating_sub(elapsed)
+                        .as_secs()
+                        .max(1),
+                );
+            }
+        }
+        if !failures.contains_key(&client_ip) && failures.len() >= LOGIN_MAX_TRACKED_CLIENTS {
+            return Some(LOGIN_FAILURE_WINDOW.as_secs());
+        }
+        None
+    }
+
+    fn record_failure_at(&self, client_ip: IpAddr, now: Instant) {
+        let mut failures = self.failures.lock();
+        let attempt = failures.entry(client_ip).or_insert(FailedLogins {
+            count: 0,
+            window_started: now,
+        });
+        if now.saturating_duration_since(attempt.window_started) >= LOGIN_FAILURE_WINDOW {
+            attempt.count = 0;
+            attempt.window_started = now;
+        }
+        attempt.count = attempt.count.saturating_add(1);
+    }
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Authentication state shared across worker threads.
 pub struct AuthState {
@@ -323,5 +413,48 @@ mod tests {
         assert!(!is_public_path("/api/auth/password"));
         assert!(!is_public_path("/api/settings"));
         assert!(!is_public_path("/api/stats/live"));
+    }
+
+    #[test]
+    fn login_throttle_locks_and_expires_failed_attempts() {
+        let throttle = LoginThrottle::new();
+        let client_ip = "192.0.2.1".parse().unwrap();
+        let started = Instant::now();
+
+        for _ in 0..LOGIN_MAX_FAILURES - 1 {
+            throttle.record_failure_at(client_ip, started);
+            assert_eq!(throttle.retry_after_at(client_ip, started), None);
+        }
+        throttle.record_failure_at(client_ip, started);
+        assert_eq!(
+            throttle.retry_after_at(client_ip, started),
+            Some(LOGIN_FAILURE_WINDOW.as_secs())
+        );
+        assert_eq!(
+            throttle.retry_after_at(client_ip, started + LOGIN_FAILURE_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn successful_login_clears_failed_attempts() {
+        let throttle = LoginThrottle::new();
+        let client_ip = "192.0.2.2".parse().unwrap();
+        let now = Instant::now();
+        for _ in 0..LOGIN_MAX_FAILURES {
+            throttle.record_failure_at(client_ip, now);
+        }
+        throttle.record_success(client_ip);
+        assert_eq!(throttle.retry_after_at(client_ip, now), None);
+    }
+
+    #[tokio::test]
+    async fn login_throttle_rejects_work_above_bcrypt_limit() {
+        let throttle = LoginThrottle::new();
+        let first = throttle.begin("192.0.2.3".parse().unwrap()).unwrap();
+        let second = throttle.begin("192.0.2.4".parse().unwrap()).unwrap();
+        assert_eq!(throttle.begin("192.0.2.5".parse().unwrap()).unwrap_err(), 1);
+        drop((first, second));
+        assert!(throttle.begin("192.0.2.5".parse().unwrap()).is_ok());
     }
 }

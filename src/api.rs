@@ -9,7 +9,9 @@ use tracing::warn;
 
 use crate::acl::SharedAcl;
 use crate::activity::ActivityLog;
-use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret};
+use crate::auth::{
+    AuthState, LoginThrottle, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_secret,
+};
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbError, DbPool};
 use crate::forwarder::{ForwardStrategy, ParallelForwarder};
@@ -1493,18 +1495,52 @@ fn auth_cookie(
 async fn login(
     pool: web::Data<DbPool>,
     auth: web::Data<Arc<AuthState>>,
+    acl: web::Data<SharedAcl>,
+    throttle: web::Data<LoginThrottle>,
     req: HttpRequest,
     body: web::Json<LoginPayload>,
 ) -> impl Responder {
-    let hash = match db::get_password_hash(&pool) {
-        Some(h) => h,
+    if !check_acl(&req, &acl) {
+        return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
+    }
+    let Some(client_ip) = req.peer_addr().map(|addr| addr.ip()) else {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({"error": "missing client address"}));
+    };
+    let permit = match throttle.begin(client_ip) {
+        Ok(permit) => permit,
+        Err(retry_after) => {
+            return HttpResponse::TooManyRequests()
+                .insert_header(("Retry-After", retry_after.to_string()))
+                .json(serde_json::json!({"error": "too many login attempts"}));
+        }
+    };
+    let pool = pool.get_ref().clone();
+    let password = body.password.clone();
+    let verified = match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        db::get_password_hash(&pool).map(|hash| AuthState::verify_password(&password, &hash))
+    })
+    .await
+    {
+        Ok(verified) => verified,
+        Err(e) => {
+            tracing::error!("login verification task failed: {e}");
+            return HttpResponse::InternalServerError()
+                .json(serde_json::json!({"error": "failed to process login"}));
+        }
+    };
+    match verified {
+        Some(true) => throttle.record_success(client_ip),
+        Some(false) => {
+            throttle.record_failure(client_ip);
+            return HttpResponse::Unauthorized()
+                .json(serde_json::json!({"error": "invalid password"}));
+        }
         None => {
             return HttpResponse::Unauthorized()
                 .json(serde_json::json!({"error": "no admin password configured"}));
         }
-    };
-    if !AuthState::verify_password(&body.password, &hash) {
-        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid password"}));
     }
     let session = auth.create_session(SESSION_MAX_AGE_SECS);
     HttpResponse::Ok()
@@ -1916,7 +1952,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::auth_cookie;
+    use super::{auth_cookie, login};
+    use crate::acl::Acl;
+    use crate::auth::{AuthState, LoginThrottle};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     #[test]
     fn auth_cookie_security_tracks_request_transport() {
@@ -1930,5 +1970,41 @@ mod tests {
                 .secure()
                 .unwrap_or(false)
         );
+    }
+
+    #[actix_web::test]
+    async fn login_rejects_client_outside_acl_before_password_work() {
+        let db_path = std::env::temp_dir().join(format!(
+            "rb-login-acl-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::create_pool(&db_path).unwrap();
+        crate::db::seed_defaults(&pool).unwrap();
+        let acl = Arc::new(RwLock::new(Acl::parse("127.0.0.0/8")));
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(actix_web::web::Data::new(pool.clone()))
+                .app_data(actix_web::web::Data::new(Arc::new(AuthState::new())))
+                .app_data(actix_web::web::Data::new(acl))
+                .app_data(actix_web::web::Data::new(LoginThrottle::new()))
+                .route("/api/auth/login", actix_web::web::post().to(login)),
+        )
+        .await;
+        let request = actix_web::test::TestRequest::post()
+            .uri("/api/auth/login")
+            .peer_addr("192.0.2.10:12345".parse().unwrap())
+            .set_json(serde_json::json!({"password": "unused"}))
+            .to_request();
+
+        let response = actix_web::test::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+        drop(app);
+        drop(pool);
+        let _ = std::fs::remove_file(db_path);
     }
 }
