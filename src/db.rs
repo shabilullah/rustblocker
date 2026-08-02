@@ -52,6 +52,7 @@ pub struct SourceRefreshResult {
     pub store: DomainStore,
 }
 
+/// Serializes every domain-list DB mutation with its corresponding runtime-store update.
 static SOURCE_MUTATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub(crate) async fn lock_source_mutation() -> tokio::sync::MutexGuard<'static, ()> {

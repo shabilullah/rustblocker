@@ -25,6 +25,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     configured_upstream_port(r, &cfg);
     update_detection(r);
     db_concurrency(r, &cfg);
+    list_mutation_serialization(r, &cfg);
     import_hot_reload(r, &cfg);
     dns_rewrite(r, &cfg);
     dns_wildcard(r, &cfg);
@@ -962,6 +963,109 @@ fn update_detection(r: &mut Runner) {
         );
     }
 }
+
+fn list_mutation_serialization(r: &mut Runner, cfg: &SmokeConfig) {
+    let source_path = format!("/tmp/{}-list-race.txt", cfg.run_tag);
+    let source_base = format!("source.{}-list-race.rustblocker.test", cfg.run_tag);
+    let manual_domain = format!("manual.{}-list-race.rustblocker.test", cfg.run_tag);
+    let write_source = format!(
+        "i=1; : > {path}; while [ $i -le 10000 ]; do printf 'source-%s.{base}\\n' \"$i\" >> {path}; i=$((i + 1)); done",
+        path = shell_quote(&source_path),
+        base = source_base,
+    );
+    if let Err(error) = r.remote_root(&write_source) {
+        r.fail(
+            "list-mutation-serialization",
+            format!("write source: {error}"),
+        );
+        return;
+    }
+
+    let source_id = r
+        .curl_json(
+            "POST",
+            "/api/sources",
+            Some(json!({
+                "url": source_path,
+                "list_type": "blocklist",
+                "update_interval_hours": 24
+            })),
+        )
+        .ok()
+        .and_then(|value| json_id(&value));
+    let http = LocalHttp::login(r, cfg);
+    let mut refresh = match (source_id, http.as_ref()) {
+        (Some(id), Ok(http)) => http.spawn_post(&format!("/api/sources/{id}/refresh")).ok(),
+        _ => None,
+    };
+    let refresh_overlapped = refresh
+        .as_mut()
+        .is_some_and(|child| child.try_wait().is_ok_and(|status| status.is_none()));
+    thread::sleep(Duration::from_millis(25));
+    let manual_id = r
+        .curl_json(
+            "POST",
+            "/api/blocklist",
+            Some(json!({"domain": manual_domain})),
+        )
+        .ok()
+        .and_then(|value| json_id(&value));
+    let refresh_code = refresh
+        .take()
+        .and_then(|child| child.wait().ok().map(|(code, _)| code));
+    let refresh_ok = refresh_code == Some(200);
+    let search = r
+        .curl_json(
+            "GET",
+            &format!("/api/blocklist?search={}", url_encode(&manual_domain)),
+            None,
+        )
+        .unwrap_or(Value::Null);
+    let db_visible = search
+        .get("domains")
+        .and_then(Value::as_array)
+        .is_some_and(|domains| {
+            domains
+                .iter()
+                .any(|entry| entry.get("domain").and_then(Value::as_str) == Some(&manual_domain))
+        });
+    let runtime_visible = r
+        .dns_query(&manual_domain)
+        .is_ok_and(|answer| has_line(&answer, &cfg.sinkhole_ipv4));
+
+    let source_cleanup = source_id.and_then(|id| {
+        r.curl_code("DELETE", &format!("/api/sources/{id}"), None)
+            .ok()
+    }) == Some(200);
+    let manual_cleanup = manual_id.and_then(|id| {
+        r.curl_code("DELETE", &format!("/api/blocklist/{id}"), None)
+            .ok()
+    }) == Some(200);
+    let _ = r.remote_root(&format!("rm -f {}", shell_quote(&source_path)));
+
+    if refresh_overlapped
+        && refresh_ok
+        && manual_id.is_some()
+        && db_visible
+        && runtime_visible
+        && source_cleanup
+        && manual_cleanup
+    {
+        r.ok(
+            "list-mutation-serialization",
+            "manual blocklist add remained in DB and runtime across concurrent source refresh",
+        );
+    } else {
+        r.fail(
+            "list-mutation-serialization",
+            format!(
+                "race proof failed source={} overlap={refresh_overlapped} refresh={refresh_code:?} manual={} db={db_visible} runtime={runtime_visible} cleanup={source_cleanup}/{manual_cleanup}",
+                source_id.is_some(),
+                manual_id.is_some(),
+            ),
+        );
+    }
+}
 fn db_concurrency(r: &mut Runner, cfg: &SmokeConfig) {
     let Ok(http) = LocalHttp::login(r, cfg) else {
         r.fail(
@@ -1876,6 +1980,37 @@ impl LocalHttp {
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|err| format!("start snapshot curl: {err}"))?;
+        Ok(SnapshotChild { child, out_path })
+    }
+
+    fn spawn_post(&self, path: &str) -> Result<SnapshotChild, String> {
+        let out_path = std::env::temp_dir().join(format!(
+            "rb-xtask-post-{}-{}.json",
+            unix_millis(),
+            std::process::id()
+        ));
+        let child = Command::new("curl")
+            .args([
+                "-s",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                &(self.timeout_secs.max(120)).to_string(),
+                "-b",
+            ])
+            .arg(&self.cookie_path)
+            .args([
+                "-X",
+                "POST",
+                "-o",
+                out_path.to_string_lossy().as_ref(),
+                "-w",
+                "%{http_code}",
+                &format!("{}{}", self.base_url, path),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("start POST curl: {err}"))?;
         Ok(SnapshotChild { child, out_path })
     }
 }

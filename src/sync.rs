@@ -257,6 +257,11 @@ async fn apply_snapshot(
     let allowlist = allowlist.clone();
     let rewrites = rewrites.clone();
     let forwarder = forwarder.clone();
+    let _mutation_guard = if matches!(category.as_str(), "blocklist" | "allowlist") {
+        Some(db::lock_source_mutation().await)
+    } else {
+        None
+    };
 
     let category_for_log = category.clone();
     if let Err(e) = tokio::task::spawn_blocking(move || {

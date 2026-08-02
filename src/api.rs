@@ -893,6 +893,7 @@ async fn add_blocklist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    let _mutation_guard = db::lock_source_mutation().await;
     let pool = pool.get_ref().clone();
     let domain = body.domain.clone();
     let id = match db_blocking(move || db::add_domain(&pool, "blocklist_domains", &domain)).await {
@@ -913,6 +914,7 @@ async fn delete_blocklist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    let _mutation_guard = db::lock_source_mutation().await;
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
     let domain = match db_blocking(move || {
@@ -951,6 +953,7 @@ async fn bulk_import_blocklist(
             return HttpResponse::BadRequest().json(serde_json::json!({"error": error}));
         }
     };
+    let _mutation_guard = db::lock_source_mutation().await;
     let pool_for_import = pool.get_ref().clone();
     let import_result = match db_blocking(move || {
         db::bulk_import_domains_with_entries(&pool_for_import, "blocklist_domains", &content)
@@ -1010,6 +1013,7 @@ async fn add_allowlist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    let _mutation_guard = db::lock_source_mutation().await;
     let pool = pool.get_ref().clone();
     let domain = body.domain.clone();
     let id = match db_blocking(move || db::add_domain(&pool, "allowlist_domains", &domain)).await {
@@ -1030,6 +1034,7 @@ async fn delete_allowlist_domain(
     if !check_acl(&req, &acl) {
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
+    let _mutation_guard = db::lock_source_mutation().await;
     let id = path.into_inner();
     let pool = pool.get_ref().clone();
     let domain = match db_blocking(move || {
@@ -1068,6 +1073,7 @@ async fn bulk_import_allowlist(
             return HttpResponse::BadRequest().json(serde_json::json!({"error": error}));
         }
     };
+    let _mutation_guard = db::lock_source_mutation().await;
     let pool_for_import = pool.get_ref().clone();
     let import_result = match db_blocking(move || {
         db::bulk_import_domains_with_entries(&pool_for_import, "allowlist_domains", &content)
@@ -1982,9 +1988,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{auth_cookie, login};
+    use super::{DomainAdd, add_blocklist_domain, auth_cookie, login};
     use crate::acl::Acl;
     use crate::auth::{AuthState, LoginThrottle};
+    use crate::lists::{BlocklistStore, DomainStore};
+    use actix_web::Responder;
     use parking_lot::RwLock;
     use std::sync::Arc;
 
@@ -2000,6 +2008,60 @@ mod tests {
                 .secure()
                 .unwrap_or(false)
         );
+    }
+
+    #[actix_web::test]
+    async fn manual_list_mutation_waits_for_source_snapshot_install() {
+        let db_path = std::env::temp_dir().join(format!(
+            "rb-list-mutation-lock-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = crate::db::create_pool(&db_path).unwrap();
+        let acl = Arc::new(RwLock::new(Acl::default()));
+        let blocklist = BlocklistStore(Arc::new(RwLock::new(DomainStore::default())));
+        let request = actix_web::test::TestRequest::post()
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_http_request();
+        let guard = crate::db::lock_source_mutation().await;
+        let mutation = add_blocklist_domain(
+            actix_web::web::Data::new(pool.clone()),
+            request,
+            actix_web::web::Data::new(acl),
+            actix_web::web::Data::new(blocklist.clone()),
+            actix_web::web::Json(DomainAdd {
+                domain: "during-refresh.example".to_string(),
+            }),
+        );
+        tokio::pin!(mutation);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), mutation.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            crate::db::count_domains(&pool, "blocklist_domains").unwrap(),
+            0
+        );
+        assert!(!blocklist.read().matches("during-refresh.example"));
+
+        drop(guard);
+        let responder = mutation.await;
+        let response =
+            responder.respond_to(&actix_web::test::TestRequest::default().to_http_request());
+        assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
+        assert_eq!(
+            crate::db::count_domains(&pool, "blocklist_domains").unwrap(),
+            1
+        );
+        assert!(blocklist.read().matches("during-refresh.example"));
+
+        drop(pool);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[actix_web::test]
