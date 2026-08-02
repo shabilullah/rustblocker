@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -6,13 +6,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{FuturesUnordered, StreamExt};
-use hickory_net::{DnsError, NetError};
-use hickory_proto::op::{Metadata, ResponseCode};
-use hickory_proto::rr::{Name, RData, Record, RecordData, RecordType};
-use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
-use hickory_resolver::lookup::Lookup;
-use hickory_resolver::net::runtime::TokioRuntimeProvider;
-use hickory_resolver::{Resolver, TokioResolver};
+use hickory_net::NetError;
+use hickory_net::proto::op::{DnsRequest, DnsRequestOptions, DnsResponse, Message, ResponseCode};
+use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::tcp::TcpClientStream;
+use hickory_net::udp::UdpClientStream;
+use hickory_net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
+use hickory_proto::rr::Name;
 use hickory_server::server::{ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
 use tokio::time::timeout;
@@ -113,25 +113,48 @@ impl UpstreamHealth {
     }
 }
 
-type LookupFuture = BoxFuture<'static, (usize, std::result::Result<Lookup, NetError>)>;
+type RawDnsClient = DnsExchange<TokioRuntimeProvider>;
+type LookupFuture = BoxFuture<'static, (usize, std::result::Result<DnsResponse, NetError>)>;
 
 enum ForwardAttemptError {
     Upstream(Option<NetError>),
     Response(anyhow::Error),
 }
 
-fn lookup_future(
-    idx: usize,
-    resolver: TokioResolver,
-    name: Name,
-    query_type: RecordType,
-) -> LookupFuture {
-    async move { (idx, resolver.lookup(name, query_type).await) }.boxed()
+#[derive(Clone)]
+struct UpstreamClient {
+    udp: RawDnsClient,
+    address: SocketAddr,
+    timeout: Duration,
+}
+
+impl UpstreamClient {
+    async fn query(&self, request: DnsRequest) -> std::result::Result<DnsResponse, NetError> {
+        let response = self.udp.send(request.clone()).first_answer().await?;
+        if !response.truncation {
+            return Ok(response);
+        }
+
+        debug!(upstream = %self.address, "UDP response truncated; retrying over TCP");
+        let tcp = TcpClientStream::exchange(
+            self.address,
+            None,
+            self.timeout,
+            Some(32),
+            TokioRuntimeProvider::default(),
+        )
+        .await?;
+        tcp.send(request).first_answer().await
+    }
+}
+
+fn lookup_future(idx: usize, client: UpstreamClient, request: DnsRequest) -> LookupFuture {
+    async move { (idx, client.query(request).await) }.boxed()
 }
 
 /// DNS forwarder with configurable upstream selection strategy.
 pub struct ParallelForwarder {
-    resolvers: Arc<Vec<TokioResolver>>,
+    clients: Arc<Vec<UpstreamClient>>,
     addresses: Arc<Vec<String>>,
     health: Arc<Vec<UpstreamHealth>>,
     timeout: Duration,
@@ -143,7 +166,7 @@ pub struct ParallelForwarder {
 impl Clone for ParallelForwarder {
     fn clone(&self) -> Self {
         Self {
-            resolvers: self.resolvers.clone(),
+            clients: self.clients.clone(),
             addresses: self.addresses.clone(),
             health: self.health.clone(),
             timeout: self.timeout,
@@ -155,21 +178,6 @@ impl Clone for ParallelForwarder {
 }
 
 impl ParallelForwarder {
-    /// Default cache size per resolver: 32K responses (was 256K, earlier 1M).
-    /// Each upstream owns a separate LRU; N upstreams ⇒ N×cache_size entries.
-    /// Shared domain space means most hits overlap, so a smaller per-resolver
-    /// cache cuts RAM floor sharply with little miss cost on the hot path.
-    pub const DEFAULT_CACHE_SIZE: u64 = 32_768;
-
-    /// Configured per-upstream response cache size (entries).
-    pub fn cache_size(&self) -> u64 {
-        Self::DEFAULT_CACHE_SIZE
-    }
-    /// More aggressive hedging: fan out to 3 upstreams simultaneously.
-    const DEFAULT_NUM_CONCURRENT_REQS: usize = 3;
-    /// Shorter negative TTL to avoid caching stale NXDOMAIN/NODATA too long.
-    const DEFAULT_NEGATIVE_MIN_TTL_SECS: u64 = 600; // 10 minutes
-
     pub fn new(upstreams: &[UpstreamConfig], timeout_secs: u64) -> Result<Self> {
         Self::new_with_options(
             upstreams,
@@ -193,40 +201,32 @@ impl ParallelForwarder {
         strategy: ForwardStrategy,
         hedge_delay_ms: u64,
     ) -> Result<Self> {
-        let mut resolvers = Vec::with_capacity(upstreams.len());
+        let timeout = Duration::from_secs(timeout_secs);
+        let mut clients = Vec::with_capacity(upstreams.len());
         let mut addresses = Vec::with_capacity(upstreams.len());
         for upstream in upstreams {
             let ip: IpAddr = upstream
                 .address
                 .parse()
                 .with_context(|| format!("Invalid upstream IP: {}", upstream.address))?;
-
-            let ns_config = NameServerConfig::udp_and_tcp(ip);
-            let config = ResolverConfig::from_parts(None, vec![], vec![ns_config]);
-
-            // Tune resolver opts: smaller shared cache, more concurrent requests.
-            let mut opts = ResolverOpts::default();
-            opts.cache_size = Self::DEFAULT_CACHE_SIZE;
-            opts.num_concurrent_reqs = Self::DEFAULT_NUM_CONCURRENT_REQS;
-            opts.negative_min_ttl = Some(Duration::from_secs(Self::DEFAULT_NEGATIVE_MIN_TTL_SECS));
-
-            let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-                .with_options(opts)
-                .build()?;
-            resolvers.push(resolver);
-            addresses.push(upstream.address.clone());
-            debug!("Added upstream resolver: {}", upstream.address);
+            let address = SocketAddr::new(ip, upstream.port.unwrap_or(53));
+            let udp = UdpClientStream::builder(address, TokioRuntimeProvider::default())
+                .with_timeout(Some(timeout))
+                .exchange();
+            clients.push(UpstreamClient {
+                udp,
+                address,
+                timeout,
+            });
+            addresses.push(address.to_string());
+            debug!("Added upstream resolver: {}", address);
         }
 
         Ok(Self {
-            health: Arc::new(
-                (0..resolvers.len())
-                    .map(|_| UpstreamHealth::new())
-                    .collect(),
-            ),
-            resolvers: Arc::new(resolvers),
+            health: Arc::new((0..clients.len()).map(|_| UpstreamHealth::new()).collect()),
+            clients: Arc::new(clients),
             addresses: Arc::new(addresses),
-            timeout: Duration::from_secs(timeout_secs),
+            timeout,
             strategy,
             hedge_delay: Duration::from_millis(hedge_delay_ms),
             max_adaptive_parallel: DEFAULT_MAX_ADAPTIVE_PARALLEL,
@@ -242,7 +242,7 @@ impl ParallelForwarder {
         hedge_delay_ms: u64,
     ) -> Result<()> {
         let fresh = Self::new_with_options(upstreams, timeout_secs, strategy, hedge_delay_ms)?;
-        self.resolvers = fresh.resolvers;
+        self.clients = fresh.clients;
         self.addresses = fresh.addresses;
         self.health = fresh.health;
         self.timeout = Duration::from_secs(timeout_secs);
@@ -273,7 +273,7 @@ impl ParallelForwarder {
     }
 
     fn adaptive_order(&self) -> Vec<usize> {
-        let mut indexes: Vec<usize> = (0..self.resolvers.len()).collect();
+        let mut indexes: Vec<usize> = (0..self.clients.len()).collect();
         indexes.sort_by_key(|idx| {
             self.health
                 .get(*idx)
@@ -325,6 +325,11 @@ impl ParallelForwarder {
         };
         let name = Name::from(query.name());
         let query_type = query.query_type();
+        let upstream_request = upstream_request(
+            request.metadata,
+            query.original().clone(),
+            request.edns.clone(),
+        );
 
         debug!(
             "Forwarding query: {} ({}) using {} strategy",
@@ -334,19 +339,19 @@ impl ParallelForwarder {
         );
 
         let start = Instant::now();
-        if self.resolvers.len() == 1 {
+        if self.clients.len() == 1 {
             return self
-                .resolve_one(request, &mut response_handle, name, query_type, start)
+                .resolve_one(request, &mut response_handle, upstream_request, start)
                 .await;
         }
 
         match self.strategy {
             ForwardStrategy::Adaptive => {
-                self.resolve_adaptive(request, &mut response_handle, name, query_type, start)
+                self.resolve_adaptive(request, &mut response_handle, upstream_request, start)
                     .await
             }
             ForwardStrategy::Parallel => {
-                self.resolve_parallel(request, &mut response_handle, name, query_type, start)
+                self.resolve_parallel(request, &mut response_handle, upstream_request, start)
                     .await
             }
         }
@@ -356,11 +361,10 @@ impl ParallelForwarder {
         &self,
         request: &hickory_server::server::Request,
         response_handle: &mut impl ResponseHandler,
-        name: Name,
-        query_type: RecordType,
+        upstream_request: DnsRequest,
         start: Instant,
     ) -> Result<ResolveResult> {
-        let Some(resolver) = self.resolvers.first().cloned() else {
+        let Some(client) = self.clients.first().cloned() else {
             warn!("No upstream resolvers configured");
             return Ok(ResolveResult {
                 info: send_servfail(request, response_handle).await?,
@@ -369,33 +373,17 @@ impl ParallelForwarder {
             });
         };
 
-        match timeout(self.timeout, resolver.lookup(name, query_type)).await {
-            Ok(Ok(lookup)) => {
+        match timeout(self.timeout, client.query(upstream_request)).await {
+            Ok(Ok(response)) => {
                 let latency_us = start.elapsed().as_micros() as u64;
                 self.record_success(0, latency_us);
-                self.send_lookup_response(
-                    request,
-                    response_handle,
-                    0,
-                    query_type,
-                    &lookup,
-                    latency_us,
-                )
-                .await
+                self.send_upstream_response(request, response_handle, 0, response, latency_us)
+                    .await
             }
-            Ok(Err(e)) => {
-                let latency_us = start.elapsed().as_micros() as u64;
-                if is_dns_no_answer(&e) {
-                    self.record_success(0, latency_us);
-                } else {
-                    self.record_failure(0);
-                }
-                let (info, resolver) = build_error_response(request, response_handle, &e).await?;
-                Ok(ResolveResult {
-                    info,
-                    resolver,
-                    latency_us,
-                })
+            Ok(Err(error)) => {
+                self.record_failure(0);
+                self.send_upstream_failure(request, response_handle, error, start)
+                    .await
             }
             Err(_) => {
                 warn!("Upstream resolver timed out, sending SERVFAIL");
@@ -412,54 +400,39 @@ impl ParallelForwarder {
         &self,
         request: &hickory_server::server::Request,
         response_handle: &mut impl ResponseHandler,
-        name: Name,
-        query_type: RecordType,
+        upstream_request: DnsRequest,
         start: Instant,
     ) -> Result<ResolveResult> {
         let result = timeout(self.timeout, async {
             let mut last_err: Option<NetError> = None;
             let mut futs: FuturesUnordered<LookupFuture> = self
-                .resolvers
+                .clients
                 .iter()
                 .cloned()
                 .enumerate()
-                .map(|(idx, resolver)| lookup_future(idx, resolver, name.clone(), query_type))
+                .map(|(idx, client)| lookup_future(idx, client, upstream_request.clone()))
                 .collect();
 
             while let Some((idx, result)) = futs.next().await {
                 match result {
-                    Ok(lookup) => {
+                    Ok(response) => {
                         let latency_us = start.elapsed().as_micros() as u64;
                         self.record_success(idx, latency_us);
                         return self
-                            .send_lookup_response(
+                            .send_upstream_response(
                                 request,
                                 response_handle,
                                 idx,
-                                query_type,
-                                &lookup,
+                                response,
                                 latency_us,
                             )
                             .await
                             .map_err(ForwardAttemptError::Response);
                     }
-                    Err(e) => {
-                        debug!("Upstream resolver failed: {}", e);
-                        if is_dns_no_answer(&e) {
-                            let latency_us = start.elapsed().as_micros() as u64;
-                            self.record_success(idx, latency_us);
-                            let (info, resolver) =
-                                build_error_response(request, response_handle, &e)
-                                    .await
-                                    .map_err(ForwardAttemptError::Response)?;
-                            return Ok(ResolveResult {
-                                info,
-                                resolver,
-                                latency_us,
-                            });
-                        }
+                    Err(error) => {
+                        debug!("Upstream resolver failed: {}", error);
                         self.record_failure(idx);
-                        last_err = Some(e);
+                        last_err = Some(error);
                     }
                 }
             }
@@ -470,14 +443,8 @@ impl ParallelForwarder {
         match result {
             Ok(Ok(resolve_result)) => Ok(resolve_result),
             Ok(Err(ForwardAttemptError::Upstream(Some(last_err)))) => {
-                let latency_us = start.elapsed().as_micros() as u64;
-                let (info, resolver) =
-                    build_error_response(request, response_handle, &last_err).await?;
-                Ok(ResolveResult {
-                    info,
-                    resolver,
-                    latency_us,
-                })
+                self.send_upstream_failure(request, response_handle, last_err, start)
+                    .await
             }
             Ok(Err(ForwardAttemptError::Upstream(None))) => {
                 warn!("All upstream resolvers failed without a captured error");
@@ -503,8 +470,7 @@ impl ParallelForwarder {
         &self,
         request: &hickory_server::server::Request,
         response_handle: &mut impl ResponseHandler,
-        name: Name,
-        query_type: RecordType,
+        upstream_request: DnsRequest,
         start: Instant,
     ) -> Result<ResolveResult> {
         let order = self.adaptive_order();
@@ -528,8 +494,8 @@ impl ParallelForwarder {
             let launch = |idx: usize,
                           in_flight: &mut FuturesUnordered<LookupFuture>,
                           launched: &mut Vec<usize>| {
-                if let Some(resolver) = self.resolvers.get(idx).cloned() {
-                    in_flight.push(lookup_future(idx, resolver, name.clone(), query_type));
+                if let Some(client) = self.clients.get(idx).cloned() {
+                    in_flight.push(lookup_future(idx, client, upstream_request.clone()));
                     launched.push(idx);
                 }
             };
@@ -550,40 +516,25 @@ impl ParallelForwarder {
                 tokio::select! {
                     resolved = in_flight.next() => {
                         match resolved {
-                            Some((idx, Ok(lookup))) => {
+                            Some((idx, Ok(response))) => {
                                 let latency_us = start.elapsed().as_micros() as u64;
                                 self.record_success(idx, latency_us);
                                 self.record_hedged_misses(&launched, idx, latency_us);
                                 return self
-                                    .send_lookup_response(
+                                    .send_upstream_response(
                                         request,
                                         response_handle,
                                         idx,
-                                        query_type,
-                                        &lookup,
+                                        response,
                                         latency_us,
                                     )
                                     .await
                                     .map_err(ForwardAttemptError::Response);
                             }
-                            Some((idx, Err(e))) => {
-                                debug!("Upstream resolver failed: {}", e);
-                                if is_dns_no_answer(&e) {
-                                    let latency_us = start.elapsed().as_micros() as u64;
-                                    self.record_success(idx, latency_us);
-                                    let (info, resolver) =
-                                        build_error_response(request, response_handle, &e)
-                                            .await
-                                            .map_err(ForwardAttemptError::Response)?;
-                                    return Ok(ResolveResult {
-                                        info,
-                                        resolver,
-                                        latency_us,
-                                    });
-                                }
-
+                            Some((idx, Err(error))) => {
+                                debug!("Upstream resolver failed: {}", error);
                                 self.record_failure(idx);
-                                last_err = Some(e);
+                                last_err = Some(error);
                                 if in_flight.len() < max_parallel && next < order.len() {
                                     launch(order[next], &mut in_flight, &mut launched);
                                     next += 1;
@@ -606,14 +557,8 @@ impl ParallelForwarder {
         match result {
             Ok(Ok(resolve_result)) => Ok(resolve_result),
             Ok(Err(ForwardAttemptError::Upstream(Some(last_err)))) => {
-                let latency_us = start.elapsed().as_micros() as u64;
-                let (info, resolver) =
-                    build_error_response(request, response_handle, &last_err).await?;
-                Ok(ResolveResult {
-                    info,
-                    resolver,
-                    latency_us,
-                })
+                self.send_upstream_failure(request, response_handle, last_err, start)
+                    .await
             }
             Ok(Err(ForwardAttemptError::Upstream(None))) => {
                 warn!("All upstream resolvers failed without a captured error");
@@ -635,101 +580,114 @@ impl ParallelForwarder {
         }
     }
 
-    async fn send_lookup_response(
+    async fn send_upstream_response(
         &self,
         request: &hickory_server::server::Request,
         response_handle: &mut impl ResponseHandler,
         idx: usize,
-        query_type: RecordType,
-        lookup: &Lookup,
+        response: DnsResponse,
         latency_us: u64,
     ) -> Result<ResolveResult> {
-        let answers = extract_answers(query_type, lookup);
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let mut metadata = Metadata::response_from_request(&request.metadata);
-        metadata.response_code = ResponseCode::NoError;
-        let response = builder.build(metadata, answers.iter(), [].iter(), [].iter(), [].iter());
+        let resolver = response_label(&response, self.addresses.get(idx));
+        let message = downstream_message(
+            response.into_message(),
+            request.metadata.id,
+            request.edns.as_ref(),
+        );
+        let mut builder = MessageResponseBuilder::from_message_request(request);
+        if let Some(edns) = &message.edns {
+            builder.edns(edns);
+        }
+        let response = builder.build(
+            message.metadata,
+            message.answers.iter(),
+            message.authorities.iter(),
+            [].iter(),
+            message.additionals.iter(),
+        );
         let info = response_handle.send_response(response).await?;
-        let resolver = self
-            .addresses
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
         Ok(ResolveResult {
             info,
             resolver,
             latency_us,
         })
     }
-}
 
-fn extract_answers(
-    query_type: RecordType,
-    lookup: &hickory_resolver::lookup::Lookup,
-) -> Vec<Record> {
-    let mut answers = Vec::new();
-    for record in lookup.answers() {
-        match query_type {
-            RecordType::A | RecordType::AAAA => {
-                // Preserve CNAME records so clients can follow the alias
-                // chain (e.g. click.redditmail.com -> CNAME thirdparty.bnc.lt
-                // -> A 52.11.118.109). Dropping the CNAME leaves a bare A
-                // answer whose name does not match the query name, which
-                // stub resolvers reject.
-                match record.data {
-                    RData::A(_) | RData::AAAA(_) | RData::CNAME(_) => {
-                        answers.push(Record::from_rdata(
-                            record.name.clone(),
-                            record.ttl,
-                            record.data.clone(),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            _ => {
-                // Non-address query types: pass through matching records.
-                if record.record_type() == query_type {
-                    answers.push(Record::from_rdata(
-                        record.name.clone(),
-                        record.ttl,
-                        record.data.clone(),
-                    ));
-                }
-            }
-        }
+    async fn send_upstream_failure(
+        &self,
+        request: &hickory_server::server::Request,
+        response_handle: &mut impl ResponseHandler,
+        error: NetError,
+        start: Instant,
+    ) -> Result<ResolveResult> {
+        let label = classify_upstream_failure(&error);
+        warn!("Upstream {}: {}; returning SERVFAIL", label, error);
+        Ok(ResolveResult {
+            info: send_servfail(request, response_handle).await?,
+            resolver: label.to_string(),
+            latency_us: start.elapsed().as_micros() as u64,
+        })
     }
-    answers
 }
 
-/// Classify an upstream failure into downstream DNS response and log label.
-///
-/// DNS responses retain their upstream response code. Failures without a DNS
-/// response become SERVFAIL and expose their actual failure class.
-fn classify_upstream_error(err: &NetError) -> (ResponseCode, &'static str) {
-    match err {
-        NetError::Dns(DnsError::NoRecordsFound(no_records)) => match no_records.response_code {
-            ResponseCode::NXDomain => (ResponseCode::NXDomain, "nxdomain"),
-            ResponseCode::NoError => (ResponseCode::NoError, "nodata"),
-            code => (code, response_code_label(code)),
-        },
-        NetError::Dns(DnsError::ResponseCode(code)) => (*code, response_code_label(*code)),
-        NetError::Timeout => (ResponseCode::ServFail, "timeout"),
+fn downstream_message(
+    mut message: Message,
+    request_id: u16,
+    client_edns: Option<&hickory_proto::op::Edns>,
+) -> Message {
+    message.metadata.id = request_id;
+    if let (Some(client_edns), Some(upstream_edns)) = (client_edns, &mut message.edns) {
+        upstream_edns.set_max_payload(upstream_edns.max_payload().min(client_edns.max_payload()));
+    } else if client_edns.is_none() {
+        message.edns = None;
+    }
+    message
+}
+
+fn upstream_request(
+    metadata: hickory_proto::op::Metadata,
+    query: hickory_proto::op::Query,
+    edns: Option<hickory_proto::op::Edns>,
+) -> DnsRequest {
+    let mut message = Message::query();
+    message.metadata = metadata;
+    message.queries.push(query);
+    message.edns = edns;
+
+    let mut options = DnsRequestOptions::default();
+    options.use_edns = message.edns.is_some();
+    options.edns_payload_len = message.max_payload();
+    options.edns_set_dnssec_ok = message
+        .edns
+        .as_ref()
+        .is_some_and(|edns| edns.flags().dnssec_ok);
+    options.recursion_desired = message.metadata.recursion_desired;
+    DnsRequest::new(message, options)
+}
+fn response_label(response: &DnsResponse, address: Option<&String>) -> String {
+    match response.metadata.response_code {
+        ResponseCode::NoError if response.answers.is_empty() => "nodata".to_string(),
+        ResponseCode::NoError => address.cloned().unwrap_or_else(|| "unknown".to_string()),
+        code => response_code_label(code).to_string(),
+    }
+}
+
+fn classify_upstream_failure(error: &NetError) -> &'static str {
+    match error {
+        NetError::Timeout => "timeout",
         NetError::Io(io)
             if matches!(
                 io.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
             ) =>
         {
-            (ResponseCode::ServFail, "timeout")
+            "timeout"
         }
-        NetError::Io(_) | NetError::NoConnections | NetError::Busy => {
-            (ResponseCode::ServFail, "transport_error")
-        }
+        NetError::Io(_) | NetError::NoConnections | NetError::Busy => "transport_error",
         NetError::Proto(_) | NetError::QueryCaseMismatch | NetError::ParseInt(_) => {
-            (ResponseCode::ServFail, "protocol_error")
+            "protocol_error"
         }
-        _ => (ResponseCode::ServFail, "upstream_error"),
+        _ => "upstream_error",
     }
 }
 
@@ -759,64 +717,6 @@ fn response_code_label(code: ResponseCode) -> &'static str {
     }
 }
 
-fn is_dns_no_answer(err: &NetError) -> bool {
-    matches!(err, NetError::Dns(DnsError::NoRecordsFound(_)))
-}
-
-/// Build a response for an upstream DNS response or failure.
-async fn build_error_response(
-    request: &hickory_server::server::Request,
-    response_handle: &mut impl hickory_server::server::ResponseHandler,
-    err: &NetError,
-) -> Result<(ResponseInfo, String)> {
-    let (rcode, label) = classify_upstream_error(err);
-    if let NetError::Dns(DnsError::NoRecordsFound(no_records)) = err {
-        // Preserve authority data needed for downstream NODATA/NXDOMAIN caching.
-        let ttl = no_records.negative_ttl.unwrap_or(0);
-        let soa_records: Vec<Record> = no_records
-            .soa
-            .as_ref()
-            .map(|soa| {
-                Record::from_rdata(
-                    soa.name.clone(),
-                    ttl.max(soa.ttl),
-                    soa.data.clone().into_rdata(),
-                )
-            })
-            .into_iter()
-            .collect();
-        let auth_records: Vec<Record> = no_records
-            .authorities
-            .as_ref()
-            .map(|a| a.iter().cloned().collect())
-            .unwrap_or_default();
-
-        debug!(
-            "Forwarding {} response ({}) for {} (ttl={})",
-            rcode, label, no_records.query, ttl,
-        );
-
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let mut metadata = Metadata::response_from_request(&request.metadata);
-        metadata.response_code = rcode;
-        let response = builder.build(
-            metadata,
-            [].iter(),
-            auth_records.iter(),
-            soa_records.iter(),
-            [].iter(),
-        );
-        let info = response_handle.send_response(response).await?;
-        Ok((info, label.to_string()))
-    } else {
-        warn!("Upstream {}: {}; returning {}", label, err, rcode);
-        let builder = MessageResponseBuilder::from_message_request(request);
-        let response = builder.error_msg(&request.metadata, rcode);
-        let info = response_handle.send_response(response).await?;
-        Ok((info, label.to_string()))
-    }
-}
-
 async fn send_servfail(
     request: &hickory_server::server::Request,
     response_handle: &mut impl hickory_server::server::ResponseHandler,
@@ -830,154 +730,157 @@ async fn send_servfail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_net::NoRecords;
-    use hickory_proto::op::Query;
-    use hickory_proto::rr::rdata::{A, CNAME};
-    use hickory_proto::rr::{Name, RData};
-    use hickory_resolver::lookup::Lookup;
-    use std::net::Ipv4Addr;
+    use hickory_proto::op::{Edns, MessageType, Metadata, Query};
+    use hickory_proto::rr::rdata::{A, CNAME, SOA};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     fn record(name: &str, ttl: u32, data: RData) -> Record {
         Record::from_rdata(Name::from_ascii(format!("{}.", name)).unwrap(), ttl, data)
     }
 
-    #[test]
-    fn default_cache_size_is_bounded_per_upstream() {
-        // Finding 6: N upstreams each hold DEFAULT_CACHE_SIZE entries.
-        // Keep this well below the old 256K floor and above hickory's 8K default.
-        assert_eq!(ParallelForwarder::DEFAULT_CACHE_SIZE, 32_768);
-        const {
-            assert!(ParallelForwarder::DEFAULT_CACHE_SIZE < 256_000);
-            assert!(ParallelForwarder::DEFAULT_CACHE_SIZE >= 8_192);
-        }
+    fn request_metadata(checking_disabled: bool) -> Metadata {
+        let mut metadata = Metadata::new(7, MessageType::Query, hickory_proto::op::OpCode::Query);
+        metadata.recursion_desired = true;
+        metadata.checking_disabled = checking_disabled;
+        metadata
     }
 
-    /// Regression: an A query for a CNAME-chained domain (e.g.
-    /// click.redditmail.com -> CNAME thirdparty.bnc.lt -> A 52.11.118.109)
-    /// must keep the CNAME record in the answer so stub resolvers can link
-    /// the A answer back to the queried name.
     #[test]
-    fn extract_answers_preserves_cname_chain_for_a_query() {
-        let query = Query::query(
-            Name::from_ascii("click.redditmail.com.").unwrap(),
-            RecordType::A,
-        );
-        let answers = vec![
-            record(
-                "click.redditmail.com",
-                300,
-                RData::CNAME(CNAME(Name::from_ascii("thirdparty.bnc.lt.").unwrap())),
-            ),
-            record(
-                "thirdparty.bnc.lt",
-                60,
-                RData::A(A::from(Ipv4Addr::new(52, 11, 118, 109))),
-            ),
-        ];
-        let lookup = Lookup::new_with_max_ttl(query, answers);
+    fn upstream_request_preserves_query_metadata_and_edns() {
+        let query = Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::AAAA);
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232).set_dnssec_ok(true);
+        let metadata = request_metadata(true);
 
-        let extracted = extract_answers(RecordType::A, &lookup);
+        let forwarded = upstream_request(metadata, query.clone(), Some(edns.clone()));
 
-        // Both the CNAME and the A record must survive.
-        assert_eq!(
-            extracted.len(),
-            2,
-            "CNAME record was dropped from answer chain"
-        );
-        assert!(extracted.iter().any(|r| matches!(r.data, RData::CNAME(_))));
-        assert!(extracted.iter().any(|r| matches!(r.data, RData::A(_))));
+        assert_eq!(forwarded.queries, vec![query]);
+        assert!(forwarded.metadata.recursion_desired);
+        assert!(forwarded.metadata.checking_disabled);
+        assert_eq!(forwarded.edns, Some(edns));
+        assert!(forwarded.options().use_edns);
+        assert_eq!(forwarded.options().edns_payload_len, 1232);
+        assert!(forwarded.options().edns_set_dnssec_ok);
     }
 
-    /// A plain A query (no CNAME) must still return only the A record.
     #[test]
-    fn extract_answers_returns_a_record_without_cname() {
-        let query = Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::A);
-        let answers = vec![record(
+    fn downstream_message_preserves_sections_flags_and_edns_limit() {
+        let query = Query::query(Name::from_ascii("www.example.com.").unwrap(), RecordType::A);
+        let mut message = Message::response(99, hickory_proto::op::OpCode::Query);
+        message.metadata.authoritative = true;
+        message.metadata.recursion_available = true;
+        message.metadata.authentic_data = true;
+        message.metadata.checking_disabled = true;
+        message.queries.push(query);
+        message.answers.push(record(
+            "www.example.com",
+            300,
+            RData::CNAME(CNAME(Name::from_ascii("example.com.").unwrap())),
+        ));
+        message.answers.push(record(
             "example.com",
             60,
             RData::A(A::from(Ipv4Addr::new(93, 184, 216, 34))),
-        )];
-        let lookup = Lookup::new_with_max_ttl(query, answers);
+        ));
+        message.authorities.push(record(
+            "example.com",
+            60,
+            RData::SOA(SOA::new(
+                Name::from_ascii("ns.example.com.").unwrap(),
+                Name::from_ascii("hostmaster.example.com.").unwrap(),
+                1,
+                3600,
+                600,
+                86400,
+                60,
+            )),
+        ));
+        message.additionals.push(record(
+            "ns.example.com",
+            60,
+            RData::AAAA(hickory_proto::rr::rdata::AAAA::from(Ipv6Addr::LOCALHOST)),
+        ));
+        let mut upstream_edns = Edns::new();
+        upstream_edns.set_max_payload(4096).set_dnssec_ok(true);
+        message.edns = Some(upstream_edns);
+        let expected = message.clone();
+        let mut client_edns = Edns::new();
+        client_edns.set_max_payload(1232);
 
-        let extracted = extract_answers(RecordType::A, &lookup);
-        assert_eq!(extracted.len(), 1);
-        assert!(matches!(extracted[0].data, RData::A(_)));
-    }
+        let response = downstream_message(message, 7, Some(&client_edns));
 
-    // --- classify_upstream_error: exact DNS responses and failure classes ---
-
-    fn no_records_query(name: &str) -> Box<Query> {
-        Query::query(
-            Name::from_ascii(format!("{}.", name)).unwrap(),
-            RecordType::AAAA,
-        )
-        .into()
-    }
-
-    /// NODATA: a domain exists but has no record of the queried type (e.g.
-    /// github.com AAAA). Upstream returns NOERROR with 0 answers; this must
-    /// be forwarded as NOERROR, not masked as SERVFAIL.
-    #[test]
-    fn classify_nodata_returns_noerror() {
-        let nr = NoRecords::new(no_records_query("github.com"), ResponseCode::NoError);
-        let err: NetError = DnsError::NoRecordsFound(nr).into();
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::NoError);
-        assert_eq!(label, "nodata");
-    }
-
-    /// NXDomain: the domain does not exist. Must be forwarded as NXDOMAIN,
-    /// not SERVFAIL.
-    #[test]
-    fn classify_nxdomain_returns_nxdomain() {
-        let nr = NoRecords::new(
-            no_records_query("nonexistent.invalid"),
-            ResponseCode::NXDomain,
+        assert_eq!(response.metadata.id, 7);
+        assert_eq!(
+            response.metadata.authoritative,
+            expected.metadata.authoritative
         );
-        let err: NetError = DnsError::NoRecordsFound(nr).into();
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::NXDomain);
-        assert_eq!(label, "nxdomain");
-    }
-
-    /// Transport failures become SERVFAIL without hiding failure class.
-    #[test]
-    fn classify_transport_error_returns_servfail() {
-        let err: NetError = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::ServFail);
-        assert_eq!(label, "transport_error");
-    }
-
-    #[test]
-    fn classify_timeout_returns_servfail() {
-        let (rcode, label) = classify_upstream_error(&NetError::Timeout);
-        assert_eq!(rcode, ResponseCode::ServFail);
-        assert_eq!(label, "timeout");
-    }
-
-    #[test]
-    fn classify_io_timeout_returns_timeout() {
-        let err: NetError = std::io::Error::from(std::io::ErrorKind::TimedOut).into();
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::ServFail);
-        assert_eq!(label, "timeout");
+        assert_eq!(
+            response.metadata.recursion_available,
+            expected.metadata.recursion_available
+        );
+        assert_eq!(
+            response.metadata.authentic_data,
+            expected.metadata.authentic_data
+        );
+        assert_eq!(
+            response.metadata.checking_disabled,
+            expected.metadata.checking_disabled
+        );
+        assert_eq!(response.answers, expected.answers);
+        assert_eq!(response.authorities, expected.authorities);
+        assert_eq!(response.additionals, expected.additionals);
+        assert_eq!(response.edns.as_ref().map(Edns::max_payload), Some(1232));
+        assert!(
+            response
+                .edns
+                .as_ref()
+                .is_some_and(|edns| edns.flags().dnssec_ok)
+        );
     }
 
     #[test]
-    fn classify_protocol_error_returns_servfail() {
-        let err = NetError::Proto("malformed response".into());
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::ServFail);
-        assert_eq!(label, "protocol_error");
+    fn downstream_message_omits_opt_for_non_edns_client() {
+        let mut message = Message::response(99, hickory_proto::op::OpCode::Query);
+        message.edns = Some(Edns::new());
+
+        let response = downstream_message(message, 7, None);
+
+        assert!(response.edns.is_none());
     }
 
     #[test]
-    fn classify_dns_error_preserves_response_code() {
-        let err: NetError = DnsError::ResponseCode(ResponseCode::Refused).into();
-        let (rcode, label) = classify_upstream_error(&err);
-        assert_eq!(rcode, ResponseCode::Refused);
-        assert_eq!(label, "refused");
+    fn response_labels_dns_outcomes_without_hiding_upstream_address() {
+        let mut positive = Message::response(1, hickory_proto::op::OpCode::Query);
+        positive.answers.push(record(
+            "example.com",
+            60,
+            RData::A(A::from(Ipv4Addr::new(93, 184, 216, 34))),
+        ));
+        let positive = DnsResponse::from_message(positive).unwrap();
+        assert_eq!(
+            response_label(&positive, Some(&"127.0.0.1:5300".to_string())),
+            "127.0.0.1:5300"
+        );
+
+        let nodata =
+            DnsResponse::from_message(Message::response(1, hickory_proto::op::OpCode::Query))
+                .unwrap();
+        assert_eq!(response_label(&nodata, None), "nodata");
+
+        let mut nxdomain = Message::response(1, hickory_proto::op::OpCode::Query);
+        nxdomain.metadata.response_code = ResponseCode::NXDomain;
+        let nxdomain = DnsResponse::from_message(nxdomain).unwrap();
+        assert_eq!(response_label(&nxdomain, None), "nxdomain");
+    }
+
+    #[test]
+    fn classify_upstream_failures() {
+        assert_eq!(classify_upstream_failure(&NetError::Timeout), "timeout");
+        let io: NetError = std::io::Error::from(std::io::ErrorKind::ConnectionReset).into();
+        assert_eq!(classify_upstream_failure(&io), "transport_error");
+        let protocol = NetError::Proto("malformed response".into());
+        assert_eq!(classify_upstream_failure(&protocol), "protocol_error");
     }
 
     #[test]
@@ -993,8 +896,8 @@ mod tests {
         assert!("sequential".parse::<ForwardStrategy>().is_err());
     }
 
-    #[test]
-    fn forwarder_defaults_to_adaptive_strategy() {
+    #[tokio::test]
+    async fn forwarder_defaults_to_adaptive_strategy() {
         let forwarder = ParallelForwarder::new(
             &[UpstreamConfig {
                 address: "1.1.1.1".to_string(),
@@ -1003,7 +906,6 @@ mod tests {
             5,
         )
         .expect("forwarder construction");
-
         assert_eq!(forwarder.strategy(), ForwardStrategy::Adaptive);
         assert_eq!(forwarder.hedge_delay_ms(), DEFAULT_HEDGE_DELAY_MS);
 
@@ -1020,8 +922,8 @@ mod tests {
         assert_eq!(custom.hedge_delay_ms(), 25);
     }
 
-    #[test]
-    fn adaptive_order_penalizes_failing_upstreams() {
+    #[tokio::test]
+    async fn adaptive_order_penalizes_failing_upstreams() {
         let forwarder = ParallelForwarder::new(
             &[
                 UpstreamConfig {

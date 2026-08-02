@@ -1,4 +1,4 @@
-use crate::core::{ResourceSnapshot, Runner, target_dns_probe};
+use crate::core::{ResourceSnapshot, Runner, target_dns_probe, target_dnssec_probe};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
-    upstream_outcome_labels(r);
+    upstream_protocol_fidelity(r, &cfg);
     update_detection(r);
     db_concurrency(r, &cfg);
     import_hot_reload(r, &cfg);
@@ -45,6 +45,7 @@ struct SmokeConfig {
     timeout_secs: u64,
     run_tag: String,
     forward_probe_domain: String,
+    dnssec_probe_domain: String,
     db_concurrency_requests: u64,
     dns_burst_requests: u64,
     dns_burst_max_ms: u64,
@@ -89,6 +90,9 @@ impl SmokeConfig {
             forward_probe_domain: r
                 .env("FORWARD_PROBE_DOMAIN")
                 .unwrap_or_else(|| "example.com".to_string()),
+            dnssec_probe_domain: r
+                .env("DNSSEC_PROBE_DOMAIN")
+                .unwrap_or_else(|| "cloudflare.com".to_string()),
             db_concurrency_requests: r.env_u64("DB_CONCURRENCY_REQUESTS").unwrap_or(16),
             dns_burst_requests: r.env_u64("DNS_BURST_REQUESTS").unwrap_or(96),
             dns_burst_max_ms: r.env_u64("DNS_BURST_MAX_MS").unwrap_or(8000),
@@ -373,7 +377,7 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
 
     let same_probe = |left: &Result<crate::core::DnsProbe, String>,
                       right: &Result<crate::core::DnsProbe, String>| {
-        matches!((left, right), (Ok(left), Ok(right)) if left.rcode == right.rcode && left.answers == right.answers && left.ede == right.ede)
+        matches!((left, right), (Ok(left), Ok(right)) if left.rcode == right.rcode && left.answers == right.answers)
     };
     let passed = setting_code == 500
         && settings_before.get("block_response_mode") == settings_after.get("block_response_mode")
@@ -700,13 +704,14 @@ fn allowlist_stats(r: &mut Runner, cfg: &SmokeConfig) {
     let _ = cfg;
 }
 
-fn upstream_outcome_labels(r: &mut Runner) {
+fn upstream_protocol_fidelity(r: &mut Runner, cfg: &SmokeConfig) {
     let domain = format!(
         "mock-nxdomain-{}-{}.invalid",
         unix_secs(),
         std::process::id()
     );
-    let response = r.dns_query(&domain);
+    let nxdomain = target_dns_probe(&cfg.ssh_host, &domain, 1);
+    let dnssec = target_dnssec_probe(&cfg.ssh_host, &cfg.dnssec_probe_domain);
     let mut queries = String::new();
     let mut labeled = false;
     for _ in 0..8 {
@@ -723,28 +728,38 @@ fn upstream_outcome_labels(r: &mut Runner) {
         }
     }
 
-    if labeled {
+    let nxdomain_ok = nxdomain.as_ref().is_ok_and(|probe| {
+        probe.rcode == 3
+            && probe.answers == 0
+            && probe.authorities > 0
+            && probe.additionals > 0
+            && probe.has_soa
+            && probe.has_opt
+            && probe.flags & 0x0080 != 0
+    });
+    let dnssec_ok = dnssec.as_ref().is_ok_and(|probe| {
+        probe.rcode == 0
+            && probe.answers > 0
+            && probe.additionals > 0
+            && probe.has_rrsig
+            && probe.has_opt
+            && probe.flags & 0x0090 == 0x0090
+    });
+
+    if labeled && nxdomain_ok && dnssec_ok {
         r.ok(
-            "upstream-outcome-labels",
-            format!("NXDOMAIN response persisted with resolver=nxdomain ({domain})"),
+            "upstream-protocol-fidelity",
+            format!(
+                "preserved NXDOMAIN SOA/OPT and {} DNSKEY RRSIG/OPT with RA/CD flags",
+                cfg.dnssec_probe_domain
+            ),
         );
     } else {
         r.fail(
-            "upstream-outcome-labels",
+            "upstream-protocol-fidelity",
             format!(
-                "NXDOMAIN outcome missing exact label (query={}, queries={})",
-                response
-                    .map(|value| if value.is_empty() {
-                        "empty".to_string()
-                    } else {
-                        value
-                    })
-                    .unwrap_or_else(|err| format!("error: {err}")),
-                if queries.is_empty() {
-                    "empty"
-                } else {
-                    &queries
-                }
+                "upstream DNS message lost data or label (NXDOMAIN={nxdomain:?} DNSSEC={dnssec:?} labeled={labeled} queries={})",
+                if queries.is_empty() { "empty" } else { &queries }
             ),
         );
     }

@@ -40,7 +40,13 @@ pub struct ResourceSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub struct DnsProbe {
     pub rcode: u8,
+    pub flags: u16,
     pub answers: u16,
+    pub authorities: u16,
+    pub additionals: u16,
+    pub has_soa: bool,
+    pub has_rrsig: bool,
+    pub has_opt: bool,
     pub ede: Option<u16>,
 }
 
@@ -907,18 +913,17 @@ impl Runner {
     fn version(&mut self) -> Result<(), String> {
         let version = self.curl_json("GET", "/api/version", None)?;
         let build = json_string(&version, "build").unwrap_or_default();
-        let cache_size = json_u64(&version, "resolver_cache_size").unwrap_or(0);
         let dns_max = json_u64(&version, "dns_max_in_flight").unwrap_or(0);
         let hedge = json_u64(&version, "adaptive_hedge_delay_ms").unwrap_or(0);
         let version_ok = if self.config.skip_build || self.config.skip_deploy {
-            !build.is_empty() && cache_size > 0 && dns_max > 0 && hedge > 0
+            !build.is_empty() && dns_max > 0 && hedge > 0
         } else {
-            cache_size == 32768 && dns_max == 512 && hedge == 75
+            dns_max == 512 && hedge == 75
         };
         if version_ok {
-            self.ok("version", format!("deployed build id is {build} resolver_cache_size={cache_size} dns_max_in_flight={dns_max} adaptive_hedge_delay_ms={hedge}"));
+            self.ok("version", format!("deployed build id is {build} dns_max_in_flight={dns_max} adaptive_hedge_delay_ms={hedge}"));
         } else {
-            self.fail("version", format!("unexpected version payload build='{}' cache='{cache_size}' dns_max='{dns_max}' hedge='{hedge}' (expected cache=32768 dns_max=512 hedge=75; response: {version})", empty(&build)));
+            self.fail("version", format!("unexpected version payload build='{}' dns_max='{dns_max}' hedge='{hedge}' (expected dns_max=512 hedge=75; response: {version})", empty(&build)));
         }
         Ok(())
     }
@@ -1500,11 +1505,27 @@ pub(crate) fn target_dns_probe_port(
     udp_dns_probe(host, port, domain, query_type, Duration::from_secs(2))
 }
 
+pub(crate) fn target_dnssec_probe(host: &str, domain: &str) -> Result<DnsProbe, String> {
+    udp_dns_probe_options(host, 53, domain, 48, 0x0110, 0x8000, Duration::from_secs(2))
+}
+
 fn udp_dns_probe(
     host: &str,
     port: u16,
     domain: &str,
     query_type: u16,
+    timeout: Duration,
+) -> Result<DnsProbe, String> {
+    udp_dns_probe_options(host, port, domain, query_type, 0x0100, 0, timeout)
+}
+
+fn udp_dns_probe_options(
+    host: &str,
+    port: u16,
+    domain: &str,
+    query_type: u16,
+    request_flags: u16,
+    edns_flags: u16,
     timeout: Duration,
 ) -> Result<DnsProbe, String> {
     if host.is_empty() || domain.is_empty() {
@@ -1520,7 +1541,7 @@ fn udp_dns_probe(
 
     let mut packet = Vec::with_capacity(512);
     packet.extend_from_slice(&0x5243_u16.to_be_bytes());
-    packet.extend_from_slice(&0x0100_u16.to_be_bytes());
+    packet.extend_from_slice(&request_flags.to_be_bytes());
     packet.extend_from_slice(&1_u16.to_be_bytes());
     packet.extend_from_slice(&0_u16.to_be_bytes());
     packet.extend_from_slice(&0_u16.to_be_bytes());
@@ -1531,7 +1552,7 @@ fn udp_dns_probe(
     packet.push(0);
     packet.extend_from_slice(&41_u16.to_be_bytes());
     packet.extend_from_slice(&1232_u16.to_be_bytes());
-    packet.extend_from_slice(&0_u32.to_be_bytes());
+    packet.extend_from_slice(&(edns_flags as u32).to_be_bytes());
     packet.extend_from_slice(&0_u16.to_be_bytes());
 
     socket
@@ -1561,10 +1582,11 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
     if buf.len() < 12 {
         return Err("short dns response".to_string());
     }
+    let flags = u16::from_be_bytes([buf[2], buf[3]]);
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let ancount = u16::from_be_bytes([buf[6], buf[7]]);
-    let nscount = u16::from_be_bytes([buf[8], buf[9]]) as usize;
-    let arcount = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+    let nscount = u16::from_be_bytes([buf[8], buf[9]]);
+    let arcount = u16::from_be_bytes([buf[10], buf[11]]);
     let mut offset = 12;
     for _ in 0..qdcount {
         skip_dns_name(buf, &mut offset)?;
@@ -1575,7 +1597,10 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
     }
 
     let mut ede = None;
-    for index in 0..(ancount as usize + nscount + arcount) {
+    let mut has_soa = false;
+    let mut has_rrsig = false;
+    let mut has_opt = false;
+    for index in 0..(ancount as usize + nscount as usize + arcount as usize) {
         skip_dns_name(buf, &mut offset)?;
         if offset + 10 > buf.len() {
             return Err("truncated dns record".to_string());
@@ -1587,7 +1612,10 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
             .checked_add(rdlen)
             .filter(|value| *value <= buf.len())
             .ok_or_else(|| "truncated dns rdata".to_string())?;
-        if index >= ancount as usize + nscount && rr_type == 41 {
+        has_soa |= rr_type == 6;
+        has_rrsig |= rr_type == 46;
+        if index >= ancount as usize + nscount as usize && rr_type == 41 {
+            has_opt = true;
             let mut option_offset = offset;
             while option_offset + 4 <= end {
                 let code = u16::from_be_bytes([buf[option_offset], buf[option_offset + 1]]);
@@ -1610,8 +1638,14 @@ fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
     }
 
     Ok(DnsProbe {
-        rcode: buf[3] & 0x0f,
+        rcode: (flags & 0x000f) as u8,
+        flags,
         answers: ancount,
+        authorities: nscount,
+        additionals: arcount,
+        has_soa,
+        has_rrsig,
+        has_opt,
         ede,
     })
 }

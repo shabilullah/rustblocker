@@ -30,6 +30,9 @@ DNS_BURST_MAX_FAILURES=0
 
 # Domain used to prove parallel/adaptive upstream forwarding both resolve.
 FORWARD_PROBE_DOMAIN=example.com
+# DNSSEC-signed zone used to prove DNSKEY/RRSIG and EDNS forwarding.
+DNSSEC_PROBE_DOMAIN=cloudflare.com
+
 
 # Number of background DNS probes used while API hot-reload changes are applied.
 HOT_RELOAD_DNS_REQUESTS=60
