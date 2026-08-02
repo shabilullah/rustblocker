@@ -29,6 +29,24 @@ pub struct UpdateInfo {
 pub async fn check_for_update() -> Result<Option<UpdateInfo>> {
     let feed = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        // GitHub can refuse idle HTTP/2 streams; update checks are tiny and infrequent.
+        .http1_only()
+        .retry(
+            reqwest::retry::for_host("github.com")
+                .no_budget()
+                .max_retries_per_request(2)
+                .classify_fn(|attempt| {
+                    if attempt.error().is_some()
+                        || attempt
+                            .status()
+                            .is_some_and(|status| status.is_server_error())
+                    {
+                        attempt.retryable()
+                    } else {
+                        attempt.success()
+                    }
+                }),
+        )
         .user_agent(concat!("rustblocker/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build update HTTP client")?
