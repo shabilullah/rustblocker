@@ -754,6 +754,24 @@ async fn update_setting(
         }));
     }
 
+    let parsed_acl = if body.key == "allowed_networks" {
+        match crate::acl::Acl::parse(&body.value) {
+            Ok(parsed) => Some(parsed),
+            Err(error) => {
+                activity_log.warning(
+                    "settings",
+                    "Save Settings",
+                    &format!("Invalid allowed_networks: {error}"),
+                );
+                return HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": error.to_string()
+                }));
+            }
+        }
+    } else {
+        None
+    };
+
     if let Err(e) = db::set_setting(&pool, &body.key, &body.value) {
         tracing::warn!("db set_setting failed: {e}");
     }
@@ -797,8 +815,7 @@ async fn update_setting(
             }
         }
         "allowed_networks" => {
-            let mut acl_guard = acl.write();
-            *acl_guard = crate::acl::Acl::parse(&body.value);
+            *acl.write() = parsed_acl.expect("allowed_networks parsed before persistence");
             tracing::info!("ACL reloaded: {}", body.value);
         }
         _ => {}
@@ -1984,7 +2001,7 @@ mod tests {
         ));
         let pool = crate::db::create_pool(&db_path).unwrap();
         crate::db::seed_defaults(&pool).unwrap();
-        let acl = Arc::new(RwLock::new(Acl::parse("127.0.0.0/8")));
+        let acl = Arc::new(RwLock::new(Acl::parse("127.0.0.0/8").unwrap()));
         let app = actix_web::test::init_service(
             actix_web::App::new()
                 .app_data(actix_web::web::Data::new(pool.clone()))

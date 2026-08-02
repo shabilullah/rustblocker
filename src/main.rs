@@ -245,7 +245,7 @@ async fn run_server(cli: Cli) -> Result<()> {
 
     // Load ACL from database
     let allowed_networks = get_setting_string(&pool, "allowed_networks");
-    let shared_acl = acl::load_acl_from_db(&pool);
+    let shared_acl = acl::load_acl_from_db(&pool).context("Invalid allowed_networks setting")?;
     if !allowed_networks.is_empty() {
         info!("ACL enabled: {}", allowed_networks);
     }

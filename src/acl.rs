@@ -1,9 +1,10 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use ipnet::IpNet;
 use parking_lot::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Access control list based on CIDR networks.
 /// Empty list means allow all.
@@ -12,33 +13,41 @@ pub struct Acl {
     networks: Vec<IpNet>,
 }
 
-impl Acl {
-    /// Parse a comma-separated list of CIDRs. Empty string means allow all.
-    pub fn parse(cidr_list: &str) -> Self {
-        let networks: Vec<IpNet> = cidr_list
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| match s.parse::<IpNet>() {
-                Ok(net) => Some(net),
-                Err(e) => {
-                    warn!("Invalid CIDR '{}': {}", s, e);
-                    None
-                }
-            })
-            .collect();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclParseError {
+    cidr: String,
+}
 
-        if networks.is_empty() {
+impl fmt::Display for AclParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid CIDR: {}", self.cidr)
+    }
+}
+
+impl std::error::Error for AclParseError {}
+
+impl Acl {
+    /// Parse a comma-separated list of CIDRs. Empty input means allow all.
+    pub fn parse(cidr_list: &str) -> Result<Self, AclParseError> {
+        if cidr_list.trim().is_empty() {
             info!("ACL: no networks configured, allowing all");
-        } else {
-            info!(
-                "ACL: restricting to {} network(s): {:?}",
-                networks.len(),
-                networks
-            );
+            return Ok(Self::default());
         }
 
-        Self { networks }
+        let mut networks = Vec::new();
+        for cidr in cidr_list.split(',').map(str::trim) {
+            let network = cidr.parse::<IpNet>().map_err(|_| AclParseError {
+                cidr: cidr.to_string(),
+            })?;
+            networks.push(network);
+        }
+
+        info!(
+            "ACL: restricting to {} network(s): {:?}",
+            networks.len(),
+            networks
+        );
+        Ok(Self { networks })
     }
 
     /// Check if an IP address is allowed.
@@ -49,23 +58,35 @@ impl Acl {
         }
         self.networks.iter().any(|net| net.contains(&addr))
     }
-
-    /// Replace the ACL with a new CIDR list (for hot-reload).
-    pub fn replace(&mut self, cidr_list: &str) {
-        let new_acl = Self::parse(cidr_list);
-        self.networks = new_acl.networks;
-    }
 }
 
 /// Shared ACL state for both DNS handler and web server.
 pub type SharedAcl = Arc<RwLock<Acl>>;
 
 /// Load ACL from the `allowed_networks` setting in the database.
-pub fn load_acl_from_db(pool: &crate::db::DbPool) -> SharedAcl {
+pub fn load_acl_from_db(pool: &crate::db::DbPool) -> Result<SharedAcl, AclParseError> {
     let settings = crate::db::get_settings(pool).unwrap_or_default();
     let cidr_list = settings
         .get("allowed_networks")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    Arc::new(RwLock::new(Acl::parse(cidr_list)))
+    Ok(Arc::new(RwLock::new(Acl::parse(cidr_list)?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Acl;
+    use std::net::IpAddr;
+
+    #[test]
+    fn empty_input_explicitly_allows_all() {
+        let acl = Acl::parse("  ").unwrap();
+        assert!(acl.is_allowed("192.0.2.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn invalid_entry_rejects_entire_acl() {
+        assert!(Acl::parse("192.168.1.0/24,192.168.1.0/33").is_err());
+        assert!(Acl::parse(",").is_err());
+    }
 }

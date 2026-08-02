@@ -229,6 +229,7 @@ impl Runner {
         self.login()?;
         self.auth_login_throttle()?;
         let settings = self.settings()?;
+        self.acl_validation(&settings)?;
         self.resource_baseline();
         self.forward_strategy(&settings)?;
         self.adaptive_hedge_delay(&settings)?;
@@ -793,6 +794,27 @@ impl Runner {
             self.fail("settings", "could not read settings");
         }
         serde_json::from_str(&response.body).map_err(|err| format!("parse settings JSON: {err}"))
+    }
+
+    fn acl_validation(&mut self, settings: &Value) -> Result<(), String> {
+        let original = json_string(settings, "allowed_networks").unwrap_or_default();
+        let code = self.put_setting("allowed_networks", "192.168.1.0/33")?;
+        let current = self.curl_json("GET", "/api/settings", None)?;
+        let persisted = json_string(&current, "allowed_networks").unwrap_or_default();
+        if code == 400 && persisted == original {
+            self.ok(
+                "acl-validation",
+                "invalid CIDR rejected with HTTP 400 and prior setting preserved",
+            );
+        } else {
+            self.fail(
+                "acl-validation",
+                format!(
+                    "expected HTTP 400 with preserved setting; HTTP={code} original={original:?} persisted={persisted:?}"
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn resource_baseline(&mut self) {
