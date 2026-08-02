@@ -37,6 +37,13 @@ pub struct ResourceSnapshot {
     pub fds: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DnsProbe {
+    pub rcode: u8,
+    pub answers: u16,
+    pub ede: Option<u16>,
+}
+
 pub struct Runner {
     pub config: Config,
     step: u64,
@@ -440,6 +447,16 @@ impl Runner {
         ))
     }
 
+    pub fn dns_probe(&self, domain: &str, query_type: u16) -> Result<DnsProbe, String> {
+        udp_dns_probe(
+            &self.env_or("SSH_HOST", ""),
+            53,
+            domain,
+            query_type,
+            Duration::from_secs(2),
+        )
+    }
+
     pub fn resource_snapshot(&self) -> Result<ResourceSnapshot, String> {
         let output = self.remote_root("pid=$(pidof rustblocker 2>/dev/null | awk '{print $1}'); [ -n \"$pid\" ] || pid=$(pgrep -x rustblocker 2>/dev/null | head -1); [ -n \"$pid\" ] || exit 1; rss=$(awk '/^VmRSS:/ {print $2}' /proc/$pid/status 2>/dev/null); threads=$(awk '/^Threads:/ {print $2}' /proc/$pid/status 2>/dev/null); fds=$(find /proc/$pid/fd -maxdepth 1 2>/dev/null | wc -l); printf '%s %s %s %s\n' \"$pid\" \"${rss:-0}\" \"${threads:-0}\" \"${fds:-0}\"")?;
         let mut parts = output.split_whitespace();
@@ -488,7 +505,7 @@ impl Runner {
         Err(format!("cleanup did not finish after {max_passes} passes"))
     }
 
-    pub fn cleanup_blocklist_sqlite(&self, prefix: &str) -> Result<(), String> {
+    pub fn cleanup_blocklist_sqlite(&mut self, prefix: &str) -> Result<(), String> {
         let db = shell_quote(&self.env_or("REMOTE_DB_PATH", "/var/lib/rustblocker/rustblocker.db"));
         let like = shell_quote(&format!("%{prefix}%"));
         self.remote_root(&format!(
@@ -952,9 +969,20 @@ impl Runner {
         }
     }
 
-    fn restart_remote_service(&self) -> Result<(), String> {
-        self.remote_root("systemctl restart rustblocker 2>/dev/null || rc-service rustblocker restart 2>/dev/null")?;
-        Ok(())
+    fn restart_remote_service(&mut self) -> Result<(), String> {
+        self.remote_root(
+            "systemctl restart rustblocker 2>/dev/null || rc-service rustblocker restart 2>/dev/null",
+        )?;
+        for _ in 0..15 {
+            if self
+                .curl_code("GET", "/api/health", None)
+                .is_ok_and(|code| code == 200)
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Err("service did not become healthy after restart".to_string())
     }
 
     fn ensure_remote_service_defaults(&self) -> Result<(), String> {
@@ -1331,6 +1359,139 @@ fn udp_dns_a(host: &str, port: u16, domain: &str, timeout: Duration) -> Result<S
         .recv_from(&mut buf)
         .map_err(|err| format!("receive dns response: {err}"))?;
     parse_dns_a_response(&buf[..len])
+}
+
+pub(crate) fn target_dns_probe(
+    host: &str,
+    domain: &str,
+    query_type: u16,
+) -> Result<DnsProbe, String> {
+    udp_dns_probe(host, 53, domain, query_type, Duration::from_secs(2))
+}
+
+pub(crate) fn target_dns_probe_port(
+    host: &str,
+    port: u16,
+    domain: &str,
+    query_type: u16,
+) -> Result<DnsProbe, String> {
+    udp_dns_probe(host, port, domain, query_type, Duration::from_secs(2))
+}
+
+fn udp_dns_probe(
+    host: &str,
+    port: u16,
+    domain: &str,
+    query_type: u16,
+    timeout: Duration,
+) -> Result<DnsProbe, String> {
+    if host.is_empty() || domain.is_empty() {
+        return Err("missing dns host or domain".to_string());
+    }
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|err| format!("bind udp dns: {err}"))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("set dns timeout: {err}"))?;
+    socket
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("set dns timeout: {err}"))?;
+
+    let mut packet = Vec::with_capacity(512);
+    packet.extend_from_slice(&0x5243_u16.to_be_bytes());
+    packet.extend_from_slice(&0x0100_u16.to_be_bytes());
+    packet.extend_from_slice(&1_u16.to_be_bytes());
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+    packet.extend_from_slice(&1_u16.to_be_bytes());
+    encode_dns_name(&mut packet, domain)?;
+    packet.extend_from_slice(&query_type.to_be_bytes());
+    packet.extend_from_slice(&1_u16.to_be_bytes());
+    packet.push(0);
+    packet.extend_from_slice(&41_u16.to_be_bytes());
+    packet.extend_from_slice(&1232_u16.to_be_bytes());
+    packet.extend_from_slice(&0_u32.to_be_bytes());
+    packet.extend_from_slice(&0_u16.to_be_bytes());
+
+    socket
+        .send_to(&packet, (host, port))
+        .map_err(|err| format!("send dns query: {err}"))?;
+    let mut buf = [0_u8; 1232];
+    let (len, _) = socket
+        .recv_from(&mut buf)
+        .map_err(|err| format!("receive dns response: {err}"))?;
+    parse_dns_probe_response(&buf[..len])
+}
+
+fn encode_dns_name(packet: &mut Vec<u8>, domain: &str) -> Result<(), String> {
+    for label in domain.trim_end_matches('.').split('.') {
+        let len = label.len();
+        if len == 0 || len > 63 {
+            return Err(format!("invalid dns label: {domain}"));
+        }
+        packet.push(len as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.push(0);
+    Ok(())
+}
+
+fn parse_dns_probe_response(buf: &[u8]) -> Result<DnsProbe, String> {
+    if buf.len() < 12 {
+        return Err("short dns response".to_string());
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+    let nscount = u16::from_be_bytes([buf[8], buf[9]]) as usize;
+    let arcount = u16::from_be_bytes([buf[10], buf[11]]) as usize;
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        skip_dns_name(buf, &mut offset)?;
+        offset = offset
+            .checked_add(4)
+            .filter(|value| *value <= buf.len())
+            .ok_or_else(|| "truncated dns question".to_string())?;
+    }
+
+    let mut ede = None;
+    for index in 0..(ancount as usize + nscount + arcount) {
+        skip_dns_name(buf, &mut offset)?;
+        if offset + 10 > buf.len() {
+            return Err("truncated dns record".to_string());
+        }
+        let rr_type = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        offset += 10;
+        let end = offset
+            .checked_add(rdlen)
+            .filter(|value| *value <= buf.len())
+            .ok_or_else(|| "truncated dns rdata".to_string())?;
+        if index >= ancount as usize + nscount && rr_type == 41 {
+            let mut option_offset = offset;
+            while option_offset + 4 <= end {
+                let code = u16::from_be_bytes([buf[option_offset], buf[option_offset + 1]]);
+                let len =
+                    u16::from_be_bytes([buf[option_offset + 2], buf[option_offset + 3]]) as usize;
+                option_offset += 4;
+                if option_offset + len > end {
+                    return Err("truncated edns option".to_string());
+                }
+                if code == 15 && len >= 2 {
+                    ede = Some(u16::from_be_bytes([
+                        buf[option_offset],
+                        buf[option_offset + 1],
+                    ]));
+                }
+                option_offset += len;
+            }
+        }
+        offset = end;
+    }
+
+    Ok(DnsProbe {
+        rcode: buf[3] & 0x0f,
+        answers: ancount,
+        ede,
+    })
 }
 
 fn parse_dns_a_response(buf: &[u8]) -> Result<String, String> {

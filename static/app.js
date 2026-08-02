@@ -975,6 +975,10 @@
             {key: 'listen_port', label: 'DNS Port'},
             {key: 'sinkhole_ipv4', label: 'Sinkhole IPv4'},
             {key: 'sinkhole_ipv6', label: 'Sinkhole IPv6'},
+            {key: 'block_response_mode', label: 'Blocked DNS Response', type: 'select', options: [
+                {value: 'nxdomain', label: 'NXDOMAIN (fast failure)'},
+                {value: 'null_ip', label: 'Null IP (0.0.0.0 / ::)'}
+            ]},
             {key: 'log_level', label: 'Log Level'},
             {key: 'upstream_timeout_secs', label: 'Upstream Timeout (s)'},
             {key: 'forward_strategy', label: 'Forward Strategy', type: 'select', options: [
@@ -1013,7 +1017,7 @@
     }
 
     async function saveSettings() {
-        const keys = ['listen_address', 'listen_port', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'forward_strategy', 'allowed_networks', 'stats_retention_days'];
+        const keys = ['listen_address', 'listen_port', 'block_response_mode', 'sinkhole_ipv4', 'sinkhole_ipv6', 'log_level', 'upstream_timeout_secs', 'forward_strategy', 'allowed_networks', 'stats_retention_days'];
         const restartKeys = ['listen_address', 'listen_port', 'log_level'];
         let needsRestart = false;
         let restartPending = false;

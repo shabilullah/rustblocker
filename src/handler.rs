@@ -1,10 +1,13 @@
+use std::fmt;
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
+use hickory_proto::op::{Edns, Header, HeaderCounts, Metadata, ResponseCode};
+use hickory_proto::rr::rdata::opt::EdnsOption;
 use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{RData, Record, RecordType};
 use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo};
@@ -21,6 +24,47 @@ use crate::stats::{QueryAction, QueryEntry, QueryLog};
 /// Default max concurrent DNS request handlers (UDP+TCP combined).
 /// Caps in-flight work under flood; excess gets immediate SERVFAIL.
 pub const DEFAULT_DNS_MAX_IN_FLIGHT: usize = 512;
+
+const BLOCKED_RESPONSE_TTL_SECS: u32 = 60;
+const EDE_OPTION_CODE: u16 = 15;
+const EDE_FORGED_ANSWER: u16 = 4;
+const EDE_BLOCKED: u16 = 15;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockResponseMode {
+    #[default]
+    NxDomain,
+    NullIp,
+}
+
+impl BlockResponseMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NxDomain => "nxdomain",
+            Self::NullIp => "null_ip",
+        }
+    }
+}
+
+impl fmt::Display for BlockResponseMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BlockResponseMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "nxdomain" => Ok(Self::NxDomain),
+            "null_ip" => Ok(Self::NullIp),
+            _ => Err("expected nxdomain or null_ip"),
+        }
+    }
+}
+
+pub type SharedBlockResponseMode = Arc<RwLock<BlockResponseMode>>;
 
 /// Shared DNS concurrency gate + counters (handler + HTTP metrics).
 #[derive(Clone)]
@@ -74,6 +118,7 @@ pub struct DnsBlockerHandler {
     forwarder: Arc<RwLock<ParallelForwarder>>,
     sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
     sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+    block_response_mode: SharedBlockResponseMode,
     acl: SharedAcl,
     query_log: Arc<QueryLog>,
     concurrency: DnsConcurrency,
@@ -88,6 +133,7 @@ impl DnsBlockerHandler {
         forwarder: Arc<RwLock<ParallelForwarder>>,
         sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
         sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+        block_response_mode: SharedBlockResponseMode,
         acl: SharedAcl,
         query_log: Arc<QueryLog>,
     ) -> Self {
@@ -98,6 +144,7 @@ impl DnsBlockerHandler {
             forwarder,
             sinkhole_ipv4,
             sinkhole_ipv6,
+            block_response_mode,
             acl,
             query_log,
             DnsConcurrency::new(DEFAULT_DNS_MAX_IN_FLIGHT),
@@ -112,6 +159,7 @@ impl DnsBlockerHandler {
         forwarder: Arc<RwLock<ParallelForwarder>>,
         sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
         sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+        block_response_mode: SharedBlockResponseMode,
         acl: SharedAcl,
         query_log: Arc<QueryLog>,
         max_in_flight: usize,
@@ -123,6 +171,7 @@ impl DnsBlockerHandler {
             forwarder,
             sinkhole_ipv4,
             sinkhole_ipv6,
+            block_response_mode,
             acl,
             query_log,
             DnsConcurrency::new(max_in_flight),
@@ -137,6 +186,7 @@ impl DnsBlockerHandler {
         forwarder: Arc<RwLock<ParallelForwarder>>,
         sinkhole_ipv4: Arc<RwLock<Ipv4Addr>>,
         sinkhole_ipv6: Arc<RwLock<Ipv6Addr>>,
+        block_response_mode: SharedBlockResponseMode,
         acl: SharedAcl,
         query_log: Arc<QueryLog>,
         concurrency: DnsConcurrency,
@@ -148,6 +198,7 @@ impl DnsBlockerHandler {
             forwarder,
             sinkhole_ipv4,
             sinkhole_ipv6,
+            block_response_mode,
             acl,
             query_log,
             concurrency,
@@ -171,11 +222,42 @@ impl DnsBlockerHandler {
     }
 }
 
-fn build_rdata(query_type: RecordType, ipv4: Ipv4Addr, ipv6: Ipv6Addr) -> RData {
-    match query_type {
-        RecordType::AAAA => RData::AAAA(AAAA::from(ipv6)),
-        _ => RData::A(A::from(ipv4)),
+enum BlockResponse {
+    Answer(RData),
+    NxDomain,
+    Refused,
+}
+
+fn blocked_response(
+    mode: BlockResponseMode,
+    query_type: RecordType,
+    ipv4: Ipv4Addr,
+    ipv6: Ipv6Addr,
+) -> BlockResponse {
+    match (mode, query_type) {
+        (BlockResponseMode::NxDomain, _) => BlockResponse::NxDomain,
+        (BlockResponseMode::NullIp, RecordType::A) => {
+            BlockResponse::Answer(RData::A(A::from(ipv4)))
+        }
+        (BlockResponseMode::NullIp, RecordType::AAAA) => {
+            BlockResponse::Answer(RData::AAAA(AAAA::from(ipv6)))
+        }
+        (BlockResponseMode::NullIp, _) => BlockResponse::Refused,
     }
+}
+
+fn blocked_response_edns(request: &Request, info_code: u16) -> Option<Edns> {
+    request.edns.as_ref().map(|request_edns| {
+        let mut response_edns = Edns::new();
+        response_edns
+            .set_version(0)
+            .set_max_payload(request_edns.max_payload());
+        response_edns.options_mut().insert(EdnsOption::Unknown(
+            EDE_OPTION_CODE,
+            info_code.to_be_bytes().to_vec(),
+        ));
+        response_edns
+    })
 }
 /// Construct a fallback `ResponseInfo` (SERVFAIL) when the response cannot be
 /// sent (client disconnect, IO error). Mirrors hickory's internal
@@ -309,45 +391,70 @@ impl RequestHandler for DnsBlockerHandler {
             }
 
             // 2. Check allowlist, then blocklist
-            let (allowlisted, block_response): (bool, Option<RData>) = {
+            let (allowlisted, is_domain_blocked) = {
                 let allowlist = self.allowlist.read();
                 if allowlist.matches(&domain) {
                     debug!("Allowed: {}", domain);
-                    (true, None)
+                    (true, false)
                 } else {
                     let blocklist = self.blocklist.read();
-                    if blocklist.matches(&domain) {
-                        info!("Blocked: {}", domain);
-                        self.query_log.record(QueryEntry {
-                            client_ip: src_ip,
-                            domain: domain.clone(),
-                            query_type,
-                            action: QueryAction::Blocked,
-                            resolver: None,
-                            latency_us: None,
-                        });
-                        let sink_v4 = *self.sinkhole_ipv4.read();
-                        let sink_v6 = *self.sinkhole_ipv6.read();
-                        (false, Some(build_rdata(query_type, sink_v4, sink_v6)))
-                    } else {
-                        (false, None)
-                    }
+                    (false, blocklist.matches(&domain))
                 }
             };
 
-            if let Some(rdata) = block_response {
-                let builder = MessageResponseBuilder::from_message_request(request);
+            if is_domain_blocked {
+                info!("Blocked: {}", domain);
+                self.query_log.record(QueryEntry {
+                    client_ip: src_ip,
+                    domain: domain.clone(),
+                    query_type,
+                    action: QueryAction::Blocked,
+                    resolver: None,
+                    latency_us: None,
+                });
+                let mode = *self.block_response_mode.read();
+                let sink_v4 = *self.sinkhole_ipv4.read();
+                let sink_v6 = *self.sinkhole_ipv6.read();
+                let block_response = blocked_response(mode, query_type, sink_v4, sink_v6);
+                let info_code = match block_response {
+                    BlockResponse::Answer(_) => EDE_FORGED_ANSWER,
+                    BlockResponse::NxDomain | BlockResponse::Refused => EDE_BLOCKED,
+                };
+                let response_edns = blocked_response_edns(request, info_code);
+                let mut builder = MessageResponseBuilder::from_message_request(request);
+                if let Some(edns) = &response_edns {
+                    builder.edns(edns);
+                }
                 let mut metadata = Metadata::response_from_request(&request.metadata);
-                metadata.response_code = ResponseCode::NoError;
-                let record = Record::from_rdata(query_name, 60, rdata);
-                let answers = [record];
-                let response =
-                    builder.build(metadata, answers.iter(), [].iter(), [].iter(), [].iter());
                 let mut rh = response_handle;
-                return match rh.send_response(response).await {
+                let result = match block_response {
+                    BlockResponse::Answer(rdata) => {
+                        metadata.response_code = ResponseCode::NoError;
+                        let record =
+                            Record::from_rdata(query_name, BLOCKED_RESPONSE_TTL_SECS, rdata);
+                        let answers = [record];
+                        let response = builder.build(
+                            metadata,
+                            answers.iter(),
+                            [].iter(),
+                            [].iter(),
+                            [].iter(),
+                        );
+                        rh.send_response(response).await
+                    }
+                    BlockResponse::NxDomain => {
+                        metadata.response_code = ResponseCode::NXDomain;
+                        rh.send_response(builder.build_no_records(metadata)).await
+                    }
+                    BlockResponse::Refused => {
+                        metadata.response_code = ResponseCode::Refused;
+                        rh.send_response(builder.build_no_records(metadata)).await
+                    }
+                };
+                return match result {
                     Ok(info) => info,
                     Err(e) => {
-                        warn!("failed to send sinkhole response: {}", e);
+                        warn!("failed to send blocked response: {}", e);
                         serve_failed(request)
                     }
                 };
@@ -430,10 +537,64 @@ mod tests {
             forwarder,
             Arc::new(RwLock::new(Ipv4Addr::UNSPECIFIED)),
             Arc::new(RwLock::new(Ipv6Addr::UNSPECIFIED)),
+            Arc::new(RwLock::new(BlockResponseMode::NxDomain)),
             Arc::new(RwLock::new(Acl::default())),
             query_log,
             max_in_flight,
         )
+    }
+
+    #[test]
+    fn block_response_mode_parses_supported_values() {
+        assert_eq!("nxdomain".parse(), Ok(BlockResponseMode::NxDomain));
+        assert_eq!("null_ip".parse(), Ok(BlockResponseMode::NullIp));
+        assert!("servfail".parse::<BlockResponseMode>().is_err());
+    }
+
+    #[test]
+    fn null_ip_only_answers_matching_address_queries() {
+        assert!(matches!(
+            blocked_response(
+                BlockResponseMode::NullIp,
+                RecordType::A,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+            ),
+            BlockResponse::Answer(RData::A(_))
+        ));
+        assert!(matches!(
+            blocked_response(
+                BlockResponseMode::NullIp,
+                RecordType::AAAA,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+            ),
+            BlockResponse::Answer(RData::AAAA(_))
+        ));
+        assert!(matches!(
+            blocked_response(
+                BlockResponseMode::NullIp,
+                RecordType::HTTPS,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+            ),
+            BlockResponse::Refused
+        ));
+    }
+
+    #[test]
+    fn nxdomain_blocks_every_query_type() {
+        for query_type in [RecordType::A, RecordType::AAAA, RecordType::HTTPS] {
+            assert!(matches!(
+                blocked_response(
+                    BlockResponseMode::NxDomain,
+                    query_type,
+                    Ipv4Addr::UNSPECIFIED,
+                    Ipv6Addr::UNSPECIFIED,
+                ),
+                BlockResponse::NxDomain
+            ));
+        }
     }
 
     #[tokio::test]

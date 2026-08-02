@@ -151,25 +151,17 @@ fn init_schema(conn: &rusqlite::Connection) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Seed the database with sensible defaults (only if tables are empty).
+/// Ensure every default setting exists without overwriting operator values.
 pub fn seed_defaults(pool: &DbPool) -> Result<(), DbError> {
     let conn = pool.get()?;
-
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
-        .unwrap_or(0);
-    if count > 0 {
-        info!("Database already seeded");
-        return Ok(());
-    }
-
-    info!("Seeding database with default settings...");
+    info!("Ensuring default settings exist...");
 
     let settings = [
         ("listen_address", "0.0.0.0"),
         ("listen_port", "53"),
         ("sinkhole_ipv4", "0.0.0.0"),
         ("sinkhole_ipv6", "::"),
+        ("block_response_mode", "nxdomain"),
         ("log_level", "info"),
         ("upstream_timeout_secs", "5"),
         ("forward_strategy", "adaptive"),
@@ -177,21 +169,24 @@ pub fn seed_defaults(pool: &DbPool) -> Result<(), DbError> {
         ("allowed_networks", ""),
         ("stats_retention_days", "30"),
     ];
-    for (key, value) in &settings {
+    for (key, value) in settings {
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
             params![key, value],
-        )
-        .ok();
+        )?;
     }
 
-    conn.execute(
-        "INSERT OR IGNORE INTO upstreams (address, port) VALUES (?1, ?2)",
-        params!["8.8.8.8", 53],
-    )
-    .ok();
+    let upstream_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM upstreams", [], |row| row.get(0))
+        .unwrap_or(0);
+    if upstream_count == 0 {
+        conn.execute(
+            "INSERT INTO upstreams (address, port) VALUES (?1, ?2)",
+            params!["8.8.8.8", 53],
+        )?;
+    }
 
-    info!("Database seeded with defaults (1 upstream: 8.8.8.8:53)");
+    info!("Database defaults ready");
     Ok(())
 }
 

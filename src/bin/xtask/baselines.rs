@@ -1,4 +1,4 @@
-use crate::core::{CurlResponse, Runner};
+use crate::core::{CurlResponse, Runner, target_dns_probe_port};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -1243,8 +1243,8 @@ fn run_sync_apply(r: &mut Runner, ctx: &BaselineRun) -> Result<(), String> {
             sleep_secs(settle_secs);
             full_dns = remote_dns_a_port(r, &removed_domain, slave_dns_port);
             keep_dns = remote_dns_a_port(r, &keep_domain, slave_dns_port);
-            if has_exact_line(&full_dns, &ctx.sinkhole_ipv4)
-                && has_exact_line(&keep_dns, &ctx.sinkhole_ipv4)
+            if blocked_on_port(&full_dns, &removed_domain, slave_dns_port, ctx)
+                && blocked_on_port(&keep_dns, &keep_domain, slave_dns_port, ctx)
             {
                 full_dns_ok = 1;
                 sync_ok = true;
@@ -1306,8 +1306,18 @@ fn run_sync_apply(r: &mut Runner, ctx: &BaselineRun) -> Result<(), String> {
             sleep_secs(settle_secs);
             removed_dns = remote_dns_a_port(r, &removed_domain, slave_dns_port);
             keep_dns2 = remote_dns_a_port(r, &keep_domain, slave_dns_port);
-            keep_dns_ok = u64::from(has_exact_line(&keep_dns2, &ctx.sinkhole_ipv4));
-            sticky_dns = u64::from(has_exact_line(&removed_dns, &ctx.sinkhole_ipv4));
+            keep_dns_ok = u64::from(blocked_on_port(
+                &keep_dns2,
+                &keep_domain,
+                slave_dns_port,
+                ctx,
+            ));
+            sticky_dns = u64::from(blocked_on_port(
+                &removed_dns,
+                &removed_domain,
+                slave_dns_port,
+                ctx,
+            ));
             if keep_dns_ok == 1 && sticky_dns == 0 {
                 break;
             }
@@ -1698,7 +1708,6 @@ fn sticky_cleanup(
         let _ = r.curl_code("DELETE", &format!("/api/sources/{source_id}"), None);
     }
     cleanup_blocklist_best_effort(r, prefix);
-    let _ = restart_remote_service(r);
     let _ = r.remote_root(&format!(
         "rm -f {} {}",
         shell_quote(full_path),
@@ -1779,6 +1788,14 @@ fn wait_for_slave_health(r: &mut Runner, ctx: &BaselineRun, web_port: u64) -> bo
         sleep_secs(1);
     }
     false
+}
+
+fn blocked_on_port(answer: &str, domain: &str, port: u64, ctx: &BaselineRun) -> bool {
+    has_exact_line(answer, &ctx.sinkhole_ipv4)
+        || u16::try_from(port)
+            .ok()
+            .and_then(|port| target_dns_probe_port(&ctx.ssh_host, port, domain, 1).ok())
+            .is_some_and(|probe| probe.rcode == 3 && probe.answers == 0 && probe.ede == Some(15))
 }
 
 fn cleanup_slave(r: &mut Runner, slave: &SlavePaths) {

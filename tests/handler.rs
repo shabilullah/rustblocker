@@ -12,6 +12,7 @@ use common::{MockResponseHandler, make_handler, make_request};
 use hickory_net::runtime::TokioTime;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::RecordType;
+use hickory_proto::rr::rdata::opt::{EdnsCode, EdnsOption};
 use hickory_server::server::RequestHandler;
 
 /// Drive the handler: send a query, return (response_code, answer_count,
@@ -52,11 +53,30 @@ async fn overload_returns_servfail_and_increments_rejected() {
 // --- Blocklist: exact match ---
 
 #[tokio::test]
-async fn blocklist_exact_match_sinkholes() {
+async fn blocklist_exact_match_returns_nxdomain() {
     let (handler, _) = make_handler(&["ads.example.com"], &[], &[]);
     let (rcode, answers, _) = query(&handler, "ads.example.com", RecordType::A).await;
-    assert_eq!(rcode, ResponseCode::NoError, "blocked => NoError");
-    assert_eq!(answers, 1, "one sinkhole A record (0.0.0.0)");
+    assert_eq!(rcode, ResponseCode::NXDomain, "blocked => NXDOMAIN");
+    assert_eq!(answers, 0, "NXDOMAIN has no answer records");
+}
+
+#[tokio::test]
+async fn blocklist_response_includes_blocked_ede() {
+    let (handler, _) = make_handler(&["ads.example.com"], &[], &[]);
+    let req = make_request("ads.example.com", RecordType::A);
+    let mock = MockResponseHandler::new();
+    let _ = handler
+        .handle_request::<_, TokioTime>(&req, mock.clone())
+        .await;
+    let message = mock.message();
+    assert_eq!(message.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(
+        message
+            .edns
+            .as_ref()
+            .and_then(|edns| edns.options().get(EdnsCode::Unknown(15))),
+        Some(&EdnsOption::Unknown(15, 15_u16.to_be_bytes().to_vec()))
+    );
 }
 
 #[tokio::test]
@@ -75,13 +95,21 @@ async fn blocklist_exact_does_not_match_unlisted() {
 // --- Blocklist: wildcard ---
 
 #[tokio::test]
-async fn blocklist_wildcard_sinkholes_subdomain() {
+async fn blocklist_wildcard_returns_nxdomain_for_subdomain() {
     let (handler, _) = make_handler(&["*.shopee.com"], &[], &[]);
     for sub in ["phys.shopee.com", "id.shopee.com", "api.id.shopee.com"] {
         let (rcode, answers, _) = query(&handler, sub, RecordType::A).await;
-        assert_eq!(rcode, ResponseCode::NoError, "{sub}: blocked => NoError");
-        assert_eq!(answers, 1, "{sub}: one sinkhole answer");
+        assert_eq!(rcode, ResponseCode::NXDomain, "{sub}: blocked => NXDOMAIN");
+        assert_eq!(answers, 0, "{sub}: NXDOMAIN has no answer records");
     }
+}
+
+#[tokio::test]
+async fn blocklist_returns_nxdomain_for_https_queries() {
+    let (handler, _) = make_handler(&["tags.example.com"], &[], &[]);
+    let (rcode, answers, _) = query(&handler, "tags.example.com", RecordType::HTTPS).await;
+    assert_eq!(rcode, ResponseCode::NXDomain);
+    assert_eq!(answers, 0);
 }
 
 #[tokio::test]

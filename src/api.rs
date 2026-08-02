@@ -13,6 +13,7 @@ use crate::auth::{AuthState, SESSION_COOKIE_NAME, SESSION_MAX_AGE_SECS, encode_s
 use crate::config::UpstreamConfig;
 use crate::db::{self, DbError, DbPool};
 use crate::forwarder::{ForwardStrategy, ParallelForwarder};
+use crate::handler::{BlockResponseMode, SharedBlockResponseMode};
 use crate::lists::{AllowlistStore, BlocklistStore, DomainStore};
 use crate::stats::QueryLog;
 use crate::sync::SharedSyncState;
@@ -629,6 +630,7 @@ async fn update_setting(
     activity_log: web::Data<ActivityLog>,
     sinkhole_ipv4: web::Data<Arc<RwLock<Ipv4Addr>>>,
     sinkhole_ipv6: web::Data<Arc<RwLock<Ipv6Addr>>>,
+    block_response_mode: web::Data<SharedBlockResponseMode>,
     forwarder: web::Data<Arc<RwLock<ParallelForwarder>>>,
     query_log: web::Data<QueryLog>,
     body: web::Json<SettingUpdate>,
@@ -660,6 +662,32 @@ async fn update_setting(
                 );
                 return HttpResponse::BadRequest()
                     .json(serde_json::json!({"error": "invalid forward_strategy"}));
+            }
+        }
+    }
+    if body.key == "block_response_mode" {
+        match body.value.parse::<BlockResponseMode>() {
+            Ok(mode) => {
+                if let Err(e) = db::set_setting(&pool, &body.key, mode.as_str()) {
+                    tracing::warn!("db set_setting failed: {e}");
+                }
+                *block_response_mode.write() = mode;
+                activity_log.info(
+                    "settings",
+                    "Save Settings",
+                    &format!("Setting saved: {} = {}", body.key, mode),
+                );
+                tracing::info!("Blocked DNS response mode reloaded: {}", mode);
+                return HttpResponse::Ok().json(serde_json::json!({"ok": true}));
+            }
+            Err(_) => {
+                activity_log.warning(
+                    "settings",
+                    "Save Settings",
+                    &format!("Invalid blocked DNS response mode: {}", body.value),
+                );
+                return HttpResponse::BadRequest()
+                    .json(serde_json::json!({"error": "invalid block_response_mode"}));
             }
         }
     }

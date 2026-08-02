@@ -17,7 +17,7 @@ use parking_lot::RwLock;
 use rustblocker::acl::{Acl, SharedAcl};
 use rustblocker::config::RewriteRule;
 use rustblocker::forwarder::ParallelForwarder;
-use rustblocker::handler::DnsBlockerHandler;
+use rustblocker::handler::{BlockResponseMode, DnsBlockerHandler};
 use rustblocker::lists::{AllowlistStore, BlocklistStore, DomainStore, RewriteMap};
 use rustblocker::stats::QueryLog;
 
@@ -79,6 +79,11 @@ impl MockResponseHandler {
             .map(|i| i.counts().authorities)
             .unwrap_or(0)
     }
+
+    pub fn message(&self) -> Message {
+        Message::from_vec(self.bytes.read().as_deref().expect("missing DNS response"))
+            .expect("invalid DNS response")
+    }
 }
 
 impl std::default::Default for MockResponseHandler {
@@ -119,6 +124,7 @@ pub fn make_request(name: &str, query_type: RecordType) -> Request {
         Name::from_ascii(format!("{}.", name)).unwrap(),
         query_type,
     ));
+    msg.set_edns(hickory_proto::op::Edns::new());
     let bytes = msg.to_vec().expect("encode failed");
     Request::from_bytes(
         bytes,
@@ -194,6 +200,7 @@ pub fn make_handler(
         forwarder,
         Arc::new(RwLock::new(Ipv4Addr::new(0, 0, 0, 0))),
         Arc::new(RwLock::new(Ipv6Addr::UNSPECIFIED)),
+        Arc::new(RwLock::new(BlockResponseMode::NxDomain)),
         acl,
         query_log.clone(),
     );

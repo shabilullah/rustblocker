@@ -15,7 +15,7 @@ use rustblocker::api;
 use rustblocker::config::UpstreamConfig;
 use rustblocker::db;
 use rustblocker::forwarder::{ForwardStrategy, ParallelForwarder};
-use rustblocker::handler::DnsBlockerHandler;
+use rustblocker::handler::{BlockResponseMode, DnsBlockerHandler};
 use rustblocker::lists::{AllowlistStore, BlocklistStore, DomainStore, RewriteMap};
 use rustblocker::stats::QueryLog;
 use rustblocker::sync;
@@ -302,6 +302,11 @@ async fn run_server(cli: Cli) -> Result<()> {
         .unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
     let sinkhole_ipv4 = Arc::new(RwLock::new(sinkhole_ipv4_raw));
     let sinkhole_ipv6 = Arc::new(RwLock::new(sinkhole_ipv6_raw));
+    let block_response_mode_raw = get_setting_string(&pool, "block_response_mode")
+        .parse::<BlockResponseMode>()
+        .unwrap_or_default();
+    let block_response_mode = Arc::new(RwLock::new(block_response_mode_raw));
+    info!("Blocked DNS response mode: {}", block_response_mode_raw);
 
     let dns_max_in_flight = cli
         .dns_max_in_flight
@@ -318,6 +323,7 @@ async fn run_server(cli: Cli) -> Result<()> {
         forwarder.clone(),
         sinkhole_ipv4.clone(),
         sinkhole_ipv6.clone(),
+        block_response_mode.clone(),
         shared_acl.clone(),
         query_log.clone(),
         dns_concurrency.clone(),
@@ -348,6 +354,7 @@ async fn run_server(cli: Cli) -> Result<()> {
     let forwarder_data = actix_web::web::Data::new(forwarder.clone());
     let sinkhole_v4_data = actix_web::web::Data::new(sinkhole_ipv4.clone());
     let sinkhole_v6_data = actix_web::web::Data::new(sinkhole_ipv6.clone());
+    let block_response_mode_data = actix_web::web::Data::new(block_response_mode.clone());
     let sync_state: rustblocker::sync::SharedSyncState = Arc::new(parking_lot::Mutex::new(
         rustblocker::sync::SyncState::default(),
     ));
@@ -420,6 +427,7 @@ async fn run_server(cli: Cli) -> Result<()> {
                 .app_data(forwarder_data.clone())
                 .app_data(sinkhole_v4_data.clone())
                 .app_data(sinkhole_v6_data.clone())
+                .app_data(block_response_mode_data.clone())
                 .app_data(actix_web::web::Data::new(auth_data.clone()))
                 .app_data(activity_log.clone())
                 .app_data(sync_state_data.clone())

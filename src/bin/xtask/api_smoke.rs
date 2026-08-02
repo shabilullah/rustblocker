@@ -1,4 +1,4 @@
-use crate::core::{ResourceSnapshot, Runner};
+use crate::core::{ResourceSnapshot, Runner, target_dns_probe};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     let cfg = SmokeConfig::from_runner(r);
     let resource_base = r.resource_snapshot().ok().map(|snapshot| snapshot.rss_kb);
 
+    block_response_modes(r, &cfg);
     query_log_prune(r, &cfg);
     allowlist_delete(r);
     allowlist_stats(r, &cfg);
@@ -121,6 +122,113 @@ impl SmokeConfig {
     }
 }
 
+fn block_response_modes(r: &mut Runner, cfg: &SmokeConfig) {
+    let domain = format!("{}-block-response.rustblocker.test", cfg.run_tag);
+    let added = r.curl_json("POST", "/api/blocklist", Some(json!({ "domain": domain })));
+    let id = added.as_ref().ok().and_then(json_id);
+    if id.is_none() {
+        r.fail(
+            "block-response-mode",
+            format!(
+                "failed to add temporary blocked domain: {}",
+                format_result_json(&added)
+            ),
+        );
+        return;
+    }
+
+    let nxdomain_code = r
+        .curl_code(
+            "PUT",
+            "/api/settings",
+            Some(json!({ "key": "block_response_mode", "value": "nxdomain" })),
+        )
+        .unwrap_or(0);
+    let nxdomain_a = target_dns_probe(&cfg.ssh_host, &domain, 1);
+    let nxdomain_https = target_dns_probe(&cfg.ssh_host, &domain, 65);
+    let nxdomain_ok = nxdomain_code == 200
+        && nxdomain_a
+            .as_ref()
+            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0 && probe.ede == Some(15))
+        && nxdomain_https
+            .as_ref()
+            .is_ok_and(|probe| probe.rcode == 3 && probe.answers == 0 && probe.ede == Some(15));
+    if nxdomain_ok {
+        r.ok(
+            "block-response-nxdomain",
+            "A and HTTPS queries returned NXDOMAIN with EDE 15 (Blocked)",
+        );
+    } else {
+        r.fail(
+            "block-response-nxdomain",
+            format!(
+                "expected HTTP 200 and A/HTTPS NXDOMAIN answers=0 EDE=15; HTTP={nxdomain_code} A={nxdomain_a:?} HTTPS={nxdomain_https:?}"
+            ),
+        );
+    }
+
+    let null_ip_code = r
+        .curl_code(
+            "PUT",
+            "/api/settings",
+            Some(json!({ "key": "block_response_mode", "value": "null_ip" })),
+        )
+        .unwrap_or(0);
+    let null_ip_a = target_dns_probe(&cfg.ssh_host, &domain, 1);
+    let null_ip_https = target_dns_probe(&cfg.ssh_host, &domain, 65);
+    let null_ip_ok = null_ip_code == 200
+        && null_ip_a
+            .as_ref()
+            .is_ok_and(|probe| probe.rcode == 0 && probe.answers == 1 && probe.ede == Some(4))
+        && null_ip_https
+            .as_ref()
+            .is_ok_and(|probe| probe.rcode == 5 && probe.answers == 0 && probe.ede == Some(15));
+    if null_ip_ok {
+        r.ok(
+            "block-response-null-ip",
+            "A returned null IP with EDE 4; HTTPS returned REFUSED with EDE 15",
+        );
+    } else {
+        r.fail(
+            "block-response-null-ip",
+            format!(
+                "expected HTTP 200, A NOERROR answer=1 EDE=4, HTTPS REFUSED EDE=15; HTTP={null_ip_code} A={null_ip_a:?} HTTPS={null_ip_https:?}"
+            ),
+        );
+    }
+
+    if let Some(id) = id {
+        let code = r
+            .curl_code("DELETE", &format!("/api/blocklist/{id}"), None)
+            .unwrap_or(0);
+        if code != 200 {
+            r.fail(
+                "block-response-mode",
+                format!("failed to remove temporary blocked domain (HTTP {code})"),
+            );
+        }
+    }
+
+    let restore_code = r
+        .curl_code(
+            "PUT",
+            "/api/settings",
+            Some(json!({ "key": "block_response_mode", "value": "null_ip" })),
+        )
+        .unwrap_or(0);
+    if restore_code == 200 {
+        r.ok(
+            "block-response-restore",
+            "restored block_response_mode=null_ip for legacy smoke contracts",
+        );
+    } else {
+        r.fail(
+            "block-response-restore",
+            format!("failed to restore block_response_mode (HTTP {restore_code})"),
+        );
+    }
+}
+
 fn query_log_prune(r: &mut Runner, cfg: &SmokeConfig) {
     if !cfg.mock_query_log_prune_baseline {
         r.skip("query-log-prune", "disabled");
@@ -152,7 +260,7 @@ fn query_log_prune(r: &mut Runner, cfg: &SmokeConfig) {
 
     if status == "running" {
         let sql = format!(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) INSERT INTO query_log (timestamp, client_ip, domain, query_type, action) SELECT datetime('now', '-60 days'), '127.0.0.1', '{}-' || i || '.example', 'A', 'blocked' FROM n;",
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < {}) INSERT INTO query_log (timestamp, client_ip, domain, query_type, action) SELECT datetime('now', '-60 days'), '127.0.0.1', '{}-' || i || '.example', 'A', 'blocked' FROM n; SELECT changes();",
             cfg.query_log_prune_rows, prune_prefix
         );
         let cmd = format!(
@@ -160,25 +268,21 @@ fn query_log_prune(r: &mut Runner, cfg: &SmokeConfig) {
             shell_quote(&cfg.remote_db_path),
             shell_quote(&sql)
         );
-        if r.remote_root(&cmd).is_ok() {
-            old_rows_before = remote_sqlite_u64(
-                r,
-                cfg,
-                &format!(
-                    "SELECT COUNT(*) FROM query_log WHERE domain LIKE '{}-%';",
-                    prune_prefix
-                ),
-            );
-            r.ok(
-                "query-log-prune",
-                format!(
-                    "inserted expired rows={} db_before={}B wal_before={}B freelist_before={}",
-                    old_rows_before, db_bytes_before, wal_bytes_before, freelist_before
-                ),
-            );
-        } else {
-            status = "failed".to_string();
-            r.fail("query-log-prune", "failed to insert expired query_log rows");
+        match r.remote_root(&cmd) {
+            Ok(output) => {
+                old_rows_before = output.trim().parse().unwrap_or(0);
+                r.ok(
+                    "query-log-prune",
+                    format!(
+                        "inserted expired rows={} db_before={}B wal_before={}B freelist_before={}",
+                        old_rows_before, db_bytes_before, wal_bytes_before, freelist_before
+                    ),
+                );
+            }
+            Err(_) => {
+                status = "failed".to_string();
+                r.fail("query-log-prune", "failed to insert expired query_log rows");
+            }
         }
     }
 
