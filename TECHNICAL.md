@@ -58,6 +58,14 @@ cargo build --release --target x86_64-unknown-linux-musl
 
 ## Testing
 
+CI uses the latest stable Rust toolchain. Update the local stable toolchain before running checks so Rust, Cargo, Clippy, and rustfmt match CI:
+
+```bash
+rustup update stable
+rustup default stable
+rustup component add clippy rustfmt
+```
+
 Required checks before committing code changes:
 
 ```bash
@@ -125,6 +133,8 @@ http://<listen_address>:<listen_port + 1>/api
 ```
 
 Protected endpoints require a session cookie from `/api/auth/login`.
+
+Failed blocking database operations return HTTP 500 with a JSON `error` string. The API keeps database and task errors separate from HTTP responses and constructs the response in the handler.
 
 | Method | Path | Description |
 |--------|------|-------------|

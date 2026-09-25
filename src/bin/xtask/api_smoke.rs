@@ -308,12 +308,14 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
         .curl_json("GET", "/api/settings", None)
         .unwrap_or(Value::Null);
     let blocked_before = r.dns_probe(&sentinel, 1);
-    let setting_code = r
-        .curl_code(
-            "PUT",
-            "/api/settings",
-            Some(json!({ "key": "block_response_mode", "value": "nxdomain" })),
-        )
+    let setting_response = r.curl_body(
+        "PUT",
+        "/api/settings",
+        Some(json!({ "key": "block_response_mode", "value": "nxdomain" })),
+    );
+    let setting_code = setting_response
+        .as_ref()
+        .map(|response| response.code)
         .unwrap_or(0);
     let settings_after = r
         .curl_json("GET", "/api/settings", None)
@@ -322,12 +324,13 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
 
     let block_domain = format!("{}-failed-block.rustblocker.test", cfg.run_tag);
     let block_before = r.dns_probe(&block_domain, 1);
-    let block_code = r
-        .curl_body(
-            "POST",
-            "/api/blocklist",
-            Some(json!({ "domain": block_domain })),
-        )
+    let block_response = r.curl_body(
+        "POST",
+        "/api/blocklist",
+        Some(json!({ "domain": block_domain })),
+    );
+    let block_code = block_response
+        .as_ref()
         .map(|response| response.code)
         .unwrap_or(0);
     let block_after = r.dns_probe(&block_domain, 1);
@@ -400,7 +403,14 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
                       right: &Result<crate::core::DnsProbe, String>| {
         matches!((left, right), (Ok(left), Ok(right)) if left.rcode == right.rcode && left.answers == right.answers)
     };
+    let json_errors = [&setting_response, &block_response].iter().all(|response| {
+        response.as_ref().is_ok_and(|response| {
+            serde_json::from_str::<Value>(&response.body)
+                .is_ok_and(|body| body.get("error").is_some_and(Value::is_string))
+        })
+    });
     let passed = setting_code == 500
+        && json_errors
         && settings_before.get("block_response_mode") == settings_after.get("block_response_mode")
         && same_probe(&blocked_before, &blocked_after_setting)
         && block_code == 500
@@ -421,13 +431,13 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
     if passed {
         r.ok(
             "persistence-failure-guards",
-            "forced setting/domain/rewrite/upstream/password DB failures returned HTTP 500 and preserved live state",
+            "forced DB failures returned HTTP 500 with JSON setting/domain errors and preserved live state",
         );
     } else {
         r.fail(
             "persistence-failure-guards",
             format!(
-                "persistence guard failed setting={setting_code} block={block_code} allow={allow_code} rewrite={rewrite_code} upstream={upstream_code} password={password_code} auth={auth_after_password} login={original_login_code} setting_dns={blocked_before:?}/{blocked_after_setting:?} allow_dns={blocked_after_allow:?} block_dns={block_before:?}/{block_after:?} rewrite_dns={rewrite_before:?}/{rewrite_after:?} cleanup={cleanup:?}"
+                "persistence guard failed setting={setting_code} block={block_code} json_errors={json_errors} allow={allow_code} rewrite={rewrite_code} upstream={upstream_code} password={password_code} auth={auth_after_password} login={original_login_code} setting_dns={blocked_before:?}/{blocked_after_setting:?} allow_dns={blocked_after_allow:?} block_dns={block_before:?}/{block_after:?} rewrite_dns={rewrite_before:?}/{rewrite_after:?} cleanup={cleanup:?}"
             ),
         );
     }

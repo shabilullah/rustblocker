@@ -119,26 +119,33 @@ async fn resolve_import_content(body: &BulkImport) -> Result<String, String> {
     }
 }
 
-async fn db_blocking<T, F>(f: F) -> Result<T, HttpResponse>
+enum DbRequestError {
+    Task(tokio::task::JoinError),
+    Database(DbError),
+}
+
+impl DbRequestError {
+    fn into_response(self) -> HttpResponse {
+        let message = match self {
+            Self::Task(error) => format!("database task failed: {error}"),
+            Self::Database(error) => format!("database error: {error}"),
+        };
+        HttpResponse::InternalServerError().json(serde_json::json!({"error": message}))
+    }
+}
+
+async fn db_blocking<T, F>(f: F) -> Result<T, DbRequestError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, DbError> + Send + 'static,
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("database task failed: {}", e)
-            }))
-        })?
-        .map_err(|e| {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("database error: {}", e)
-            }))
-        })
+        .map_err(DbRequestError::Task)?
+        .map_err(DbRequestError::Database)
 }
 
-async fn persist_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), HttpResponse> {
+async fn persist_setting(pool: &DbPool, key: &str, value: &str) -> Result<(), DbRequestError> {
     let pool = pool.clone();
     let key = key.to_string();
     let value = value.to_string();
@@ -172,7 +179,7 @@ async fn get_settings(
     let pool = pool.get_ref().clone();
     let settings = match db_blocking(move || db::get_settings(&pool)).await {
         Ok(settings) => settings,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(settings)
 }
@@ -712,8 +719,8 @@ async fn update_setting(
         .map(|value| value.as_str())
         .or_else(|| response_mode.as_ref().map(|value| value.as_str()))
         .unwrap_or(&body.value);
-    if let Err(response) = persist_setting(&pool, &body.key, persisted_value).await {
-        return response;
+    if let Err(error) = persist_setting(&pool, &body.key, persisted_value).await {
+        return error.into_response();
     }
 
     if let Some(strategy) = strategy {
@@ -799,7 +806,7 @@ async fn add_upstream(
     }
     let id = match db_blocking(move || db::add_upstream(&pool_for_add, &address, port)).await {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     reload_forwarder(pool.get_ref(), &forwarder);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
@@ -875,7 +882,7 @@ async fn get_blocklist(
     .await
     {
         Ok(result) => result,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(serde_json::json!({
         "domains": domains,
@@ -898,7 +905,7 @@ async fn add_blocklist_domain(
     let domain = body.domain.clone();
     let id = match db_blocking(move || db::add_domain(&pool, "blocklist_domains", &domain)).await {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     insert_domain(&mut blocklist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
@@ -923,7 +930,7 @@ async fn delete_blocklist_domain(
     .await
     {
         Ok(domain) => domain,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     match domain {
         Some(domain) => {
@@ -961,7 +968,7 @@ async fn bulk_import_blocklist(
     .await
     {
         Ok(result) => result,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     let count = import_result.inserted;
     {
@@ -995,7 +1002,7 @@ async fn get_allowlist(
     .await
     {
         Ok(result) => result,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(serde_json::json!({
         "domains": domains,
@@ -1018,7 +1025,7 @@ async fn add_allowlist_domain(
     let domain = body.domain.clone();
     let id = match db_blocking(move || db::add_domain(&pool, "allowlist_domains", &domain)).await {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     insert_domain(&mut allowlist.write(), &body.domain);
     HttpResponse::Created().json(serde_json::json!({"id": id}))
@@ -1043,7 +1050,7 @@ async fn delete_allowlist_domain(
     .await
     {
         Ok(domain) => domain,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     match domain {
         Some(domain) => {
@@ -1081,7 +1088,7 @@ async fn bulk_import_allowlist(
     .await
     {
         Ok(result) => result,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     let count = import_result.inserted;
     {
@@ -1125,7 +1132,7 @@ async fn add_rewrite(
     .await
     {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     rewrites.write().insert(crate::config::RewriteRule {
         domain: body.domain.clone(),
@@ -1149,7 +1156,7 @@ async fn delete_rewrite(
     let pool = pool.get_ref().clone();
     let rewrite = match db_blocking(move || Ok(db::delete_rewrite_by_id(&pool, id))).await {
         Ok(rewrite) => rewrite,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     match rewrite {
         Some(rewrite) => {
@@ -1180,7 +1187,7 @@ async fn get_sources(
     let pool = pool.get_ref().clone();
     let sources = match db_blocking(move || db::get_sources(&pool)).await {
         Ok(sources) => sources,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(sources)
 }
@@ -1207,7 +1214,7 @@ async fn add_source(
     .await
     {
         Ok(id) => id,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
 
     let source = db::DbSource {
@@ -1241,7 +1248,7 @@ async fn delete_source(
     let result =
         match db_blocking(move || Ok(db::delete_source_with_cleanup(&pool_for_delete, id))).await {
             Ok(result) => result,
-            Err(resp) => return resp,
+            Err(error) => return error.into_response(),
         };
     match result {
         Some((list_type, rebuilt)) => {
@@ -1269,7 +1276,7 @@ async fn refresh_all_sources(
     let pool_for_sources = pool.get_ref().clone();
     let sources = match db_blocking(move || db::get_sources(&pool_for_sources)).await {
         Ok(sources) => sources,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     let mut results = Vec::new();
     for source in &sources {
@@ -1297,7 +1304,7 @@ async fn refresh_one_source(
     let pool_for_lookup = pool.get_ref().clone();
     let source = match db_blocking(move || Ok(db::get_source_by_id(&pool_for_lookup, id))).await {
         Ok(source) => source,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     let Some(source) = source else {
         return HttpResponse::NotFound().json(serde_json::json!({"error": "not found"}));
@@ -1325,7 +1332,7 @@ async fn get_stats(
     let pool = pool.get_ref().clone();
     let stats = match db_blocking(move || Ok(QueryLog::get_stats(&pool, limit))).await {
         Ok(stats) => stats,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(stats)
 }
@@ -1362,7 +1369,7 @@ async fn get_query_trend(
     .await
     {
         Ok(trend) => trend,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(trend)
 }
@@ -1381,7 +1388,7 @@ async fn get_queries(
     let pool = pool.get_ref().clone();
     let queries = match db_blocking(move || Ok(QueryLog::get_queries(&pool, limit, offset))).await {
         Ok(queries) => queries,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(queries)
 }
@@ -1395,13 +1402,13 @@ async fn clear_stats(
         return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
     }
     let pool = pool.get_ref().clone();
-    if let Err(resp) = db_blocking(move || {
+    if let Err(error) = db_blocking(move || {
         QueryLog::clear(&pool);
         Ok(())
     })
     .await
     {
-        return resp;
+        return error.into_response();
     }
     HttpResponse::Ok().json(serde_json::json!({"status": "cleared"}))
 }
@@ -1818,7 +1825,7 @@ async fn sync_manifest(
     let pool = pool.get_ref().clone();
     let hashes = match db_blocking(move || db::sync_manifest(&pool)).await {
         Ok(hashes) => hashes,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     HttpResponse::Ok().json(serde_json::json!({"hashes": hashes}))
 }
@@ -1837,7 +1844,7 @@ async fn sync_snapshot(
     let category_for_db = category.clone();
     let snapshot = match db_blocking(move || db::sync_snapshot(&pool, &category_for_db)).await {
         Ok(snapshot) => snapshot,
-        Err(resp) => return resp,
+        Err(error) => return error.into_response(),
     };
     match snapshot {
         Some(data) => HttpResponse::Ok().json(data),
