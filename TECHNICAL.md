@@ -337,6 +337,8 @@ The runner reads `scripts/.deployenv`, writes JSON-lines to `<report-dir>/run.js
 
 The `genpass` proof runs the deployed binary against an isolated temporary database for first-time setup and two password resets. It verifies each printed password against the stored hash and checks that each reset invalidates the previous password and session. It leaves the service credentials unchanged and suppresses service restarts for this isolated check.
 
+After a full build and deploy, the `version` proof checks that `/api/version` reports the package version compiled into the runner.
+
 ## Docker Multi-Stage Build
 
 ```dockerfile

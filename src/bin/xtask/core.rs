@@ -915,18 +915,19 @@ impl Runner {
 
     fn version(&mut self) -> Result<(), String> {
         let version = self.curl_json("GET", "/api/version", None)?;
+        let package_version = json_string(&version, "version").unwrap_or_default();
         let build = json_string(&version, "build").unwrap_or_default();
         let dns_max = json_u64(&version, "dns_max_in_flight").unwrap_or(0);
         let hedge = json_u64(&version, "adaptive_hedge_delay_ms").unwrap_or(0);
         let version_ok = if self.config.skip_build || self.config.skip_deploy {
             !build.is_empty() && dns_max > 0 && hedge > 0
         } else {
-            dns_max == 512 && hedge == 75
+            package_version == env!("CARGO_PKG_VERSION") && dns_max == 512 && hedge == 75
         };
         if version_ok {
-            self.ok("version", format!("deployed build id is {build} dns_max_in_flight={dns_max} adaptive_hedge_delay_ms={hedge}"));
+            self.ok("version", format!("deployed version is {package_version} build id is {build} dns_max_in_flight={dns_max} adaptive_hedge_delay_ms={hedge}"));
         } else {
-            self.fail("version", format!("unexpected version payload build='{}' dns_max='{dns_max}' hedge='{hedge}' (expected dns_max=512 hedge=75; response: {version})", empty(&build)));
+            self.fail("version", format!("unexpected version payload version='{package_version}' build='{}' dns_max='{dns_max}' hedge='{hedge}' (expected version={} dns_max=512 hedge=75; response: {version})", empty(&build), env!("CARGO_PKG_VERSION")));
         }
         Ok(())
     }
