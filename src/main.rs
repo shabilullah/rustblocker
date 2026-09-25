@@ -95,9 +95,10 @@ fn main() -> Result<()> {
         let hash = rustblocker::auth::AuthState::hash_password(&password)
             .map_err(|e| anyhow::anyhow!("failed to hash password: {e}"))?;
 
-        // Verify the write actually landed. Silent failures (e.g. permission
-        // denied on a root-owned DB) produce the same "invalid password"
-        // symptom that started this investigation.
+        db::set_setting(&pool, "admin_password_hash", &hash)
+            .with_context(|| format!("Failed to save admin password to {}", db_path.display()))?;
+
+        // Read back the stored hash before printing the new password.
         let stored_hash = db::get_password_hash(&pool);
         if stored_hash.as_deref() != Some(hash.as_str()) {
             return Err(anyhow::anyhow!(
@@ -110,7 +111,8 @@ fn main() -> Result<()> {
         // Rotate session secret so old sessions are invalidated on the next server start.
         let session_secret = rustblocker::auth::AuthState::generate_secret();
         let encoded_secret = rustblocker::auth::encode_secret(&session_secret);
-        let _ = db::set_setting(&pool, "session_secret", &encoded_secret);
+        db::set_setting(&pool, "session_secret", &encoded_secret)
+            .with_context(|| format!("Failed to save session secret to {}", db_path.display()))?;
         let stored_secret = db::get_setting(&pool, "session_secret");
         if stored_secret.as_deref() != Some(encoded_secret.as_str()) {
             return Err(anyhow::anyhow!(

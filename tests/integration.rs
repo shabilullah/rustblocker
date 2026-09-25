@@ -155,3 +155,92 @@ async fn test_list_loading_from_memory() {
     assert!(store.matches("tracker.example.com"));
     assert!(!store.matches("example.com"));
 }
+
+#[test]
+fn genpass_persists_password_and_rotates_sessions() {
+    use rustblocker::auth::{AuthState, decode_secret};
+    use rustblocker::db;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "rustblocker-genpass-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("rustblocker.db");
+    let generate = || {
+        Command::new(env!("CARGO_BIN_EXE_rustblocker"))
+            .arg("--genpass")
+            .arg("--db-path")
+            .arg(&path)
+            .current_dir(&dir)
+            // Do not restart an installed service when testing an isolated database.
+            .env("PATH", "")
+            .output()
+            .unwrap()
+    };
+    let mut previous_password = None::<String>;
+    let mut previous_session = None::<String>;
+
+    for _ in 0..2 {
+        let output = generate();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let password = stdout.lines().nth(1).expect("generated password");
+        let pool = db::create_pool(&path).unwrap();
+        let hash = db::get_password_hash(&pool).expect("persisted password hash");
+        assert!(AuthState::verify_password(password, &hash));
+        let secret = db::get_setting(&pool, "session_secret").expect("persisted session secret");
+        let auth = AuthState::from_secret(decode_secret(&secret).unwrap());
+        if let Some(old_password) = previous_password.as_ref() {
+            assert!(!AuthState::verify_password(old_password, &hash));
+            assert_eq!(
+                db::get_setting(&pool, "listen_port").as_deref(),
+                Some("5353")
+            );
+        }
+        if let Some(old_session) = previous_session.as_ref() {
+            assert!(!auth.validate_session(old_session));
+        }
+        let session = auth.create_session(60);
+        assert!(auth.validate_session(&session));
+        previous_password = Some(password.to_owned());
+        previous_session = Some(session);
+        db::set_setting(&pool, "listen_port", "5353").unwrap();
+    }
+
+    let pool = db::create_pool(&path).unwrap();
+    let hash = db::get_password_hash(&pool).unwrap();
+    let secret = db::get_setting(&pool, "session_secret").unwrap();
+    pool.get()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_password_write BEFORE INSERT ON settings
+         WHEN NEW.key = 'admin_password_hash'
+         BEGIN SELECT RAISE(ABORT, 'forced password write failure'); END;",
+        )
+        .unwrap();
+    let output = generate();
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "failed writes must not print a password"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("forced password write failure"));
+    assert_eq!(db::get_password_hash(&pool).as_deref(), Some(hash.as_str()));
+    assert_eq!(
+        db::get_setting(&pool, "session_secret").as_deref(),
+        Some(secret.as_str())
+    );
+    drop(pool);
+    std::fs::remove_dir_all(dir).unwrap();
+}

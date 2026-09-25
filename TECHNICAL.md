@@ -335,6 +335,8 @@ ACME_POLL_ATTEMPTS=30 cargo run --bin xtask -- mock-deploy --timeout=45
 
 The runner reads `scripts/.deployenv`, writes JSON-lines to `<report-dir>/run.jsonl`, writes `<report-dir>/summary.json`, and exits non-zero if any step fails. Process environment values override `.deployenv` values, which lets CI pin gates such as `MEMORY_RSS_GROWTH_MAX_KB` or `QUERY_LOG_PRUNE_WAL_MAX_BYTES` without editing secrets.
 
+The `genpass` proof runs the deployed binary against an isolated temporary database for first-time setup and two password resets. It verifies each printed password against the stored hash and checks that each reset invalidates the previous password and session. It leaves the service credentials unchanged and suppresses service restarts for this isolated check.
+
 ## Docker Multi-Stage Build
 
 ```dockerfile

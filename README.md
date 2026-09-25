@@ -38,6 +38,8 @@ sudo rustblocker --genpass
 
 Open the Web UI, log in with the generated password, then configure upstreams, lists, sync, HTTPS, and access control.
 
+`--genpass` saves and verifies the password hash before printing the password. If an older binary reports `Password hash was not persisted` even under `sudo`, it may contain a bug that skipped the database write. Use a build containing the fix, then rerun the command. Changing permissions or deleting the database does not fix that bug.
+
 ## CLI Options
 
 ```bash

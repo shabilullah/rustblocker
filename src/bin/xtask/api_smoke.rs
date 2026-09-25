@@ -16,6 +16,7 @@ pub fn run(r: &mut Runner) -> Result<(), String> {
     let cfg = SmokeConfig::from_runner(r);
     let resource_base = r.resource_snapshot().ok().map(|snapshot| snapshot.rss_kb);
 
+    password_generation(r, &cfg);
     block_response_modes(r, &cfg);
     persistence_failure_guards(r, &cfg);
     bulk_import_failure_rollback(r, &cfg);
@@ -255,8 +256,8 @@ fn block_response_modes(r: &mut Runner, cfg: &SmokeConfig) {
 }
 
 fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
-    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
-        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    if !(r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        || cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
     {
         r.fail(
             "persistence-failure-guards",
@@ -433,8 +434,8 @@ fn persistence_failure_guards(r: &mut Runner, cfg: &SmokeConfig) {
 }
 
 fn bulk_import_failure_rollback(r: &mut Runner, cfg: &SmokeConfig) {
-    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
-        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    if !(r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        || cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
     {
         r.fail(
             "bulk-import-rollback",
@@ -515,9 +516,87 @@ fn bulk_import_failure_rollback(r: &mut Runner, cfg: &SmokeConfig) {
     }
 }
 
+fn password_generation(r: &mut Runner, cfg: &SmokeConfig) {
+    use rustblocker::auth::{AuthState, decode_secret};
+
+    if !(r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        || cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    {
+        r.fail(
+            "genpass",
+            "sqlite3 unavailable; cannot verify persisted credentials",
+        );
+        return;
+    }
+    let dir = match r.remote_root("mktemp -d /tmp/rustblocker-genpass.XXXXXX") {
+        Ok(dir) => dir,
+        Err(error) => {
+            r.fail("genpass", error);
+            return;
+        }
+    };
+    let db = shell_quote(&format!("{dir}/rustblocker.db"));
+    let bin = shell_quote(&format!(
+        "{}/{}",
+        r.env_or("REMOTE_INSTALL_DIR", "/usr/local/lib/rustblocker"),
+        r.env_or("BINARY_NAME", "rustblocker")
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut previous_password = None::<String>;
+        let mut previous_session = None::<String>;
+        for _ in 0..3 {
+            // Keep this isolated database proof from restarting the installed service.
+            let output = r.remote_root(&format!("PATH= {bin} --genpass --db-path {db}"))?;
+            let password = output.lines().nth(1).ok_or("no generated password")?;
+            let stored = r.remote_root(&format!(
+                "sqlite3 {db} {}",
+                shell_quote("SELECT value FROM settings WHERE key IN ('admin_password_hash', 'session_secret') ORDER BY key;")
+            ))?;
+            let mut values = stored.lines();
+            let hash = values.next().ok_or("password hash not persisted")?;
+            let secret = values.next().ok_or("session secret not persisted")?;
+            if !AuthState::verify_password(password, hash) {
+                return Err("generated password does not match persisted hash".into());
+            }
+            if previous_password
+                .as_ref()
+                .is_some_and(|old| AuthState::verify_password(old, hash))
+            {
+                return Err("previous password still accepted after reset".into());
+            }
+            let auth =
+                AuthState::from_secret(decode_secret(secret).map_err(|err| err.to_string())?);
+            if previous_session
+                .as_ref()
+                .is_some_and(|old| auth.validate_session(old))
+            {
+                return Err("previous session still accepted after reset".into());
+            }
+            let session = auth.create_session(60);
+            if !auth.validate_session(&session) {
+                return Err("persisted session secret cannot validate new sessions".into());
+            }
+            previous_password = Some(password.to_owned());
+            previous_session = Some(session);
+        }
+        Ok(())
+    })();
+    let cleanup = r.remote_root(&format!("rm -rf {}", shell_quote(&dir)));
+    match result {
+        Ok(()) => r.ok(
+            "genpass",
+            "fresh setup and two resets persisted usable passwords and invalidated previous passwords and sessions",
+        ),
+        Err(error) => r.fail("genpass", error),
+    }
+    if let Err(error) = cleanup {
+        r.fail("genpass-cleanup", error);
+    }
+}
+
 fn startup_policy_read_failure(r: &mut Runner, cfg: &SmokeConfig) {
-    if !r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
-        && !(cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
+    if !(r.ssh_status("command -v sqlite3 >/dev/null 2>&1")
+        || cfg.stress_install_sqlite3 && stress_install_sqlite3(r))
     {
         r.fail(
             "startup-policy-read-failure",
