@@ -143,6 +143,10 @@ A background task checks every 24 hours for certificates expiring within 7 days 
 | `wildcard_cert` | Request `*.domain.com + domain.com` when enabled |
 | `acme_directory_url` | Optional Let's Encrypt directory URL override |
 
+## DNS Hardening
+
+Queries in any class other than `IN` are answered `REFUSED` locally and are never forwarded. This blocks the standard `version.bind` / `version.server` / `id.server` / `hostname.bind` CHAOS-class probes that DNS auditors use to fingerprint resolvers, which would otherwise return the upstream resolver's identity string.
+
 ## Network Access Control
 
 RustBlocker has two layers of network access control:

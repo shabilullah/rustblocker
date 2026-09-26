@@ -9,6 +9,7 @@ This file contains the technical, build, test, storage, API, and deployment deta
 - **DNS Rewrite**: return custom IPs for specific domains
 - **Parallel Forwarding**: races queries across multiple upstream resolvers
 - **UDP + TCP**: listens on both protocols simultaneously
+- **Non-IN class refusal**: CHAOS-class identity probes (`version.bind`, `version.server`, `id.server`, `hostname.bind`) and any other non-IN class get REFUSED locally instead of being forwarded, so upstream resolver identity strings never leak through this server
 - **Web Management UI**: TailwindCSS dark UI
 - **Query Statistics**: tracks totals, top clients, top domains, and recent queries
 - **Live Query Log**: Server-Sent Events stream

@@ -372,6 +372,27 @@ impl RequestHandler for DnsBlockerHandler {
 
             debug!("Query from {}: {} ({})", src_ip, domain, query_type);
 
+            // 0. Only class IN is served. CHAOS-class TXT probes (version.bind,
+            // id.server, version.server) would otherwise be forwarded upstream
+            // and leak the upstream resolver's identity string back to the
+            // client; every other non-IN class is meaningless for a forwarder.
+            if query_class != DNSClass::IN {
+                warn!(
+                    "Refusing non-IN query from {}: {} ({}) class={}",
+                    src_ip, domain, query_type, query_class
+                );
+                let builder = MessageResponseBuilder::from_message_request(request);
+                let response = builder.error_msg(&request.metadata, ResponseCode::Refused);
+                let mut rh = response_handle;
+                return match rh.send_response(response).await {
+                    Ok(info) => info,
+                    Err(e) => {
+                        warn!("failed to send REFUSED response: {}", e);
+                        serve_failed(request)
+                    }
+                };
+            }
+
             // 1. Check rewrite map
             let rewrite_rdata: Option<RData> = {
                 let rewrites = self.rewrites.read();
@@ -464,27 +485,14 @@ impl RequestHandler for DnsBlockerHandler {
                     BlockResponse::NxDomain => {
                         metadata.response_code = ResponseCode::NXDomain;
                         metadata.authoritative = false;
-                        if query_class == DNSClass::IN {
-                            let response = builder.build(
-                                metadata,
-                                [].iter(),
-                                [].iter(),
-                                std::iter::once(&*BLOCKED_NXDOMAIN_SOA),
-                                [].iter(),
-                            );
-                            rh.send_response(response).await
-                        } else {
-                            let mut soa = BLOCKED_NXDOMAIN_SOA.clone();
-                            soa.dns_class = query_class;
-                            let response = builder.build(
-                                metadata,
-                                [].iter(),
-                                [].iter(),
-                                std::iter::once(&soa),
-                                [].iter(),
-                            );
-                            rh.send_response(response).await
-                        }
+                        let response = builder.build(
+                            metadata,
+                            [].iter(),
+                            [].iter(),
+                            std::iter::once(&*BLOCKED_NXDOMAIN_SOA),
+                            [].iter(),
+                        );
+                        rh.send_response(response).await
                     }
                     BlockResponse::Refused => {
                         metadata.response_code = ResponseCode::Refused;

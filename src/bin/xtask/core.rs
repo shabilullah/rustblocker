@@ -243,6 +243,7 @@ impl Runner {
         self.forward_strategy(&settings)?;
         self.adaptive_hedge_delay(&settings)?;
         self.forward_strategy_dns(&settings)?;
+        self.chaos_class_refusal()?;
         self.version()?;
         self.db_api()?;
         self.stats_concurrency()?;
@@ -464,6 +465,21 @@ impl Runner {
             53,
             domain,
             query_type,
+            Duration::from_secs(2),
+        )
+    }
+
+    /// CHAOS-class TXT probe (query class 3, type 16) for identity-disclosure
+    /// audits: `version.bind`, `id.server`, `version.server`, `hostname.bind`.
+    pub fn chaos_txt_probe(&self, domain: &str) -> Result<DnsProbe, String> {
+        udp_dns_probe_options(
+            &self.env_or("SSH_HOST", ""),
+            53,
+            domain,
+            16,
+            3,
+            0x0100,
+            0,
             Duration::from_secs(2),
         )
     }
@@ -909,6 +925,41 @@ impl Runner {
             );
         } else {
             self.fail("forward-strategy-dns", format!("parallel/adaptive DNS probe failed for {domain} (parallel HTTP {code_parallel}: {}; adaptive HTTP {code_adaptive}: {})", empty(&parallel_dns), empty(&adaptive_dns)));
+        }
+        Ok(())
+    }
+
+    /// Identity-disclosure audit (A04 chaos-version): CHAOS-class TXT probes
+    /// must be refused locally, never forwarded upstream where the answer
+    /// would carry the upstream resolver's identity string.
+    fn chaos_class_refusal(&mut self) -> Result<(), String> {
+        let names = [
+            "version.bind",
+            "version.server",
+            "id.server",
+            "hostname.bind",
+        ];
+        let mut details = Vec::new();
+        let mut failures = Vec::new();
+        for name in names {
+            match self.chaos_txt_probe(name) {
+                Ok(probe) if probe.rcode == 5 && probe.answers == 0 && probe.authorities == 0 => {
+                    details.push(format!("{name}=REFUSED/0"));
+                }
+                Ok(probe) => failures.push(format!(
+                    "{name} rcode={} answers={} authorities={} (want REFUSED with no records)",
+                    probe.rcode, probe.answers, probe.authorities
+                )),
+                Err(err) => failures.push(format!("{name}: {err}")),
+            }
+        }
+        if failures.is_empty() {
+            self.ok(
+                "chaos-class-refused",
+                format!("CHAOS TXT identity probes refused: {}", details.join(" ")),
+            );
+        } else {
+            self.fail("chaos-class-refused", failures.join("; "));
         }
         Ok(())
     }
@@ -1510,7 +1561,16 @@ pub(crate) fn target_dns_probe_port(
 }
 
 pub(crate) fn target_dnssec_probe(host: &str, domain: &str) -> Result<DnsProbe, String> {
-    udp_dns_probe_options(host, 53, domain, 48, 0x0110, 0x8000, Duration::from_secs(2))
+    udp_dns_probe_options(
+        host,
+        53,
+        domain,
+        48,
+        1,
+        0x0110,
+        0x8000,
+        Duration::from_secs(2),
+    )
 }
 
 fn udp_dns_probe(
@@ -1520,14 +1580,16 @@ fn udp_dns_probe(
     query_type: u16,
     timeout: Duration,
 ) -> Result<DnsProbe, String> {
-    udp_dns_probe_options(host, port, domain, query_type, 0x0100, 0, timeout)
+    udp_dns_probe_options(host, port, domain, query_type, 1, 0x0100, 0, timeout)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn udp_dns_probe_options(
     host: &str,
     port: u16,
     domain: &str,
     query_type: u16,
+    query_class: u16,
     request_flags: u16,
     edns_flags: u16,
     timeout: Duration,
@@ -1552,7 +1614,7 @@ fn udp_dns_probe_options(
     packet.extend_from_slice(&1_u16.to_be_bytes());
     encode_dns_name(&mut packet, domain)?;
     packet.extend_from_slice(&query_type.to_be_bytes());
-    packet.extend_from_slice(&1_u16.to_be_bytes());
+    packet.extend_from_slice(&query_class.to_be_bytes());
     packet.push(0);
     packet.extend_from_slice(&41_u16.to_be_bytes());
     packet.extend_from_slice(&1232_u16.to_be_bytes());

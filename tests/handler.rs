@@ -1,6 +1,6 @@
 //! End-to-end handler tests covering the full DNS pipeline:
 //! blocklist (exact + wildcard), allowlist bypass, rewrite, precedence,
-//! and the wildcard/bare-domain boundary.
+//! non-IN class refusal, and the wildcard/bare-domain boundary.
 //!
 //! Each test calls `handle_request` directly with a `MockResponseHandler`
 //! that captures the response code and answer/authority counts — no socket
@@ -96,19 +96,41 @@ async fn blocklist_response_includes_blocked_ede() {
 }
 
 #[tokio::test]
-async fn blocklist_soa_matches_query_class() {
+async fn non_in_classes_are_refused_locally() {
     let (handler, _) = make_handler(&["ads.example.com"], &[], &[]);
-    let req = make_request_with_class("ads.example.com", RecordType::A, DNSClass::CH);
-    let mock = MockResponseHandler::new();
-    let _ = handler
-        .handle_request::<_, TokioTime>(&req, mock.clone())
-        .await;
-    let message = mock.message();
-    let soa = message
-        .all_sections()
-        .find(|record| record.record_type() == RecordType::SOA)
-        .expect("blocked NXDOMAIN must include SOA");
-    assert_eq!(soa.dns_class, DNSClass::CH);
+    // CHAOS identity probes, a CHAOS query for a blocked name (must not take
+    // the NXDOMAIN/SOA path), and a non-IN class for a normal name.
+    let cases = [
+        ("version.bind", DNSClass::CH),
+        ("id.server", DNSClass::CH),
+        ("version.server", DNSClass::CH),
+        ("hostname.bind", DNSClass::CH),
+        ("ads.example.com", DNSClass::CH),
+        ("example.com", DNSClass::HS),
+    ];
+    for (name, class) in cases {
+        let req = make_request_with_class(name, RecordType::TXT, class);
+        let mock = MockResponseHandler::new();
+        let _ = handler
+            .handle_request::<_, TokioTime>(&req, mock.clone())
+            .await;
+        let message = mock.message();
+        assert_eq!(
+            message.metadata.response_code,
+            ResponseCode::Refused,
+            "{name} class {class} must be refused locally"
+        );
+        assert_eq!(
+            mock.answer_count(),
+            0,
+            "{name} class {class} must not disclose any record"
+        );
+        assert_eq!(
+            mock.authority_count(),
+            0,
+            "{name} class {class} must not carry authority records"
+        );
+    }
 }
 
 #[tokio::test]
